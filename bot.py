@@ -1,8 +1,8 @@
 import os
 import json
 import random
-import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, List, Tuple
 
 import discord
 from discord.ext import tasks
@@ -10,7 +10,7 @@ from discord import app_commands
 
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
-GUILD_IDS = []  # Optionally put your test guild IDs here for faster slash sync, e.g. [123456789012345678]
+GUILD_IDS: List[int] = []  # Optional: test guild IDs for faster sync, e.g. [123456789012345678]
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120  # seconds to accept/decline PvP challenge
@@ -26,7 +26,6 @@ tree = app_commands.CommandTree(bot)
 
 # ---------- Simple JSON Store ----------
 def _ensure_shape(data: dict) -> dict:
-    # Backward/forward compatible shape
     data.setdefault("wallets", {})
     data.setdefault("daily", {})
     data.setdefault("autodelete", {})
@@ -70,7 +69,7 @@ class Store:
         self.write(data)
 
     # Daily helpers
-    def get_last_daily(self, user_id: int) -> str | None:
+    def get_last_daily(self, user_id: int) -> Optional[str]:
         data = self.read()
         return data["daily"].get(str(user_id))
 
@@ -94,15 +93,7 @@ class Store:
         self.write(data)
 
     # Stats & achievements
-    def _get_user_stats(self, user_id: int) -> dict:
-        data = self.read()
-        s = data["stats"].get(str(user_id), {"wins": 0, "losses": 0, "pushes": 0})
-        data["stats"][str(user_id)] = s
-        self.write(data)
-        return s
-
     def add_result(self, user_id: int, result: str):
-        # result in {"win","loss","push"}
         data = self.read()
         s = data["stats"].get(str(user_id), {"wins": 0, "losses": 0, "pushes": 0})
         if result == "win":
@@ -119,7 +110,6 @@ class Store:
         return data["stats"].get(str(user_id), {"wins": 0, "losses": 0, "pushes": 0})
 
     def list_top(self, key: str, limit: int = 10):
-        # key: "balance" or "wins"
         data = self.read()
         if key == "balance":
             items = [(int(uid), int(bal)) for uid, bal in data["wallets"].items()]
@@ -130,10 +120,9 @@ class Store:
             items = [(int(uid), s.get("wins", 0)) for uid, s in stats.items()]
             items.sort(key=lambda x: x[1], reverse=True)
             return items[:limit]
-        else:
-            return []
+        return []
 
-    def get_achievements(self, user_id: int) -> list[str]:
+    def get_achievements(self, user_id: int) -> List[str]:
         data = self.read()
         return data["achievements"].get(str(user_id), [])
 
@@ -151,7 +140,7 @@ class Store:
 store = Store(DATA_PATH)
 
 
-# ---------- Blackjack Core ----------
+# ---------- Cards / Blackjack helpers ----------
 SUITS = ["♠", "♥", "♦", "♣"]
 RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 VALUES = {**{str(i): i for i in range(2, 11)}, "J": 10, "Q": 10, "K": 10, "A": 11}
@@ -163,7 +152,7 @@ def deal_deck():
     return deck
 
 
-def hand_value(cards):
+def hand_value(cards: List[Tuple[str, str]]) -> int:
     total = sum(VALUES[r] for r, _ in cards)
     aces = sum(1 for r, _ in cards if r == "A")
     while total > 21 and aces:
@@ -172,24 +161,59 @@ def hand_value(cards):
     return total
 
 
-def fmt_hand(cards):
+def fmt_hand(cards: List[Tuple[str, str]]) -> str:
     return " ".join(f"{r}{s}" for r, s in cards) + f" (={hand_value(cards)})"
 
 
-def is_blackjack(cards) -> bool:
+def is_blackjack(cards: List[Tuple[str, str]]) -> bool:
     return len(cards) == 2 and hand_value(cards) == 21
 
 
-# ---------- Views ----------
-class HitStandView(discord.ui.View):
-    def __init__(self, author_id: int, timeout: float = 120):
+# ---------- Utility ----------
+def require_manage_messages():
+    def predicate(inter: discord.Interaction):
+        perms = inter.channel.permissions_for(inter.user) if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None
+        if not perms or not perms.manage_messages:
+            raise app_commands.CheckFailure("You need the **Manage Messages** permission here.")
+        return True
+    return app_commands.check(predicate)
+
+
+def _maybe_award_after_hand(user_id: int, bet_delta: int, player_cards: List[Tuple[str, str]], won: bool) -> List[str]:
+    newly: List[str] = []
+    # First win
+    if won and store.get_stats(user_id).get("wins", 0) == 0:
+        if store.award_achievement(user_id, "First Blood"):
+            newly.append("First Blood")
+    # Blackjack
+    if is_blackjack(player_cards):
+        if store.award_achievement(user_id, "Blackjack!"):
+            newly.append("Blackjack!")
+    # High Roller
+    if won and bet_delta >= 1000:
+        if store.award_achievement(user_id, "High Roller (1k+)"):
+            newly.append("High Roller (1k+)")
+    # Milestones
+    wins = store.get_stats(user_id).get("wins", 0)
+    for m in (5, 10, 25, 50, 100):
+        name = f"Win Milestone {m}"
+        if wins >= m and store.award_achievement(user_id, name):
+            newly.append(name)
+    return newly
+
+
+# ---------- Views for PvP Blackjack ----------
+class PvPBlackjackView(discord.ui.View):
+    """One shared view for spectators; only the active player can press buttons."""
+    def __init__(self, current_player_id: int, timeout: float = 120):
         super().__init__(timeout=timeout)
-        self.author_id = author_id
-        self.choice = None
+        self.current_player_id = current_player_id
+        self.choice: Optional[str] = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("This isn’t your turn.", ephemeral=True)
+        # Only current player may act
+        if interaction.user.id != self.current_player_id:
+            await interaction.response.send_message("It's not your turn.", ephemeral=True)
             return False
         return True
 
@@ -211,7 +235,7 @@ class PvPChallengeView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.challenger_id = challenger_id
         self.challenged_id = challenged_id
-        self.accepted = None
+        self.accepted: Optional[bool] = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.challenged_id:
@@ -232,46 +256,9 @@ class PvPChallengeView(discord.ui.View):
         self.stop()
 
 
-# ---------- Utility ----------
-def require_manage_messages():
-    def predicate(inter: discord.Interaction):
-        perms = inter.channel.permissions_for(inter.user) if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None
-        if not perms or not perms.manage_messages:
-            raise app_commands.CheckFailure("You need the **Manage Messages** permission here.")
-        return True
-    return app_commands.check(predicate)
-
-
-# ---------- Helpers: Achievements ----------
-def handle_achievements_after_hand(user_id: int, bet_delta: int, player_cards: list, won: bool):
-    newly = []
-    # First win
-    if won:
-        if store.get_stats(user_id).get("wins", 0) == 0:
-            if store.award_achievement(user_id, "First Blood"):
-                newly.append("First Blood")
-    # Blackjack
-    if is_blackjack(player_cards):
-        if store.award_achievement(user_id, "Blackjack!"):
-            newly.append("Blackjack!")
-    # High Roller
-    if won and bet_delta >= 1000:
-        if store.award_achievement(user_id, "High Roller (1k+)"):
-            newly.append("High Roller (1k+)")
-    # Milestones
-    wins = store.get_stats(user_id).get("wins", 0)
-    for m in (5, 10, 25, 50, 100):
-        name = f"Win Milestone {m}"
-        if wins >= m:
-            store.award_achievement(user_id, name)  # silently add; we won't spam if already had
-            if name not in newly and wins == m:
-                newly.append(name)
-    return newly
-
-
 # ---------- Commands ----------
 @tree.command(name="balance", description="Check your balance.")
-async def balance(inter: discord.Interaction, user: discord.User | None = None):
+async def balance(inter: discord.Interaction, user: Optional[discord.User] = None):
     target = user or inter.user
     bal = store.get_balance(target.id)
     await inter.response.send_message(f"💰 **{target.display_name}** has **{bal}** credits.")
@@ -293,97 +280,106 @@ async def daily(inter: discord.Interaction):
             )
     store.add_balance(inter.user.id, STARTING_DAILY)
     store.set_last_daily(inter.user.id, now.isoformat())
-    await inter.response.send_message(f"✅ You claimed **{STARTING_DAILY}** credits. Use `/blackjack` to play!")
+    await inter.response.send_message(f"✅ You claimed **{STARTING_DAILY}** credits. Use `/blackjack` or `/highlow` to play!")
 
 
-@tree.command(name="blackjack", description="Play Blackjack vs dealer or challenge another user (interactive).")
+# ----- Blackjack (Dealer or PvP spectator-friendly) -----
+@tree.command(name="blackjack", description="Play Blackjack vs dealer or challenge another user (spectator-friendly).")
 @app_commands.describe(bet="Amount to wager", opponent="Optional: challenge another user for PvP")
-async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], opponent: discord.User | None = None):
+async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], opponent: Optional[discord.User] = None):
     bettor_id = inter.user.id
     bal = store.get_balance(bettor_id)
     if bal < bet:
         return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
 
-    # PvP: interactive both players
+    # PvP spectator-friendly mode
     if opponent and opponent.id != inter.user.id and not opponent.bot:
         opp_bal = store.get_balance(opponent.id)
         if opp_bal < bet:
             return await inter.response.send_message(f"❌ {opponent.mention} doesn’t have enough credits to accept.", ephemeral=True)
 
-        view = PvPChallengeView(challenger_id=inter.user.id, challenged_id=opponent.id)
+        view_challenge = PvPChallengeView(challenger_id=inter.user.id, challenged_id=opponent.id)
         await inter.response.send_message(
             f"🎲 {opponent.mention}, **{inter.user.display_name}** challenges you to Blackjack for **{bet}** credits each. Accept?",
-            view=view
+            view=view_challenge
         )
-        await view.wait()
-        if view.accepted is None:
+        await view_challenge.wait()
+        if view_challenge.accepted is None:
             return await inter.followup.send("⌛ Challenge expired.")
-        if not view.accepted:
+        if not view_challenge.accepted:
             return await inter.followup.send("🚫 Challenge declined.")
 
-        # Start game
+        # Start game (single shared public message)
         deck = deal_deck()
-        hands = {
-            inter.user.id: [deck.pop(), deck.pop()],
-            opponent.id: [deck.pop(), deck.pop()],
-        }
+        p1 = [deck.pop(), deck.pop()]
+        p2 = [deck.pop(), deck.pop()]
+        current_player_id = inter.user.id  # challenger goes first
 
-        # Each player plays their turn in order: challenger then opponent
-        async def player_turn(player_id: int, player_user: discord.User, title: str):
-            view_turn = HitStandView(author_id=player_id)
+        def embed_state(title_suffix: str = ""):
+            title = f"♠ PvP Blackjack {title_suffix}".strip()
             emb = discord.Embed(title=title, description=f"Bet each: **{bet}**")
-            # Show both hands (opponent hidden value for fun)
-            my = hands[player_id]
-            other_id = opponent.id if player_id == inter.user.id else inter.user.id
-            other = hands[other_id]
-            emb.add_field(name=f"{player_user.display_name} Hand", value=fmt_hand(my), inline=True)
-            emb.add_field(name="Opponent Shows", value=f"{other[0][0]}{other[0][1]} ??", inline=True)
-            msg = await inter.followup.send(embed=emb, view=view_turn, wait=True)
+            emb.add_field(name=f"{inter.user.display_name}", value=fmt_hand(p1), inline=True)
+            emb.add_field(name=f"{opponent.display_name}", value=fmt_hand(p2), inline=True)
+            emb.add_field(
+                name="Turn",
+                value=f"▶️ **{inter.user.display_name if current_player_id==inter.user.id else opponent.display_name}**",
+                inline=False
+            )
+            return emb
 
-            # Loop until stand or bust
-            while hand_value(hands[player_id]) < 21:
-                # wait for choice
-                await view_turn.wait()
-                choice = view_turn.choice
-                view_turn.choice = None
+        view = PvPBlackjackView(current_player_id=current_player_id)
+        msg = await inter.followup.send(embed=embed_state("— Game Start"), view=view)
+
+        # Turn loop for each player
+        async def play_turn(player_id: int, hand: List[Tuple[str, str]], name: str):
+            nonlocal view, msg, current_player_id
+            # swap current player in the view
+            current_player_id = player_id
+            view = PvPBlackjackView(current_player_id=current_player_id)
+            try:
+                await msg.edit(embed=embed_state(), view=view)
+            except discord.HTTPException:
+                pass
+
+            # actions until stand or bust or timeout
+            while hand_value(hand) < 21:
+                await view.wait()
+                choice = view.choice
+                view.choice = None
                 if choice == "hit":
-                    hands[player_id].append(deck.pop())
-                    emb.set_field_at(0, name=f"{player_user.display_name} Hand", value=fmt_hand(hands[player_id]), inline=True)
+                    hand.append(deck.pop())
                     try:
-                        await msg.edit(embed=emb)
+                        await msg.edit(embed=embed_state())
                     except discord.HTTPException:
                         pass
-                    view_turn = HitStandView(author_id=player_id)
+                    # refresh view (to reset button state)
+                    view = PvPBlackjackView(current_player_id=current_player_id)
                     try:
-                        await msg.edit(view=view_turn)
+                        await msg.edit(view=view)
                     except discord.HTTPException:
                         pass
                     continue
                 else:
-                    # stand or timeout
-                    break
+                    break  # stand or timeout
 
-            # disable buttons
-            for child in view_turn.children:
+            # disable buttons for this turn
+            for child in view.children:
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
             try:
-                await msg.edit(view=view_turn)
+                await msg.edit(view=view)
             except discord.HTTPException:
                 pass
 
-        # Challenger's turn
-        await player_turn(inter.user.id, inter.user, "♠ PvP Blackjack — Your Turn")
-        # Opponent's turn
-        await player_turn(opponent.id, opponent, "♠ PvP Blackjack — Opponent's Turn")
+        # Challenger then opponent
+        await play_turn(inter.user.id, p1, inter.user.display_name)
+        await play_turn(opponent.id, p2, opponent.display_name)
 
-        v1 = hand_value(hands[inter.user.id])
-        v2 = hand_value(hands[opponent.id])
+        v1 = hand_value(p1)
+        v2 = hand_value(p2)
 
-        # Determine winner
         outcome = "Tie! It’s a push."
         if v1 > 21 and v2 > 21:
-            # push; no balance change, track pushes
             store.add_result(inter.user.id, "push")
             store.add_result(opponent.id, "push")
         elif v1 > 21:
@@ -415,36 +411,70 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                 store.add_result(inter.user.id, "push")
                 store.add_result(opponent.id, "push")
 
-        # Achievements
-        new1 = handle_achievements_after_hand(inter.user.id, bet, hands[inter.user.id], "wins" in outcome)
-        new2 = handle_achievements_after_hand(opponent.id, bet, hands[opponent.id], f"**{opponent.display_name}** wins!" in outcome)
+        # Achievements announce
+        new1 = _maybe_award_after_hand(inter.user.id, bet, p1, "wins" in outcome and inter.user.display_name in outcome)
+        new2 = _maybe_award_after_hand(opponent.id, bet, p2, "wins" in outcome and opponent.display_name in outcome)
 
-        emb = discord.Embed(title="♠ PvP Blackjack — Result")
-        emb.add_field(name=inter.user.display_name, value=fmt_hand(hands[inter.user.id]), inline=True)
-        emb.add_field(name=opponent.display_name, value=fmt_hand(hands[opponent.id]), inline=True)
+        emb = discord.Embed(title="♠ PvP Blackjack — Result", description=f"Bet each: **{bet}**")
+        emb.add_field(name=inter.user.display_name, value=fmt_hand(p1), inline=True)
+        emb.add_field(name=opponent.display_name, value=fmt_hand(p2), inline=True)
         emb.add_field(name="Outcome", value=outcome, inline=False)
         if new1 or new2:
             awards_text = ""
             if new1:
-                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\\n"
+                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\n"
             if new2:
                 awards_text += f"🏆 {opponent.display_name}: " + ", ".join(new2)
             if awards_text:
                 emb.add_field(name="New Achievements", value=awards_text, inline=False)
-        return await inter.followup.send(embed=emb)
+        try:
+            await msg.edit(embed=emb, view=None)
+        except discord.HTTPException:
+            await inter.followup.send(embed=emb)
+        return
 
-    # Vs Dealer (interactive Hit/Stand)
+    # Vs Dealer (interactive for the player; spectators see updates)
     deck = deal_deck()
     player = [deck.pop(), deck.pop()]
     dealer = [deck.pop(), deck.pop()]
 
-    view = HitStandView(author_id=inter.user.id)
-    emb = discord.Embed(title="♣ Blackjack vs Dealer", description=f"Bet: **{bet}**")
-    emb.add_field(name="Your Hand", value=fmt_hand(player), inline=True)
-    emb.add_field(name="Dealer Shows", value=f"{dealer[0][0]}{dealer[0][1]} ??", inline=True)
-    await inter.response.send_message(embed=emb, view=view)
+    class DealerView(discord.ui.View):
+        def __init__(self, uid: int, timeout: float = 120):
+            super().__init__(timeout=timeout)
+            self.uid = uid
+            self.choice: Optional[str] = None
 
-    # Player decisions
+        async def interaction_check(self, interaction: discord.Interaction) -> bool:
+            if interaction.user.id != self.uid:
+                await interaction.response.send_message("This isn’t your game.", ephemeral=True)
+                return False
+            return True
+
+        @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
+        async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.choice = "hit"
+            await interaction.response.defer()
+            self.stop()
+
+        @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
+        async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.choice = "stand"
+            await interaction.response.defer()
+            self.stop()
+
+    def dealer_embed(title="♣ Blackjack vs Dealer"):
+        emb = discord.Embed(title=title, description=f"Bet: **{bet}**")
+        emb.add_field(name="Your Hand", value=fmt_hand(player), inline=True)
+        # show only dealer upcard until stand/bust
+        emb.add_field(name="Dealer Shows", value=f"{dealer[0][0]}{dealer[0][1]} ??", inline=True)
+        return emb
+
+    await inter.response.send_message(embed=dealer_embed(), view=DealerView(uid=inter.user.id))
+    msg = await inter.original_response()
+
+    view = DealerView(uid=inter.user.id)
+    await msg.edit(view=view)
+
     while True:
         if hand_value(player) >= 21:
             break
@@ -453,32 +483,37 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         view.choice = None
         if choice == "hit":
             player.append(deck.pop())
-            emb.set_field_at(0, name="Your Hand", value=fmt_hand(player), inline=True)
-            await inter.edit_original_response(embed=emb, view=view)
-            view = HitStandView(author_id=inter.user.id)  # fresh view for next choice
-            await inter.edit_original_response(view=view)
+            try:
+                await msg.edit(embed=dealer_embed(), view=view)
+            except discord.HTTPException:
+                pass
+            view = DealerView(uid=inter.user.id)  # refresh buttons
+            try:
+                await msg.edit(view=view)
+            except discord.HTTPException:
+                pass
             continue
-        elif choice == "stand" or choice is None:
+        else:
             break
 
     # Dealer plays
     while hand_value(dealer) < 17:
         dealer.append(deck.pop())
 
-    player_val = hand_value(player)
-    dealer_val = hand_value(dealer)
+    pv = hand_value(player)
+    dv = hand_value(dealer)
 
     won_flag = False
-    if player_val > 21:
+    if pv > 21:
         result = "You busted. Dealer wins."
         store.add_balance(inter.user.id, -bet)
         store.add_result(inter.user.id, "loss")
-    elif dealer_val > 21 or player_val > dealer_val:
+    elif dv > 21 or pv > dv:
         result = "You win!"
         store.add_balance(inter.user.id, bet)
         store.add_result(inter.user.id, "win")
         won_flag = True
-    elif dealer_val > player_val:
+    elif dv > pv:
         result = "Dealer wins."
         store.add_balance(inter.user.id, -bet)
         store.add_result(inter.user.id, "loss")
@@ -486,8 +521,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         result = "Push."
         store.add_result(inter.user.id, "push")
 
-    # Achievements
-    newly = handle_achievements_after_hand(inter.user.id, bet if won_flag else 0, player, won_flag)
+    newly = _maybe_award_after_hand(inter.user.id, bet if won_flag else 0, player, won_flag)
 
     final = discord.Embed(title="♣ Blackjack vs Dealer — Result", description=f"Bet: **{bet}**")
     final.add_field(name="Your Hand", value=fmt_hand(player), inline=True)
@@ -495,14 +529,103 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
     final.add_field(name="Outcome", value=result, inline=False)
     if newly:
         final.add_field(name="New Achievements", value=", ".join(newly), inline=False)
-    await inter.edit_original_response(embed=final, view=None)
+    await msg.edit(embed=final, view=None)
+
+
+# ----- New Mini‑Game: High/Low -----
+# Reveal one card, you guess whether the next card will be Higher or Lower.
+# Payout: 1:1 (equal rank = push)
+@tree.command(name="highlow", description="Simple High/Low card game. Guess if the next card is higher or lower.")
+@app_commands.describe(bet="Amount to wager")
+async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
+    if store.get_balance(inter.user.id) < bet:
+        return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
+
+    deck = deal_deck()
+    first = deck.pop()
+
+    def rank_value(r: str) -> int:
+        # Treat A as high
+        order = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
+        return order.index(r)
+
+    class HLView(discord.ui.View):
+        def __init__(self, uid: int, timeout: float = 60):
+            super().__init__(timeout=timeout)
+            self.uid = uid
+            self.choice: Optional[str] = None
+
+        async def interaction_check(self, interaction: discord.Interaction) -> bool:
+            if interaction.user.id != self.uid:
+                await interaction.response.send_message("This isn’t your round.", ephemeral=True)
+                return False
+            return True
+
+        @discord.ui.button(label="Higher", style=discord.ButtonStyle.primary)
+        async def higher(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.choice = "higher"
+            await interaction.response.defer()
+            self.stop()
+
+        @discord.ui.button(label="Lower", style=discord.ButtonStyle.secondary)
+        async def lower(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.choice = "lower"
+            await interaction.response.defer()
+            self.stop()
+
+    def make_embed(title="♦ High/Low"):
+        emb = discord.Embed(title=title, description=f"Bet: **{bet}**")
+        emb.add_field(name="Current Card", value=f"{first[0]}{first[1]}", inline=True)
+        emb.set_footer(text="Guess if the next card is higher or lower.")
+        return emb
+
+    view = HLView(uid=inter.user.id)
+    await inter.response.send_message(embed=make_embed(), view=view)
+    msg = await inter.original_response()
+    await view.wait()
+
+    # Draw second card and settle
+    second = deck.pop()
+    first_v = rank_value(first[0])
+    second_v = rank_value(second[0])
+
+    outcome = "Push."
+    result_tag = "push"
+    if view.choice is None:
+        # timeout counts as reveal only
+        pass
+    elif second_v == first_v:
+        outcome = "Equal rank! Push."
+    else:
+        is_higher = second_v > first_v
+        if (is_higher and view.choice == "higher") or ((not is_higher) and view.choice == "lower"):
+            outcome = "You win!"
+            result_tag = "win"
+            store.add_balance(inter.user.id, bet)
+        else:
+            outcome = "You lose."
+            result_tag = "loss"
+            store.add_balance(inter.user.id, -bet)
+
+    store.add_result(inter.user.id, result_tag)
+    newly = []
+    if result_tag == "win":
+        newly = _maybe_award_after_hand(inter.user.id, bet, [first, second], True)
+
+    emb = discord.Embed(title="♦ High/Low — Result", description=f"Bet: **{bet}**")
+    emb.add_field(name="First Card", value=f"{first[0]}{first[1]}", inline=True)
+    emb.add_field(name="Second Card", value=f"{second[0]}{second[1]}", inline=True)
+    emb.add_field(name="Outcome", value=outcome, inline=False)
+    if newly:
+        emb.add_field(name="New Achievements", value=", ".join(newly), inline=False)
+    await msg.edit(embed=emb, view=None)
 
 
 # ----- Moderation: Purge -----
 @tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
 @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
 @require_manage_messages()
-async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 1000], user: discord.User | None = None):
+async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 1000], user: Optional[discord.User] = None):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("This command can only be used in text channels.", ephemeral=True)
 
@@ -566,19 +689,25 @@ async def leaderboard(inter: discord.Interaction, category: app_commands.Choice[
         return await inter.response.send_message("No data yet.")
     lines = []
     for i, (uid, val) in enumerate(top, start=1):
-        user = await bot.fetch_user(uid)
-        lines.append(f"**{i}. {user.display_name}** — {val} {'credits' if category.value=='balance' else 'wins'}")
-    emb = discord.Embed(title=f"🏆 Leaderboard — {category.value.capitalize()}", description="\\n".join(lines))
+        try:
+            user = await bot.fetch_user(uid)
+            uname = user.display_name
+        except Exception:
+            uname = f"User {uid}"
+        lines.append(f"**{i}. {uname}** — {val} {'credits' if category.value=='balance' else 'wins'}")
+    emb = discord.Embed(title=f"🏆 Leaderboard — {category.value.capitalize()}", description="\n".join(lines))
     await inter.response.send_message(embed=emb)
 
 
 @tree.command(name="achievements", description="Show your achievements (or another user's).")
-async def achievements(inter: discord.Interaction, user: discord.User | None = None):
+async def achievements(inter: discord.Interaction, user: Optional[discord.User] = None):
     target = user or inter.user
     ach = store.get_achievements(target.id)
+    emb = discord.Embed(title=f"🏆 Achievements — {target.display_name}")
     if not ach:
-        return await inter.response.send_message(f"🏆 **{target.display_name}** has no achievements yet.")
-    emb = discord.Embed(title=f"🏆 Achievements — {target.display_name}", description=", ".join(sorted(ach)))
+        emb.description = "None yet — go win some games!"
+    else:
+        emb.description = ", ".join(sorted(ach))
     stats = store.get_stats(target.id)
     emb.add_field(name="Record", value=f"{stats.get('wins',0)}W / {stats.get('losses',0)}L / {stats.get('pushes',0)}P", inline=False)
     await inter.response.send_message(embed=emb)
@@ -617,7 +746,7 @@ async def before_cleanup():
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
-    # Sync commands
+    # Sync slash commands
     if GUILD_IDS:
         for gid in GUILD_IDS:
             guild = discord.Object(id=gid)

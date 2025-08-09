@@ -1,0 +1,11 @@
+version: "3.8"
+services:
+  utility-bot:
+    build: .
+    container_name: utility-bot
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - DATA_PATH=/app/data/db.json
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

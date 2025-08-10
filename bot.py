@@ -1,4 +1,3 @@
-
 import os
 import json
 import random
@@ -73,6 +72,44 @@ intents.members = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
+# ---------- NEW: Shop & Inventory Config ----------
+# name -> dict(price, sell, desc)
+SHOP_CATALOG: Dict[str, Dict[str, Any]] = {
+    "Fishing Pole": {"price": 750, "sell": 375, "desc": "Required to /fish."},
+    "Basic Bait": {"price": 40, "sell": 15, "desc": "Consumed by /fish (1 per cast)."},
+    "Premium Bait": {"price": 120, "sell": 60, "desc": "Better odds for rarer fish."},
+    "Backpack Upgrade": {"price": 1000, "sell": 500, "desc": "Pure flex. (No cap yet)"},
+    # Sellables from fishing
+    "Common Fish": {"price": None, "sell": 60, "desc": "A basic catch."},
+    "Uncommon Fish": {"price": None, "sell": 160, "desc": "Tasty find."},
+    "Rare Fish": {"price": None, "sell": 400, "desc": "Nice market value."},
+    "Epic Fish": {"price": None, "sell": 1200, "desc": "A trophy catch."},
+    "Old Boot": {"price": None, "sell": 5, "desc": "Kinda soggy…"},
+}
+
+FISH_TABLE_BASIC = [
+    ("Old Boot", 0.10),
+    ("Common Fish", 0.62),
+    ("Uncommon Fish", 0.20),
+    ("Rare Fish", 0.07),
+    ("Epic Fish", 0.01),
+]
+
+FISH_TABLE_PREMIUM = [
+    ("Old Boot", 0.05),
+    ("Common Fish", 0.50),
+    ("Uncommon Fish", 0.28),
+    ("Rare Fish", 0.14),
+    ("Epic Fish", 0.03),
+]
+
+def weighted_choice(pairs: List[Tuple[str, float]]) -> str:
+    r = random.random(); acc = 0.0
+    for name, p in pairs:
+        acc += p
+        if r <= acc:
+            return name
+    return pairs[-1][0]
 
 # ---------- Simple JSON Store ----------
 def _ensure_shape(data: dict) -> dict:
@@ -104,6 +141,9 @@ def _ensure_shape(data: dict) -> dict:
 
     # Admin allowlist (new)
     ensure_list("admin_allowlist")
+
+    # NEW: Inventory map
+    ensure_dict("inventory")
 
     return data
 
@@ -145,6 +185,39 @@ class Store:
         data = self.read()
         data["wallets"][str(user_id)] = int(amount)
         self.write(data)
+
+    # NEW: Inventory helpers
+    def get_inventory(self, user_id: int) -> Dict[str, int]:
+        data = self.read()
+        return {k: int(v) for k, v in data["inventory"].get(str(user_id), {}).items()}
+
+    def add_item(self, user_id: int, item_name: str, qty: int = 1):
+        if qty == 0:
+            return
+        data = self.read()
+        inv = data["inventory"].get(str(user_id), {})
+        inv[item_name] = int(inv.get(item_name, 0)) + int(qty)
+        if inv[item_name] <= 0:
+            inv.pop(item_name, None)
+        data["inventory"][str(user_id)] = inv
+        self.write(data)
+
+    def remove_item(self, user_id: int, item_name: str, qty: int = 1) -> bool:
+        data = self.read()
+        inv = data["inventory"].get(str(user_id), {})
+        have = int(inv.get(item_name, 0))
+        if have < qty:
+            return False
+        inv[item_name] = have - qty
+        if inv[item_name] <= 0:
+            inv.pop(item_name, None)
+        data["inventory"][str(user_id)] = inv
+        self.write(data)
+        return True
+
+    def has_item(self, user_id: int, item_name: str, qty: int = 1) -> bool:
+        inv = self.get_inventory(user_id)
+        return inv.get(item_name, 0) >= qty
 
     # Daily helpers
     def get_last_daily(self, user_id: int) -> Optional[str]:
@@ -370,7 +443,6 @@ class Store:
 
 store = Store(DATA_PATH)
 
-
 # ---------- Permissions helper ----------
 def require_manage_messages():
     def predicate(inter: discord.Interaction):
@@ -546,6 +618,154 @@ async def stats_cmd(inter: discord.Interaction, user: Optional[discord.User] = N
     emb.add_field(name="Daily Streak", value=f"{st.get('count',0)} days", inline=True)
     await inter.response.send_message(embed=emb)
 
+# ---------- NEW: Weather by ZIP ----------
+@tree.command(name="weather", description="Current weather by US ZIP code (no API key).")
+async def weather_cmd(inter: discord.Interaction, zip: app_commands.Range[str, 5, 10]):
+    await inter.response.defer()
+    z = re.sub(r"[^0-9]", "", zip)
+    if len(z) != 5:
+        return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
+    try:
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            # 1) ZIP -> lat/lon
+            async with session.get(f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status != 200:
+                    return await inter.followup.send("Couldn't look up that ZIP.", ephemeral=True)
+                zp = await r.json()
+            place = zp["places"][0]
+            lat = float(place["latitude"]); lon = float(place["longitude"])
+            city = place["place name"]; state = place["state abbreviation"]
+            # 2) Weather
+            params = {
+                "latitude": lat, "longitude": lon,
+                "temperature_unit": "fahrenheit",
+                "wind_speed_unit": "mph",
+                "precipitation_unit": "inch",
+                "timezone": "auto",
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,precipitation",
+            }
+            async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=12)) as r2:
+                if r2.status != 200:
+                    return await inter.followup.send("Weather service is unavailable right now.", ephemeral=True)
+                wx = await r2.json()
+        cur = wx.get("current") or {}
+        # Back-compat if provider returns current_weather
+        if not cur and "current_weather" in wx:
+            cw = wx["current_weather"]
+            cur = {
+                "temperature_2m": cw.get("temperature"),
+                "wind_speed_10m": cw.get("windspeed"),
+                "precipitation": cw.get("precipitation", 0.0),
+            }
+        t = cur.get("temperature_2m")
+        feels = cur.get("apparent_temperature", t)
+        rh = cur.get("relative_humidity_2m")
+        wind = cur.get("wind_speed_10m")
+        pcp = cur.get("precipitation", 0.0)
+        emb = discord.Embed(title=f"🌤️ Weather — {city}, {state} {z}")
+        if t is not None:
+            emb.add_field(name="Temp", value=f"{round(t)}°F (Feels {round(feels)}°)", inline=True)
+        if rh is not None:
+            emb.add_field(name="Humidity", value=f"{int(rh)}%", inline=True)
+        if wind is not None:
+            emb.add_field(name="Wind", value=f"{round(wind)} mph", inline=True)
+        emb.add_field(name="Precip (current)", value=f"{pcp:.2f} in", inline=True)
+        await inter.followup.send(embed=emb)
+    except Exception as e:
+        await inter.followup.send(f"⚠️ Weather error: {e}", ephemeral=True)
+
+# ---------- NEW: Shop / Inventory / Fishing ----------
+def _find_catalog_item(name: str) -> Optional[str]:
+    # case-insensitive name match
+    name_norm = name.strip().lower()
+    for k in SHOP_CATALOG.keys():
+        if k.lower() == name_norm:
+            return k
+    # partial match convenience
+    matches = [k for k in SHOP_CATALOG if name_norm in k.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+@tree.command(name="shop", description="Browse items available for purchase.")
+async def shop_cmd(inter: discord.Interaction):
+    lines = []
+    for name, meta in SHOP_CATALOG.items():
+        price = meta["price"]
+        price_str = f"{price} cr" if isinstance(price, int) else "–"
+        lines.append(f"**{name}** — Buy: {price_str} • Sell: {meta['sell'] if meta['sell'] is not None else 0} • _{meta['desc']}_")
+    emb = discord.Embed(title="🛒 Shop")
+    emb.description = "\n".join(lines)
+    await inter.response.send_message(embed=emb)
+
+@tree.command(name="buy", description="Buy an item from the shop.")
+@app_commands.describe(item="Exact item name (e.g., 'Fishing Pole')", quantity="Defaults to 1")
+async def buy_cmd(inter: discord.Interaction, item: str, quantity: app_commands.Range[int, 1, 100] = 1):
+    key = _find_catalog_item(item)
+    if not key:
+        return await inter.response.send_message("Item not found. Use `/shop` to see names.", ephemeral=True)
+    meta = SHOP_CATALOG[key]
+    if meta["price"] is None:
+        return await inter.response.send_message("That item cannot be purchased.", ephemeral=True)
+    total = int(meta["price"]) * int(quantity)
+    bal = store.get_balance(inter.user.id)
+    if bal < total:
+        return await inter.response.send_message(f"Not enough credits. Need **{total}**.", ephemeral=True)
+    store.add_balance(inter.user.id, -total)
+    store.add_item(inter.user.id, key, quantity)
+    await inter.response.send_message(f"✅ Bought **{quantity}× {key}** for **{total}** credits.")
+
+@tree.command(name="sell", description="Sell an item from your inventory.")
+@app_commands.describe(item="Exact item name", quantity="How many to sell")
+async def sell_cmd(inter: discord.Interaction, item: str, quantity: app_commands.Range[int, 1, 1000]):
+    key = _find_catalog_item(item)
+    if not key:
+        return await inter.response.send_message("Item not found.", ephemeral=True)
+    meta = SHOP_CATALOG[key]
+    sell_val = meta.get("sell")
+    if sell_val is None:
+        return await inter.response.send_message("That item cannot be sold.", ephemeral=True)
+    if not store.has_item(inter.user.id, key, quantity):
+        return await inter.response.send_message("You don't have that many.", ephemeral=True)
+    ok = store.remove_item(inter.user.id, key, quantity)
+    if not ok:
+        return await inter.response.send_message("You don't have that many.", ephemeral=True)
+    total = int(sell_val) * int(quantity)
+    store.add_balance(inter.user.id, total)
+    await inter.response.send_message(f"💸 Sold **{quantity}× {key}** for **{total}** credits.")
+
+@tree.command(name="inventory", description="View your inventory (or another user's).")
+async def inventory_cmd(inter: discord.Interaction, user: Optional[discord.User] = None):
+    target = user or inter.user
+    inv = store.get_inventory(target.id)
+    if not inv:
+        return await inter.response.send_message(f"{target.display_name} has an empty inventory.")
+    lines = [f"- **{name}** × {qty}" for name, qty in sorted(inv.items())]
+    emb = discord.Embed(title=f"🎒 Inventory — {target.display_name}", description="\n".join(lines))
+    await inter.response.send_message(embed=emb)
+
+@tree.command(name="fish", description="Go fishing! Requires a Fishing Pole and 1 bait (Basic or Premium).")
+async def fish_cmd(inter: discord.Interaction):
+    uid = inter.user.id
+    # Checks
+    if not store.has_item(uid, "Fishing Pole", 1):
+        return await inter.response.send_message("You need a **Fishing Pole**. Buy one with `/buy Fishing Pole`.", ephemeral=True)
+    bait_type = None
+    if store.has_item(uid, "Premium Bait", 1):
+        bait_type = "Premium Bait"
+        table = FISH_TABLE_PREMIUM
+    elif store.has_item(uid, "Basic Bait", 1):
+        bait_type = "Basic Bait"
+        table = FISH_TABLE_BASIC
+    else:
+        return await inter.response.send_message("You need **Basic Bait** or **Premium Bait**.", ephemeral=True)
+    # Consume bait
+    store.remove_item(uid, bait_type, 1)
+    catch = weighted_choice(table)
+    store.add_item(uid, catch, 1)
+    sell_val = SHOP_CATALOG.get(catch, {}).get("sell", 0) or 0
+    flair = "🎣"
+    if "Rare" in catch: flair = "💎"
+    if "Epic" in catch: flair = "🌟"
+    await inter.response.send_message(f"{flair} You cast your line using **{bait_type}** and caught **{catch}**! (Sell value: **{sell_val}** cr)")
 
 # ---------- Notes ----------
 @tree.command(name="note_add", description="Save a personal note.")
@@ -566,7 +786,6 @@ async def notes(inter: discord.Interaction, delete_index: Optional[app_commands.
         return await inter.response.send_message("No notes.", ephemeral=True)
     lines = [f"{i+1}. {t}" for i,t in enumerate(arr)]
     await inter.response.send_message("\n".join(lines), ephemeral=True)
-
 
 # ---------- Channel Pin ----------
 @tree.command(name="pin_set", description="Set a sticky pin for this channel.")
@@ -589,7 +808,6 @@ async def pin_clear(inter: discord.Interaction):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
     store.clear_pin(inter.channel.id)
     await inter.response.send_message("🧹 Pin cleared.", ephemeral=True)
-
 
 # ---------- Polls (persistent) ----------
 class PollView(discord.ui.View):
@@ -667,7 +885,6 @@ async def poll(inter: discord.Interaction, question: str, options: str):
     view = PollView(message_id=msg.id, options=opts, creator_id=inter.user.id, timeout=None)
     await msg.edit(view=view)
 
-
 # ---------- Helpers: choose & timer ----------
 @tree.command(name="choose", description="Pick a random choice from a comma-separated list.")
 async def choose(inter: discord.Interaction, options: str):
@@ -695,7 +912,6 @@ async def timer(inter: discord.Interaction, seconds: app_commands.Range[int, 1, 
         await msg.edit(content="✅ Time!")
     except discord.HTTPException:
         pass
-
 
 # ---------- Trivia via OpenTDB ----------
 async def _get_or_create_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
@@ -1040,7 +1256,6 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
     final.add_field(name="Outcome", value=result, inline=False)
     await msg.edit(embed=final, view=None)
 
-
 # ---------- High/Low ----------
 @tree.command(name="highlow", description="Guess if the next card is higher or lower (1:1 payout).")
 @app_commands.describe(bet="Amount to wager")
@@ -1087,7 +1302,6 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     emb.add_field(name="Outcome", value=outcome, inline=False)
     await msg.edit(embed=emb, view=None)
 
-
 # ---------- Dice Duel ----------
 @tree.command(name="diceduel", description="Challenge another player to a quick dice duel (2d6 vs 2d6).")
 @app_commands.describe(bet="Optional wager (both must afford it)", opponent="User to challenge")
@@ -1124,7 +1338,6 @@ async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Opti
     emb = discord.Embed(title="🎲 Dice Duel Results", description="\n".join(desc_lines))
     emb.add_field(name="Outcome", value=outcome, inline=False)
     await inter.followup.send(embed=emb)
-
 
 # ---------- Slots (animated) ----------
 SLOT_SYMBOLS_BASE = ["🍒", "🍋", "🔔", "⭐", "🍀", "7️⃣"]
@@ -1222,7 +1435,6 @@ async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
 async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
     await inter.response.defer(); await slots_internal(inter, bet)
 
-
 # ---------- Moderation (restricted to admins/allowlist) ----------
 @tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
 @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
@@ -1267,7 +1479,6 @@ async def autodelete_status(inter: discord.Interaction):
     else:
         await inter.response.send_message("❌ Auto-delete is **OFF** for this channel.", ephemeral=True)
 
-
 # ---------- Leaderboard & Achievements ----------
 @tree.command(name="leaderboard", description="Show the top players.")
 @app_commands.describe(category="Choose 'balance' or 'wins'")
@@ -1295,7 +1506,6 @@ async def achievements(inter: discord.Interaction, user: Optional[discord.User] 
     emb.add_field(name="Record", value=f"{stats.get('wins',0)}W / {stats.get('losses',0)}L / {stats.get('pushes',0)}P", inline=False)
     await inter.response.send_message(embed=emb)
 
-
 # ---------- Background Cleaner ----------
 @tasks.loop(minutes=2)
 async def cleanup_loop():
@@ -1315,7 +1525,6 @@ async def cleanup_loop():
 @cleanup_loop.before_loop
 async def before_cleanup():
     await bot.wait_until_ready()
-
 
 # ---------- Reminders ----------
 def _chicago_tz_for(dt_naive: datetime):
@@ -1460,7 +1669,6 @@ async def reminders_scheduler():
 async def before_reminders():
     await bot.wait_until_ready()
 
-
 # ---------- Admin Allowlist Commands (real admins only) ----------
 @tree.command(name="admin_allow", description="Allow a user to use admin bot commands.")
 @require_real_admin()
@@ -1497,7 +1705,6 @@ async def admin_list(inter: discord.Interaction):
             lines.append(f"- <@{uid}> (User {uid})")
     await inter.response.send_message("**Admin allowlist:**\n" + "\n".join(lines), ephemeral=True)
 
-
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
@@ -1524,14 +1731,12 @@ async def on_ready():
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
-
 # ---------- Main ----------
 def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set")
     bot.run(token)
-
 
 if __name__ == "__main__":
     main()

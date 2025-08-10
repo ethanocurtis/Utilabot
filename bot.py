@@ -1045,6 +1045,7 @@ async def weather_subscribe(
         await inter.followup.send(f"⚠️ {type(e).__name__}: {e}", ephemeral=True)
 
 
+
 @tree.command(name="weather_subscriptions", description="List your weather subscriptions and next send time.")
 async def weather_subscriptions(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True)
@@ -1057,29 +1058,48 @@ async def weather_subscriptions(inter: discord.Interaction):
     now_local = datetime.now(tz)
 
     for s in items:
-        next_txt = "None"
-        try:
-            raw = s.get("next_run_utc")
-            if raw:
-                nxt = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
-                next_txt = _fmt_local(nxt)
-            else:
-                raise ValueError("missing")
-        except Exception:
-            hh = int(s.get("hh", 8))
-            mi = int(s.get("mi", 0))
-            cadence = s.get("cadence", "daily")
+        # defaults for safety
+        hh = int(s.get("hh", 8))
+        mi = int(s.get("mi", 0))
+        cadence = s.get("cadence", "daily") if s.get("cadence") in {"daily", "weekly"} else "daily"
+
+        # Try to parse existing next_run_utc; otherwise recompute hard
+        need_recompute = False
+        raw = s.get("next_run_utc")
+        nxt = None
+        if not raw or str(raw).strip().lower() == "none":
+            need_recompute = True
+        else:
+            try:
+                nxt = datetime.fromisoformat(str(raw)).replace(tzinfo=timezone.utc)
+            except Exception:
+                need_recompute = True
+
+        if not need_recompute and nxt is not None:
+            # If it's in the past, recompute a fresh next time
+            if nxt <= datetime.now(timezone.utc):
+                need_recompute = True
+
+        if need_recompute:
             first_local = _next_local_run(now_local, hh, mi, cadence)
             nxt = first_local.astimezone(timezone.utc)
             store.update_weather_sub(s["id"], next_run_utc=nxt.isoformat())
-            next_txt = _fmt_local(nxt)
 
+        next_txt = _fmt_local(nxt)
         out_lines.append(
-            f"**#{s['id']}** — {s.get('cadence','?')} at {int(s.get('hh',0)):02d}:{int(s.get('mi',0)):02d} CT - "
-            f"ZIP {s.get('zip','?????')} - next: {next_txt}"
+            f"**#{s['id']}** — {cadence} at {hh:02d}:{mi:02d} CT - ZIP {s.get('zip','?????')} - next: {next_txt}"
         )
 
     await inter.followup.send("\n".join(out_lines), ephemeral=True)
+
+@tree.command(name="weather_unsubscribe", description="Unsubscribe from weather DMs by ID.")
+async def weather_unsubscribe(inter: discord.Interaction, sub_id: int):
+    await inter.response.defer(ephemeral=True)
+    ok = store.remove_weather_sub(sub_id, requester_id=inter.user.id)
+    await inter.followup.send("Removed." if ok else "Couldn't remove that ID.", ephemeral=True)
+
+@tasks.loop(seconds=60)
+es), ephemeral=True)
 
 @tree.command(name="weather_unsubscribe", description="Unsubscribe from weather DMs by ID.")
 async def weather_unsubscribe(inter: discord.Interaction, sub_id: int):

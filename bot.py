@@ -733,59 +733,18 @@ DIFF_CHOICES = [
     app_commands.Choice(name="Hard", value="hard"),
 ]
 
-
-# Local fallback questions (used if the API is down)
-BUILTIN_TRIVIA: List[Tuple[str, List[str], int]] = [
-    ("What color are bananas when ripe?", ["Red", "Blue", "Green", "Yellow"], 3),
-    ("How many minutes in an hour?", ["30", "45", "60", "120"], 2),
-    ("Which planet is known as the Red Planet?", ["Earth", "Mars", "Jupiter", "Venus"], 1),
-    ("2 + 2 = ?", ["3", "4", "5", "22"], 1),
-]
-# Fallback trivia (used if OpenTDB is down)
-BUILTIN_TRIVIA = [
-    ("What is the capital of France?", ["Paris", "Rome", "Berlin", "Madrid"], 0),
-    ("2 + 2 * 2 = ?", ["6", "4", "8", "10"], 0),
-    ("Which planet is known as the Red Planet?", ["Mars", "Venus", "Jupiter", "Mercury"], 0),
-    ("Who wrote '1984'?", ["George Orwell", "Aldous Huxley", "J.K. Rowling", "Ernest Hemingway"], 0),
-    ("HTTP status code 404 means?", ["Not Found", "Bad Request", "Forbidden", "Gateway Timeout"], 0),
-]
-
 @tree.command(name="trivia", description="Answer a multiple-choice question for credits (powered by OpenTDB).")
 @app_commands.describe(difficulty="Pick a difficulty (default Any).")
 @app_commands.choices(difficulty=DIFF_CHOICES)
-async @tree.command(name="trivia", description="Answer a multiple-choice question for credits (powered by OpenTDB).")
-@app_commands.describe(difficulty="Pick a difficulty (default Any).")
-@app_commands.choices(difficulty=DIFF_CHOICES)
 async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.Choice[str]] = None):
-    # Always respond within 3s
-    try:
-        await inter.response.defer()
-    except Exception:
-        # Already deferred or responded; ignore
-        pass
-
+    await inter.response.defer()
     diff_val = difficulty.value if difficulty else None
-
-    # Try network fetch, but cap with a hard timeout.
-    fetched = None
-    try:
-        async def _do_fetch():
-            async with aiohttp.ClientSession() as session:
-                return await fetch_trivia_question(session, diff_val or None)
-        fetched = await asyncio.wait_for(_do_fetch(), timeout=8)
-    except Exception:
-        fetched = None
-
-    # Fallback to built-in questions if needed
+    async with aiohttp.ClientSession() as session:
+        fetched = await fetch_trivia_question(session, diff_val or None)
     if not fetched:
-        try:
-            q, choices, correct_idx = random.choice(BUILTIN_TRIVIA)
-        except Exception:
-            return await inter.followup.send("⚠️ Couldn't load a trivia question. Please try again.", ephemeral=True)
-    else:
-        q, choices, correct_idx = fetched  # (kept for clarity — already set above if fallback used)
-
-    # Build and send the question
+        await inter.followup.send("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
+        return
+    q, choices, correct_idx = fetched
     emb = discord.Embed(title="🧠 Trivia Time", description=q)
     letters = ["A","B","C","D"]
     for i, c in enumerate(choices):
@@ -794,46 +753,34 @@ async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.C
 
     class TriviaView(discord.ui.View):
         def __init__(self, uid: int, timeout: float = 30):
-            super().__init__(timeout=timeout); self.uid = uid; self.choice: Optional[int] = None
+            super().__init__(timeout=timeout)
+            self.uid = uid
+            self.choice: Optional[int] = None
             for i, lab in enumerate(letters):
                 self.add_item(self._make_button(lab, i))
         def _make_button(self, label: str, idx: int):
             async def cb(interaction: discord.Interaction, idx=idx):
                 if interaction.user.id != self.uid:
-                    await interaction.response.send_message("This question isn't for you.", ephemeral=True); return
-                self.choice = idx; await interaction.response.defer(); self.stop()
-            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary); btn.callback = cb; return btn
+                    await interaction.response.send_message("This question isn't for you.", ephemeral=True)
+                    return
+                self.choice = idx
+                await interaction.response.defer()
+                self.stop()
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+            btn.callback = cb
+            return btn
 
     view = TriviaView(uid=inter.user.id, timeout=30)
-    try:
-        msg = await inter.followup.send(embed=emb, view=view)
-    except Exception as e:
-        # As a last resort, send plain text
-        return await inter.followup.send(f"Trivia ready, but couldn't send embed: {e}", ephemeral=True)
-
-    # Wait for answer or timeout
-    try:
-        await view.wait()
-    except Exception:
-        pass
-
+    msg = await inter.followup.send(embed=emb, view=view)
+    await view.wait()
     if view.choice is None:
-        try:
-            return await msg.edit(content="⌛ Time's up!", embed=None, view=None)
-        except Exception:
-            return
-
+        await msg.edit(content="⌛ Time's up!", embed=None, view=None)
+        return
     if view.choice == correct_idx:
         store.add_balance(inter.user.id, TRIVIA_REWARD)
-        try:
-            await msg.edit(content=f"✅ Correct! You earned **{TRIVIA_REWARD}** credits.", embed=None, view=None)
-        except Exception:
-            pass
+        await msg.edit(content=f"✅ Correct! You earned **{TRIVIA_REWARD}** credits.", embed=None, view=None)
     else:
-        try:
-            await msg.edit(content=f"❌ Nope. Correct answer was **{letters[correct_idx]}**.", embed=None, view=None)
-        except Exception:
-            pass
+        await msg.edit(content=f"❌ Nope. Correct answer was **{letters[correct_idx]}**.", embed=None, view=None)
 
 # ---------- Blackjack (Dealer or PvP) ----------
 def is_blackjack(cards: List[Tuple[str, str]]) -> bool:

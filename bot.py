@@ -322,7 +322,10 @@ class Store:
         return data["trivia"].get("token")
 
     def set_trivia_token(self, token: Optional[str]):
-
+    def set_trivia_token(self, token: Optional[str]):
+        data = self.read()
+        data['trivia']['token'] = token
+        self.write(data)
     # Weather defaults & subscriptions
     def set_user_zip(self, user_id: int, zip_code: str):
         data = self.read()

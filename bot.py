@@ -1046,7 +1046,7 @@ async def weather_subscribe(
 
 
 
-@tree.command(name="weather_subscriptions", description="List your weather subscriptions and next send time.")
+@tree.command@tree.command(name="weather_subscriptions", description="List your weather subscriptions and next send time.")
 async def weather_subscriptions(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True)
     items = store.list_weather_subs(inter.user.id)

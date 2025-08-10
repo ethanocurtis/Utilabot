@@ -1,772 +1,1128 @@
+
 import os
-import json
-import random
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Tuple
-
+import sys
+import praw
+import requests
+import asyncio
 import discord
-from discord.ext import tasks
+import re
+import feedparser
+import json
+from pathlib import Path
 from discord import app_commands
+from datetime import datetime, time, timedelta
+from urllib.parse import urlparse
 
-# ---------- Config ----------
-DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
-GUILD_IDS: List[int] = []  # Optional: test guild IDs for faster sync, e.g. [123456789012345678]
+# ---------- .env loader (container-friendly) ----------
+ENV_FILE = os.path.join("/app", ".env")
+if os.path.exists(ENV_FILE):
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            if "=" in line:
+                key, value = line.strip().split("=", 1)
+                os.environ[key] = value
+    print(f"[DEBUG] Loaded environment from {ENV_FILE} at startup")
+else:
+    print(f"[WARN] No .env found at {ENV_FILE} on startup")
 
-STARTING_DAILY = 250
-PVP_TIMEOUT = 120  # seconds to accept/decline PvP challenge
+# ---------- Environment ----------
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
+REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "reddit-discord-bot")
+SUBREDDIT = os.environ.get("SUBREDDIT", "selfhosted")
+
+ALLOWED_FLAIRS = [f.strip() for f in os.environ.get("ALLOWED_FLAIR", "").split(",") if f.strip()]
+
+WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", 300))
+POST_LIMIT = int(os.environ.get("POST_LIMIT", 10))
+
+ENABLE_DM = os.environ.get("ENABLE_DM", "false").lower() == "true"
+DISCORD_USER_IDS = [u.strip() for u in os.environ.get("DISCORD_USER_IDS", "").split(",") if u.strip()]
+ADMIN_USER_IDS = [u.strip() for u in os.environ.get("ADMIN_USER_IDS", "").split(",") if u.strip()]
+
+# Separate keywords for Reddit vs RSS (legacy KEYWORDS still supported)
+LEGACY_KEYWORDS = [k.strip().lower() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
+REDDIT_KEYWORDS = [k.strip().lower() for k in os.environ.get("REDDIT_KEYWORDS", "").split(",") if k.strip()] or LEGACY_KEYWORDS
+RSS_KEYWORDS = [k.strip().lower() for k in os.environ.get("RSS_KEYWORDS", "").split(",") if k.strip()]
+
+# RSS feeds and channel IDs
+RSS_FEEDS = [u.strip() for u in os.environ.get("RSS_FEEDS", "").split(",") if u.strip()]
+RSS_LIMIT = int(os.environ.get("RSS_LIMIT", 10))
+DISCORD_CHANNEL_IDS = [c.strip() for c in os.environ.get("DISCORD_CHANNEL_IDS", "").split(",") if c.strip()]
+
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+
+# ---------- Clients ----------
+reddit = praw.Reddit(
+    client_id=REDDIT_CLIENT_ID,
+    client_secret=REDDIT_CLIENT_SECRET,
+    user_agent=REDDIT_USER_AGENT
+)
 
 intents = discord.Intents.default()
-intents.message_content = False
-intents.guilds = True
-intents.members = True
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+# ---------- Small persistence (data dir) ----------
+DATA_DIR = Path("/app/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Persisted "seen" IDs so restarts don't resend old stuff
+SEEN_PATH = DATA_DIR / "seen.json"  # {"reddit": ["id1","id2"], "rss": ["id3","id4"]}
 
-# ---------- Simple JSON Store ----------
-def _ensure_shape(data: dict) -> dict:
-    data.setdefault("wallets", {})
-    data.setdefault("daily", {})
-    data.setdefault("autodelete", {})
-    data.setdefault("stats", {})         # user_id -> {"wins":0,"losses":0,"pushes":0}
-    data.setdefault("achievements", {})  # user_id -> [names]
+# Digest queues and metadata
+DIGEST_QUEUE_PATH = DATA_DIR / "digests.json"     # { uid: [ {type, title, link, meta..., ts} ] }
+DIGEST_META_PATH  = DATA_DIR / "digest_meta.json" # { uid: {"daily_last":"YYYY-MM-DD","weekly_last":"YYYY-WW"} }
+
+def _load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except Exception:
+        return default
+
+def load_seen():
+    data = _load_json(SEEN_PATH, {"reddit": [], "rss": []})
+    if not isinstance(data, dict):
+        data = {"reddit": [], "rss": []}
+    data.setdefault("reddit", [])
+    data.setdefault("rss", [])
     return data
 
+def save_seen(reddit_ids, rss_ids):
+    try:
+        SEEN_PATH.write_text(json.dumps({"reddit": list(reddit_ids), "rss": list(rss_ids)}, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[ERROR] Saving seen.json: {e}")
 
-class Store:
-    def __init__(self, path):
-        self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(_ensure_shape({}), f)
+seen_boot = load_seen()
 
-    def read(self):
-        with open(self.path, "r", encoding="utf-8") as f:
-            return _ensure_shape(json.load(f))
+# ---------- State ----------
+last_post_ids = set(seen_boot.get("reddit", []))
+rss_last_ids = set(seen_boot.get("rss", []))
 
-    def write(self, data):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_ensure_shape(data), f, indent=2)
-        os.replace(tmp, self.path)
+# ---------- Visuals (footer-only icons) ----------
+REDDIT_ICON = "https://www.redditstatic.com/desktop2x/img/favicon/android-icon-192x192.png"
+RSS_ICON = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Feed-icon.svg/192px-Feed-icon.svg.png"
 
-    # Wallet helpers
-    def get_balance(self, user_id: int) -> int:
-        data = self.read()
-        return int(data["wallets"].get(str(user_id), 0))
+# ---------- Small persistence for per-user prefs ----------
+PREFS_PATH = DATA_DIR / "user_prefs.json"  # { "1234567890": { ... }, ... }
+user_prefs = _load_json(PREFS_PATH, {})
 
-    def add_balance(self, user_id: int, amount: int):
-        data = self.read()
-        key = str(user_id)
-        data["wallets"][key] = int(data["wallets"].get(key, 0)) + int(amount)
-        self.write(data)
+def save_prefs():
+    try:
+        PREFS_PATH.write_text(json.dumps(user_prefs, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[ERROR] Saving prefs: {e}")
 
-    def set_balance(self, user_id: int, amount: int):
-        data = self.read()
-        data["wallets"][str(user_id)] = int(amount)
-        self.write(data)
+def _norm_sub(name: str) -> str:
+    name = (name or "").strip()
+    name = name.lower()
+    if name.startswith("r/"):
+        name = name[2:]
+    return name
 
-    # Daily helpers
-    def get_last_daily(self, user_id: int) -> Optional[str]:
-        data = self.read()
-        return data["daily"].get(str(user_id))
+def get_user_prefs(uid: int):
+    """Return merged view of global defaults + user overrides."""
+    uid = str(uid)
+    base = {
+        "enable_dm": ENABLE_DM,            # default to global for convenience
+        "reddit_keywords": [],             # empty => allow all for personal
+        "rss_keywords": [],                # empty => allow all for personal
+        "quiet_hours": None,               # {"start":"22:00","end":"07:00"} or None
+        "digest": "off",                   # off | daily | weekly
+        "digest_time": "09:00",            # UTC HH:MM for daily/weekly send
+        "digest_day": "mon",               # for weekly digests: mon|tue|...|sun
+        "preferred_channel_id": None,      # channel to send to instead of DM
+        "reddit_flairs": [],               # optional personal flair filter; empty => allow all
+        "feeds": [],                       # personal RSS/Atom feed URLs
+        "subreddits": []                   # personal subreddit list (names without r/)
+    }
+    p = {**base, **user_prefs.get(uid, {})}
+    # normalize subs
+    p["subreddits"] = [_norm_sub(s) for s in p.get("subreddits", []) if _norm_sub(s)]
+    # normalize digest day
+    day = (p.get("digest_day") or "mon").lower()
+    if day not in ("mon","tue","wed","thu","fri","sat","sun"):
+        day = "mon"
+    p["digest_day"] = day
+    return p
 
-    def set_last_daily(self, user_id: int, iso_ts: str):
-        data = self.read()
-        data["daily"][str(user_id)] = iso_ts
-        self.write(data)
+def set_user_pref(uid: int, key: str, value):
+    uid = str(uid)
+    cur = user_prefs.get(uid, {})
+    cur[key] = value
+    user_prefs[uid] = cur
+    save_prefs()
 
-    # Auto-delete config: {channel_id: seconds}
-    def get_autodelete(self) -> dict:
-        return self.read()["autodelete"]
-
-    def set_autodelete(self, channel_id: int, seconds: int):
-        data = self.read()
-        data["autodelete"][str(channel_id)] = int(seconds)
-        self.write(data)
-
-    def remove_autodelete(self, channel_id: int):
-        data = self.read()
-        data["autodelete"].pop(str(channel_id), None)
-        self.write(data)
-
-    # Stats & achievements
-    def add_result(self, user_id: int, result: str):
-        data = self.read()
-        s = data["stats"].get(str(user_id), {"wins": 0, "losses": 0, "pushes": 0})
-        if result == "win":
-            s["wins"] += 1
-        elif result == "loss":
-            s["losses"] += 1
-        else:
-            s["pushes"] += 1
-        data["stats"][str(user_id)] = s
-        self.write(data)
-
-    def get_stats(self, user_id: int) -> dict:
-        data = self.read()
-        return data["stats"].get(str(user_id), {"wins": 0, "losses": 0, "pushes": 0})
-
-    def list_top(self, key: str, limit: int = 10):
-        data = self.read()
-        if key == "balance":
-            items = [(int(uid), int(bal)) for uid, bal in data["wallets"].items()]
-            items.sort(key=lambda x: x[1], reverse=True)
-            return items[:limit]
-        elif key == "wins":
-            stats = data["stats"]
-            items = [(int(uid), s.get("wins", 0)) for uid, s in stats.items()]
-            items.sort(key=lambda x: x[1], reverse=True)
-            return items[:limit]
-        return []
-
-    def get_achievements(self, user_id: int) -> List[str]:
-        data = self.read()
-        return data["achievements"].get(str(user_id), [])
-
-    def award_achievement(self, user_id: int, name: str) -> bool:
-        data = self.read()
-        arr = data["achievements"].get(str(user_id), [])
-        if name not in arr:
-            arr.append(name)
-            data["achievements"][str(user_id)] = arr
-            self.write(data)
-            return True
+def is_quiet_now(uid: int):
+    """Quiet hours apply ONLY to personal deliveries (global DM list ignores this)."""
+    q = get_user_prefs(uid).get("quiet_hours")
+    if not q:
+        return False
+    try:
+        sH, sM = map(int, q["start"].split(":"))
+        eH, eM = map(int, q["end"].split(":"))
+        now = datetime.utcnow().time()
+        start, end = time(sH, sM), time(eH, eM)
+        return (start <= now < end) if start < end else (now >= start or now < end)
+    except Exception:
         return False
 
-
-store = Store(DATA_PATH)
-
-
-# ---------- Cards / Blackjack helpers ----------
-SUITS = ["♠", "♥", "♦", "♣"]
-RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-VALUES = {**{str(i): i for i in range(2, 11)}, "J": 10, "Q": 10, "K": 10, "A": 11}
-
-
-def deal_deck():
-    deck = [(r, s) for s in SUITS for r in RANKS]
-    random.shuffle(deck)
-    return deck
-
-
-def hand_value(cards: List[Tuple[str, str]]) -> int:
-    total = sum(VALUES[r] for r, _ in cards)
-    aces = sum(1 for r, _ in cards if r == "A")
-    while total > 21 and aces:
-        total -= 10
-        aces -= 1
-    return total
-
-
-def fmt_hand(cards: List[Tuple[str, str]]) -> str:
-    return " ".join(f"{r}{s}" for r, s in cards) + f" (={hand_value(cards)})"
-
-
-def is_blackjack(cards: List[Tuple[str, str]]) -> bool:
-    return len(cards) == 2 and hand_value(cards) == 21
-
-
-# ---------- Utility ----------
-def require_manage_messages():
-    def predicate(inter: discord.Interaction):
-        perms = inter.channel.permissions_for(inter.user) if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None
-        if not perms or not perms.manage_messages:
-            raise app_commands.CheckFailure("You need the **Manage Messages** permission here.")
-        return True
-    return app_commands.check(predicate)
-
-
-def _maybe_award_after_hand(user_id: int, bet_delta: int, player_cards: List[Tuple[str, str]], won: bool) -> List[str]:
-    newly: List[str] = []
-    # First win
-    if won and store.get_stats(user_id).get("wins", 0) == 0:
-        if store.award_achievement(user_id, "First Blood"):
-            newly.append("First Blood")
-    # Blackjack
-    if is_blackjack(player_cards):
-        if store.award_achievement(user_id, "Blackjack!"):
-            newly.append("Blackjack!")
-    # High Roller
-    if won and bet_delta >= 1000:
-        if store.award_achievement(user_id, "High Roller (1k+)"):
-            newly.append("High Roller (1k+)")
-    # Milestones
-    wins = store.get_stats(user_id).get("wins", 0)
-    for m in (5, 10, 25, 50, 100):
-        name = f"Win Milestone {m}"
-        if wins >= m and store.award_achievement(user_id, name):
-            newly.append(name)
-    return newly
-
-
-# ---------- Views for PvP Blackjack ----------
-class PvPBlackjackView(discord.ui.View):
-    """One shared view for spectators; only the active player can press buttons."""
-    def __init__(self, current_player_id: int, timeout: float = 120):
-        super().__init__(timeout=timeout)
-        self.current_player_id = current_player_id
-        self.choice: Optional[str] = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Only current player may act
-        if interaction.user.id != self.current_player_id:
-            await interaction.response.send_message("It's not your turn.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
-    async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.choice = "hit"
-        await interaction.response.defer()
-        self.stop()
-
-    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
-    async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.choice = "stand"
-        await interaction.response.defer()
-        self.stop()
-
-
-class PvPChallengeView(discord.ui.View):
-    def __init__(self, challenger_id: int, challenged_id: int, timeout: float = PVP_TIMEOUT):
-        super().__init__(timeout=timeout)
-        self.challenger_id = challenger_id
-        self.challenged_id = challenged_id
-        self.accepted: Optional[bool] = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.challenged_id:
-            await interaction.response.send_message("Only the challenged user can respond.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.accepted = True
-        await interaction.response.defer()
-        self.stop()
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.accepted = False
-        await interaction.response.defer()
-        self.stop()
-
-
-# ---------- Commands ----------
-@tree.command(name="balance", description="Check your balance.")
-async def balance(inter: discord.Interaction, user: Optional[discord.User] = None):
-    target = user or inter.user
-    bal = store.get_balance(target.id)
-    await inter.response.send_message(f"💰 **{target.display_name}** has **{bal}** credits.")
-
-
-@tree.command(name="daily", description="Claim your daily free credits.")
-async def daily(inter: discord.Interaction):
-    now = datetime.now(timezone.utc)
-    last_iso = store.get_last_daily(inter.user.id)
-    if last_iso:
-        last = datetime.fromisoformat(last_iso)
-        if now - last < timedelta(hours=20):  # generous window
-            remaining = timedelta(hours=20) - (now - last)
-            hrs = int(remaining.total_seconds() // 3600)
-            mins = int((remaining.total_seconds() % 3600) // 60)
-            return await inter.response.send_message(
-                f"⏳ You already claimed. Try again in **{hrs}h {mins}m**.",
-                ephemeral=True
-            )
-    store.add_balance(inter.user.id, STARTING_DAILY)
-    store.set_last_daily(inter.user.id, now.isoformat())
-    await inter.response.send_message(f"✅ You claimed **{STARTING_DAILY}** credits. Use `/blackjack` or `/highlow` to play!")
-
-
-# ----- Blackjack (Dealer or PvP spectator-friendly) -----
-@tree.command(name="blackjack", description="Play Blackjack vs dealer or challenge another user (spectator-friendly).")
-@app_commands.describe(bet="Amount to wager", opponent="Optional: challenge another user for PvP")
-async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], opponent: Optional[discord.User] = None):
-    bettor_id = inter.user.id
-    bal = store.get_balance(bettor_id)
-    if bal < bet:
-        return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
-
-    # PvP spectator-friendly mode
-    if opponent and opponent.id != inter.user.id and not opponent.bot:
-        opp_bal = store.get_balance(opponent.id)
-        if opp_bal < bet:
-            return await inter.response.send_message(f"❌ {opponent.mention} doesn’t have enough credits to accept.", ephemeral=True)
-
-        view_challenge = PvPChallengeView(challenger_id=inter.user.id, challenged_id=opponent.id)
-        await inter.response.send_message(
-            f"🎲 {opponent.mention}, **{inter.user.display_name}** challenges you to Blackjack for **{bet}** credits each. Accept?",
-            view=view_challenge
-        )
-        await view_challenge.wait()
-        if view_challenge.accepted is None:
-            return await inter.followup.send("⌛ Challenge expired.")
-        if not view_challenge.accepted:
-            return await inter.followup.send("🚫 Challenge declined.")
-
-        # Start game (single shared public message)
-        deck = deal_deck()
-        p1 = [deck.pop(), deck.pop()]
-        p2 = [deck.pop(), deck.pop()]
-        current_player_id = inter.user.id  # challenger goes first
-
-        def embed_state(title_suffix: str = ""):
-            title = f"♠ PvP Blackjack {title_suffix}".strip()
-            emb = discord.Embed(title=title, description=f"Bet each: **{bet}**")
-            emb.add_field(name=f"{inter.user.display_name}", value=fmt_hand(p1), inline=True)
-            emb.add_field(name=f"{opponent.display_name}", value=fmt_hand(p2), inline=True)
-            emb.add_field(
-                name="Turn",
-                value=f"▶️ **{inter.user.display_name if current_player_id==inter.user.id else opponent.display_name}**",
-                inline=False
-            )
-            return emb
-
-        view = PvPBlackjackView(current_player_id=current_player_id)
-        msg = await inter.followup.send(embed=embed_state("— Game Start"), view=view)
-
-        # Turn loop for each player
-        async def play_turn(player_id: int, hand: List[Tuple[str, str]], name: str):
-            nonlocal view, msg, current_player_id
-            # swap current player in the view
-            current_player_id = player_id
-            view = PvPBlackjackView(current_player_id=current_player_id)
-            try:
-                await msg.edit(embed=embed_state(), view=view)
-            except discord.HTTPException:
-                pass
-
-            # actions until stand or bust or timeout
-            while hand_value(hand) < 21:
-                await view.wait()
-                choice = view.choice
-                view.choice = None
-                if choice == "hit":
-                    hand.append(deck.pop())
-                    try:
-                        await msg.edit(embed=embed_state())
-                    except discord.HTTPException:
-                        pass
-                    # refresh view (to reset button state)
-                    view = PvPBlackjackView(current_player_id=current_player_id)
-                    try:
-                        await msg.edit(view=view)
-                    except discord.HTTPException:
-                        pass
-                    continue
-                else:
-                    break  # stand or timeout
-
-            # disable buttons for this turn
-            for child in view.children:
-                if isinstance(child, discord.ui.Button):
-                    child.disabled = True
-            try:
-                await msg.edit(view=view)
-            except discord.HTTPException:
-                pass
-
-        # Challenger then opponent
-        await play_turn(inter.user.id, p1, inter.user.display_name)
-        await play_turn(opponent.id, p2, opponent.display_name)
-
-        v1 = hand_value(p1)
-        v2 = hand_value(p2)
-
-        outcome = "Tie! It’s a push."
-        if v1 > 21 and v2 > 21:
-            store.add_result(inter.user.id, "push")
-            store.add_result(opponent.id, "push")
-        elif v1 > 21:
-            outcome = f"**{opponent.display_name}** wins!"
-            store.add_balance(inter.user.id, -bet)
-            store.add_balance(opponent.id, bet)
-            store.add_result(inter.user.id, "loss")
-            store.add_result(opponent.id, "win")
-        elif v2 > 21:
-            outcome = f"**{inter.user.display_name}** wins!"
-            store.add_balance(opponent.id, -bet)
-            store.add_balance(inter.user.id, bet)
-            store.add_result(opponent.id, "loss")
-            store.add_result(inter.user.id, "win")
-        else:
-            if v1 > v2:
-                outcome = f"**{inter.user.display_name}** wins!"
-                store.add_balance(opponent.id, -bet)
-                store.add_balance(inter.user.id, bet)
-                store.add_result(opponent.id, "loss")
-                store.add_result(inter.user.id, "win")
-            elif v2 > v1:
-                outcome = f"**{opponent.display_name}** wins!"
-                store.add_balance(inter.user.id, -bet)
-                store.add_balance(opponent.id, bet)
-                store.add_result(inter.user.id, "loss")
-                store.add_result(opponent.id, "win")
-            else:
-                store.add_result(inter.user.id, "push")
-                store.add_result(opponent.id, "push")
-
-        # Achievements announce
-        new1 = _maybe_award_after_hand(inter.user.id, bet, p1, "wins" in outcome and inter.user.display_name in outcome)
-        new2 = _maybe_award_after_hand(opponent.id, bet, p2, "wins" in outcome and opponent.display_name in outcome)
-
-        emb = discord.Embed(title="♠ PvP Blackjack — Result", description=f"Bet each: **{bet}**")
-        emb.add_field(name=inter.user.display_name, value=fmt_hand(p1), inline=True)
-        emb.add_field(name=opponent.display_name, value=fmt_hand(p2), inline=True)
-        emb.add_field(name="Outcome", value=outcome, inline=False)
-        if new1 or new2:
-            awards_text = ""
-            if new1:
-                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\n"
-            if new2:
-                awards_text += f"🏆 {opponent.display_name}: " + ", ".join(new2)
-            if awards_text:
-                emb.add_field(name="New Achievements", value=awards_text, inline=False)
-        try:
-            await msg.edit(embed=emb, view=None)
-        except discord.HTTPException:
-            await inter.followup.send(embed=emb)
-        return
-
-    # Vs Dealer (interactive for the player; spectators see updates)
-    deck = deal_deck()
-    player = [deck.pop(), deck.pop()]
-    dealer = [deck.pop(), deck.pop()]
-
-    class DealerView(discord.ui.View):
-        def __init__(self, uid: int, timeout: float = 120):
-            super().__init__(timeout=timeout)
-            self.uid = uid
-            self.choice: Optional[str] = None
-
-        async def interaction_check(self, interaction: discord.Interaction) -> bool:
-            if interaction.user.id != self.uid:
-                await interaction.response.send_message("This isn’t your game.", ephemeral=True)
-                return False
-            return True
-
-        @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
-        async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
-            self.choice = "hit"
-            await interaction.response.defer()
-            self.stop()
-
-        @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
-        async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
-            self.choice = "stand"
-            await interaction.response.defer()
-            self.stop()
-
-    def dealer_embed(title="♣ Blackjack vs Dealer"):
-        emb = discord.Embed(title=title, description=f"Bet: **{bet}**")
-        emb.add_field(name="Your Hand", value=fmt_hand(player), inline=True)
-        # show only dealer upcard until stand/bust
-        emb.add_field(name="Dealer Shows", value=f"{dealer[0][0]}{dealer[0][1]} ??", inline=True)
-        return emb
-
-    await inter.response.send_message(embed=dealer_embed(), view=DealerView(uid=inter.user.id))
-    msg = await inter.original_response()
-
-    view = DealerView(uid=inter.user.id)
-    await msg.edit(view=view)
-
-    while True:
-        if hand_value(player) >= 21:
-            break
-        await view.wait()
-        choice = view.choice
-        view.choice = None
-        if choice == "hit":
-            player.append(deck.pop())
-            try:
-                await msg.edit(embed=dealer_embed(), view=view)
-            except discord.HTTPException:
-                pass
-            view = DealerView(uid=inter.user.id)  # refresh buttons
-            try:
-                await msg.edit(view=view)
-            except discord.HTTPException:
-                pass
-            continue
-        else:
-            break
-
-    # Dealer plays
-    while hand_value(dealer) < 17:
-        dealer.append(deck.pop())
-
-    pv = hand_value(player)
-    dv = hand_value(dealer)
-
-    won_flag = False
-    if pv > 21:
-        result = "You busted. Dealer wins."
-        store.add_balance(inter.user.id, -bet)
-        store.add_result(inter.user.id, "loss")
-    elif dv > 21 or pv > dv:
-        result = "You win!"
-        store.add_balance(inter.user.id, bet)
-        store.add_result(inter.user.id, "win")
-        won_flag = True
-    elif dv > pv:
-        result = "Dealer wins."
-        store.add_balance(inter.user.id, -bet)
-        store.add_result(inter.user.id, "loss")
-    else:
-        result = "Push."
-        store.add_result(inter.user.id, "push")
-
-    newly = _maybe_award_after_hand(inter.user.id, bet if won_flag else 0, player, won_flag)
-
-    final = discord.Embed(title="♣ Blackjack vs Dealer — Result", description=f"Bet: **{bet}**")
-    final.add_field(name="Your Hand", value=fmt_hand(player), inline=True)
-    final.add_field(name="Dealer Hand", value=fmt_hand(dealer), inline=True)
-    final.add_field(name="Outcome", value=result, inline=False)
-    if newly:
-        final.add_field(name="New Achievements", value=", ".join(newly), inline=False)
-    await msg.edit(embed=final, view=None)
-
-
-# ----- New Mini‑Game: High/Low -----
-# Reveal one card, you guess whether the next card will be Higher or Lower.
-# Payout: 1:1 (equal rank = push)
-@tree.command(name="highlow", description="Simple High/Low card game. Guess if the next card is higher or lower.")
-@app_commands.describe(bet="Amount to wager")
-async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
-    if store.get_balance(inter.user.id) < bet:
-        return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
-
-    deck = deal_deck()
-    first = deck.pop()
-
-    def rank_value(r: str) -> int:
-        # Treat A as high
-        order = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
-        return order.index(r)
-
-    class HLView(discord.ui.View):
-        def __init__(self, uid: int, timeout: float = 60):
-            super().__init__(timeout=timeout)
-            self.uid = uid
-            self.choice: Optional[str] = None
-
-        async def interaction_check(self, interaction: discord.Interaction) -> bool:
-            if interaction.user.id != self.uid:
-                await interaction.response.send_message("This isn’t your round.", ephemeral=True)
-                return False
-            return True
-
-        @discord.ui.button(label="Higher", style=discord.ButtonStyle.primary)
-        async def higher(self, interaction: discord.Interaction, button: discord.ui.Button):
-            self.choice = "higher"
-            await interaction.response.defer()
-            self.stop()
-
-        @discord.ui.button(label="Lower", style=discord.ButtonStyle.secondary)
-        async def lower(self, interaction: discord.Interaction, button: discord.ui.Button):
-            self.choice = "lower"
-            await interaction.response.defer()
-            self.stop()
-
-    def make_embed(title="♦ High/Low"):
-        emb = discord.Embed(title=title, description=f"Bet: **{bet}**")
-        emb.add_field(name="Current Card", value=f"{first[0]}{first[1]}", inline=True)
-        emb.set_footer(text="Guess if the next card is higher or lower.")
-        return emb
-
-    view = HLView(uid=inter.user.id)
-    await inter.response.send_message(embed=make_embed(), view=view)
-    msg = await inter.original_response()
-    await view.wait()
-
-    # Draw second card and settle
-    second = deck.pop()
-    first_v = rank_value(first[0])
-    second_v = rank_value(second[0])
-
-    outcome = "Push."
-    result_tag = "push"
-    if view.choice is None:
-        # timeout counts as reveal only
-        pass
-    elif second_v == first_v:
-        outcome = "Equal rank! Push."
-    else:
-        is_higher = second_v > first_v
-        if (is_higher and view.choice == "higher") or ((not is_higher) and view.choice == "lower"):
-            outcome = "You win!"
-            result_tag = "win"
-            store.add_balance(inter.user.id, bet)
-        else:
-            outcome = "You lose."
-            result_tag = "loss"
-            store.add_balance(inter.user.id, -bet)
-
-    store.add_result(inter.user.id, result_tag)
-    newly = []
-    if result_tag == "win":
-        newly = _maybe_award_after_hand(inter.user.id, bet, [first, second], True)
-
-    emb = discord.Embed(title="♦ High/Low — Result", description=f"Bet: **{bet}**")
-    emb.add_field(name="First Card", value=f"{first[0]}{first[1]}", inline=True)
-    emb.add_field(name="Second Card", value=f"{second[0]}{second[1]}", inline=True)
-    emb.add_field(name="Outcome", value=outcome, inline=False)
-    if newly:
-        emb.add_field(name="New Achievements", value=", ".join(newly), inline=False)
-    await msg.edit(embed=emb, view=None)
-
-
-# ----- Moderation: Purge -----
-@tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
-@app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
-@require_manage_messages()
-async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 1000], user: Optional[discord.User] = None):
-    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("This command can only be used in text channels.", ephemeral=True)
-
-    def check(m: discord.Message):
-        return (user is None) or (m.author.id == user.id)
-
-    await inter.response.defer(ephemeral=True)
+# ---------- Digest helpers ----------
+def _load_digests():
+    data = _load_json(DIGEST_QUEUE_PATH, {})
+    return data if isinstance(data, dict) else {}
+
+def _save_digests(d):
     try:
-        deleted = await inter.channel.purge(limit=limit, check=check, bulk=True)
-        await inter.followup.send(f"🧹 Deleted **{len(deleted)}** messages.", ephemeral=True)
-    except discord.Forbidden:
-        await inter.followup.send("I need the **Manage Messages** and **Read Message History** permissions.", ephemeral=True)
-    except discord.HTTPException as e:
-        await inter.followup.send(f"Error while deleting: {e}", ephemeral=True)
+        DIGEST_QUEUE_PATH.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[ERROR] Saving digests: {e}")
 
+def _load_digest_meta():
+    data = _load_json(DIGEST_META_PATH, {})
+    return data if isinstance(data, dict) else {}
 
-# ----- Auto-Delete: set/disable/status -----
-@tree.command(name="autodelete_set", description="Enable auto-delete for this channel after N minutes.")
-@app_commands.describe(minutes="Delete messages older than this many minutes (min 1, max 1440)")
-@require_manage_messages()
-async def autodelete_set(inter: discord.Interaction, minutes: app_commands.Range[int, 1, 1440]):
-    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    seconds = minutes * 60
-    store.set_autodelete(inter.channel.id, seconds)
-    await inter.response.send_message(f"🗑️ Auto-delete enabled: messages older than **{minutes}** minutes will be cleaned up periodically.", ephemeral=True)
+def _save_digest_meta(d):
+    try:
+        DIGEST_META_PATH.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[ERROR] Saving digest meta: {e}")
 
+def queue_digest_item(uid: int, item: dict):
+    q = _load_digests()
+    arr = q.get(str(uid), [])
+    arr.append(item)
+    q[str(uid)] = arr
+    _save_digests(q)
 
-@tree.command(name="autodelete_disable", description="Disable auto-delete for this channel.")
-@require_manage_messages()
-async def autodelete_disable(inter: discord.Interaction):
-    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    store.remove_autodelete(inter.channel.id)
-    await inter.response.send_message("🛑 Auto-delete disabled for this channel.", ephemeral=True)
+def pop_all_digest_items(uid: int):
+    q = _load_digests()
+    arr = q.get(str(uid), [])
+    q[str(uid)] = []
+    _save_digests(q)
+    return arr
 
+def weekday_index(day: str) -> int:
+    mapping = {"mon":0,"tue":1,"wed":2,"thu":3,"fri":4,"sat":5,"sun":6}
+    return mapping.get(day.lower(), 0)
 
-@tree.command(name="autodelete_status", description="Show auto-delete settings for this channel.")
-async def autodelete_status(inter: discord.Interaction):
-    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    conf = store.get_autodelete()
-    secs = conf.get(str(inter.channel.id))
-    if secs:
-        mins = secs // 60
-        await inter.response.send_message(f"✅ Auto-delete is **ON**: older than **{mins}** minutes.", ephemeral=True)
-    else:
-        await inter.response.send_message("❌ Auto-delete is **OFF** for this channel.", ephemeral=True)
+def should_send_digest(uid: int) -> bool:
+    p = get_user_prefs(uid)
+    mode = p.get("digest","off")
+    if mode == "off":
+        return False
 
+    hh, mm = (p.get("digest_time","09:00") or "09:00").split(":")
+    hh, mm = int(hh), int(mm)
+    now = datetime.utcnow()
+    due_today = now.hour == hh and now.minute >= mm  # minute or later within the same minute window
 
-# ----- Leaderboard & Achievements -----
-@tree.command(name="leaderboard", description="Show the top players.")
-@app_commands.describe(category="Choose 'balance' or 'wins'")
-@app_commands.choices(category=[
-    app_commands.Choice(name="balance", value="balance"),
-    app_commands.Choice(name="wins", value="wins")
-])
-async def leaderboard(inter: discord.Interaction, category: app_commands.Choice[str]):
-    top = store.list_top(category.value, 10)
-    if not top:
-        return await inter.response.send_message("No data yet.")
-    lines = []
-    for i, (uid, val) in enumerate(top, start=1):
-        try:
-            user = await bot.fetch_user(uid)
-            uname = user.display_name
-        except Exception:
-            uname = f"User {uid}"
-        lines.append(f"**{i}. {uname}** — {val} {'credits' if category.value=='balance' else 'wins'}")
-    emb = discord.Embed(title=f"🏆 Leaderboard — {category.value.capitalize()}", description="\n".join(lines))
-    await inter.response.send_message(embed=emb)
+    meta = _load_digest_meta()
+    rec = meta.get(str(uid), {})
+    if mode == "daily":
+        # compare date
+        last = rec.get("daily_last", "")  # "YYYY-MM-DD"
+        today = now.strftime("%Y-%m-%d")
+        return due_today and last != today
+    if mode == "weekly":
+        # check day and week number
+        if now.weekday() != weekday_index(p.get("digest_day","mon")) or not due_today:
+            return False
+        iso_year, iso_week, _ = now.isocalendar()
+        key = f"{iso_year}-{iso_week:02d}"
+        last = rec.get("weekly_last","")
+        return last != key
+    return False
 
-
-@tree.command(name="achievements", description="Show your achievements (or another user's).")
-async def achievements(inter: discord.Interaction, user: Optional[discord.User] = None):
-    target = user or inter.user
-    ach = store.get_achievements(target.id)
-    emb = discord.Embed(title=f"🏆 Achievements — {target.display_name}")
-    if not ach:
-        emb.description = "None yet — go win some games!"
-    else:
-        emb.description = ", ".join(sorted(ach))
-    stats = store.get_stats(target.id)
-    emb.add_field(name="Record", value=f"{stats.get('wins',0)}W / {stats.get('losses',0)}L / {stats.get('pushes',0)}P", inline=False)
-    await inter.response.send_message(embed=emb)
-
-
-# ---------- Background Cleaner ----------
-@tasks.loop(minutes=2)
-async def cleanup_loop():
-    conf = store.get_autodelete()
-    if not conf:
+def mark_digest_sent(uid: int):
+    p = get_user_prefs(uid)
+    mode = p.get("digest","off")
+    if mode == "off":
         return
-    now = datetime.now(timezone.utc)
-    for chan_id, secs in list(conf.items()):
-        channel = bot.get_channel(int(chan_id))
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            continue
+    now = datetime.utcnow()
+    meta = _load_digest_meta()
+    rec = meta.get(str(uid), {})
+    if mode == "daily":
+        rec["daily_last"] = now.strftime("%Y-%m-%d")
+    elif mode == "weekly":
+        iso_year, iso_week, _ = now.isocalendar()
+        rec["weekly_last"] = f"{iso_year}-{iso_week:02d}"
+    meta[str(uid)] = rec
+    _save_digest_meta(meta)
 
-        cutoff = now - timedelta(seconds=int(secs))
-        try:
-            await channel.purge(
-                limit=1000,
-                check=lambda m: m.created_at < cutoff,
-                bulk=True
-            )
-        except discord.Forbidden:
-            continue
-        except discord.HTTPException:
-            continue
+# ---------- Utils ----------
+def update_env_var(key, value):
+    lines = []
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    updated = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = f"{key}={value}\n"
+            updated = True
+            break
+    if not updated:
+        lines.append(f"{key}={value}\n")
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines)
 
+def make_embed(title, description, color=discord.Color.blue(), url=None):
+    embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.utcnow())
+    if url:
+        embed.url = url
+    embed.set_footer(text="MultiNotify Bot")
+    return embed
 
-@cleanup_loop.before_loop
-async def before_cleanup():
-    await bot.wait_until_ready()
+def domain_from_url(link: str) -> str:
+    try:
+        return urlparse(link).netloc or "unknown"
+    except Exception:
+        return "unknown"
 
+def matches_keywords_text(text: str, keywords_list) -> bool:
+    if not keywords_list:
+        return True
+    content = (text or "").lower()
+    return any(re.search(rf"\b{re.escape(kw)}\b", content) for kw in keywords_list)
 
-# ---------- Startup ----------
-@bot.event
-async def on_ready():
-    # Sync slash commands
-    if GUILD_IDS:
-        for gid in GUILD_IDS:
-            guild = discord.Object(id=gid)
-            await tree.sync(guild=guild)
+def matches_keywords_post(post, keywords_list) -> bool:
+    if not keywords_list:
+        return True
+    content = f"{post.title} {getattr(post, 'selftext', '')}".lower()
+    return any(re.search(rf"\b{re.escape(kw)}\b", content) for kw in keywords_list)
+
+def build_source_embed(title, url, description, color, source_type):
+    embed = discord.Embed(title=title, url=url, description=description, color=color, timestamp=datetime.utcnow())
+    if source_type == "reddit":
+        embed.set_author(name="Reddit")
+        embed.set_footer(text="MultiNotify • Reddit", icon_url=REDDIT_ICON)
+    elif source_type == "rss":
+        embed.set_author(name="RSS Feed")
+        embed.set_footer(text="MultiNotify • RSS", icon_url=RSS_ICON)
     else:
-        await tree.sync()
+        embed.set_footer(text="MultiNotify")
+    return embed
 
-    if not cleanup_loop.is_running():
-        cleanup_loop.start()
+async def send_webhook_embed(title, url, description, color, source_type):
+    if not WEBHOOK_URL:
+        return
+    if "discord.com" in WEBHOOK_URL:
+        embed = build_source_embed(title, url, description, color, source_type)
+        try:
+            requests.post(WEBHOOK_URL, json={"embeds": [embed.to_dict()]}, timeout=10)
+        except Exception as e:
+            print(f"[ERROR] Failed to send Discord webhook embed: {e}")
+    else:
+        prefix = "[Reddit]" if source_type == "reddit" else "[RSS]"
+        msg = f"{prefix} {title}\n{url}\n{description}"
+        try:
+            requests.post(WEBHOOK_URL, json={"text": msg}, timeout=10)
+        except Exception as e:
+            print(f"[ERROR] Failed to send non-Discord webhook: {e}")
 
-    print(f"Logged in as {bot.user} ({bot.user.id})")
+async def notify_channels(title, url, description, color, source_type):
+    if not DISCORD_CHANNEL_IDS:
+        return
+    embed = build_source_embed(title, url, description, color, source_type)
+    for cid in DISCORD_CHANNEL_IDS:
+        try:
+            channel = client.get_channel(int(cid))
+            if channel is None:
+                channel = await client.fetch_channel(int(cid))
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"[ERROR] Failed to send to channel {cid}: {e}")
 
+async def notify_dms(message: str):
+    """GLOBAL DM LIST: this intentionally ignores quiet hours."""
+    if not (ENABLE_DM and DISCORD_USER_IDS):
+        return
+    for uid in DISCORD_USER_IDS:
+        try:
+            user = await client.fetch_user(int(uid))
+            await user.send(message)
+        except Exception as e:
+            print(f"[ERROR] Failed to DM {uid}: {e}")
 
-# ---------- Main ----------
-def main():
-    token = os.environ.get("DISCORD_TOKEN")
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN not set")
-    bot.run(token)
+# ---------- Helpers to compute unions ----------
+def union_user_subreddits():
+    subs = {_norm_sub(SUBREDDIT)} if SUBREDDIT and _norm_sub(SUBREDDIT) else set()
+    for p in user_prefs.values():
+        for s in p.get("subreddits", []):
+            if s:
+                subs.add(_norm_sub(s))
+    return subs
 
+def union_user_feeds():
+    feeds = set(RSS_FEEDS)
+    for p in user_prefs.values():
+        for u in p.get("feeds", []):
+            if u:
+                feeds.add(u.strip())
+    return feeds
 
-if __name__ == "__main__":
-    main()
+# ---------- Reddit ----------
+async def process_reddit():
+    global last_post_ids, rss_last_ids
+
+    # Build union of subreddits to fetch for PERSONAL pipeline
+    union_subs = union_user_subreddits()
+    # If no subs anywhere, skip reddit entirely
+    if not union_subs:
+        return
+
+    global_posts = []    # pass global filters from the global SUBREDDIT only (if defined)
+    personal_posts = []  # (post, sub_name) from ANY union subreddit
+
+    for sub_name in union_subs:
+        try:
+            sr = reddit.subreddit(sub_name)
+            for submission in sr.new(limit=POST_LIMIT):
+                if submission.id in last_post_ids:
+                    continue
+
+                # Record for personal route (ignores global filters)
+                personal_posts.append((submission, sub_name))
+
+                # Global route only if SUBREDDIT is set and this matches it
+                if SUBREDDIT and sub_name == _norm_sub(SUBREDDIT):
+                    flair_ok = (not ALLOWED_FLAIRS) or (submission.link_flair_text in ALLOWED_FLAIRS)
+                    kw_ok = matches_keywords_post(submission, REDDIT_KEYWORDS)
+                    if flair_ok and kw_ok:
+                        global_posts.append(submission)
+
+                last_post_ids.add(submission.id)
+        except Exception as e:
+            print(f"[ERROR] Fetch subreddit r/{sub_name}: {e}")
+
+    # Save seen after scanning
+    save_seen(last_post_ids, rss_last_ids)
+
+    # ---------- GLOBAL DELIVERY (unchanged behavior) ----------
+    if SUBREDDIT:
+        for post in reversed(global_posts):
+            flair = post.link_flair_text if post.link_flair_text else "No Flair"
+            post_url = f"https://reddit.com{post.permalink}"
+            description = f"Subreddit: r/{_norm_sub(SUBREDDIT)}\nFlair: **{flair}**\nAuthor: u/{post.author}"
+
+            await send_webhook_embed(post.title, post_url, description, color=discord.Color.orange(), source_type="reddit")
+            await notify_channels(post.title, post_url, description, color=discord.Color.orange(), source_type="reddit")
+
+            # Global DM list — deliberately IGNORE quiet hours
+            if ENABLE_DM and DISCORD_USER_IDS:
+                dm_text = f"[Reddit] r/{_norm_sub(SUBREDDIT)} • Flair: {flair} • u/{post.author}\n{post.title}\n{post_url}"
+                await notify_dms(dm_text)
+
+    # ---------- PERSONAL DELIVERY (ignores global filters) ----------
+    if user_prefs:
+        for post, sub_name in reversed(personal_posts):
+            post_url = f"https://reddit.com{post.permalink}"
+            flair = post.link_flair_text or "No Flair"
+            sub_name_l = _norm_sub(sub_name)
+
+            for uid_str in list(user_prefs.keys()):
+                uid = int(uid_str)
+                p = get_user_prefs(uid)
+
+                # Determine which subreddits this user wants:
+                user_subs = p.get("subreddits", [])
+                if user_subs:
+                    if sub_name_l not in set(user_subs):
+                        continue
+                else:
+                    # If user hasn't set subs and SUBREDDIT cleared, skip personal delivery
+                    if not SUBREDDIT or sub_name_l != _norm_sub(SUBREDDIT):
+                        continue
+
+                # Personal matching: keywords/flairs (optional). If none set → allow all.
+                p_keywords = p.get("reddit_keywords", [])
+                if p_keywords and not matches_keywords_post(post, p_keywords):
+                    continue
+                p_flairs = p.get("reddit_flairs", [])
+                if p_flairs and flair not in p_flairs:
+                    continue
+
+                # Quiet hours apply ONLY to personal route
+                if is_quiet_now(uid):
+                    continue
+
+                if p.get("digest","off") != "off":
+                    queue_digest_item(uid, {
+                        "type": "reddit",
+                        "title": post.title,
+                        "link": post_url,
+                        "subreddit": sub_name_l,
+                        "flair": flair,
+                        "author": str(post.author) if post.author else "unknown",
+                        "ts": datetime.utcnow().isoformat(timespec="seconds")
+                    })
+                    continue
+
+                try:
+                    embed = build_source_embed(
+                        post.title,
+                        post_url,
+                        f"Subreddit: r/{sub_name_l}\nFlair: **{flair}**\nAuthor: u/{post.author}",
+                        color=discord.Color.orange(),
+                        source_type="reddit"
+                    )
+                    if p.get("preferred_channel_id"):
+                        ch = client.get_channel(int(p["preferred_channel_id"])) or await client.fetch_channel(int(p["preferred_channel_id"]))
+                        await ch.send(embed=embed)
+                    elif p.get("enable_dm"):
+                        user = await client.fetch_user(uid)
+                        await user.send(embed=embed)
+                except Exception as e:
+                    print(f"[ERROR] Personal delivery to {uid}: {e}")
+
+# ---------- RSS ----------
+async def process_rss():
+    global rss_last_ids, last_post_ids
+    # Build union of feeds for PERSONAL fetch; global still uses RSS_FEEDS for global pipeline
+    feeds_union = union_user_feeds()
+    if not feeds_union:
+        feeds_union = set(RSS_FEEDS)
+
+    global_items = []    # pass global RSS keywords from GLOBAL feeds
+    personal_items = []  # items from ANY union feed
+
+    for feed_url in feeds_union:
+        try:
+            parsed = feedparser.parse(feed_url)
+            feed_title = parsed.feed.get("title", domain_from_url(feed_url)) if hasattr(parsed, "feed") else domain_from_url(feed_url)
+
+            count = 0
+            for entry in parsed.entries:
+                if count >= RSS_LIMIT:
+                    break
+                entry_id = entry.get("id") or entry.get("link") or f"{entry.get('title','')}-{entry.get('published','')}"
+                if not entry_id:
+                    continue
+                if entry_id in rss_last_ids:
+                    continue
+
+                title = entry.get("title", "Untitled")
+                link = entry.get("link", feed_url)
+                summary = entry.get("summary", "") or entry.get("description", "")
+                text_for_match = f"{title}\n{summary}"
+
+                # Always consider for personal route (store feed_url)
+                personal_items.append({
+                    "feed_title": feed_title,
+                    "title": title,
+                    "link": link,
+                    "summary": summary,
+                    "id": entry_id,
+                    "feed_url": feed_url
+                })
+
+                # Global route uses global RSS_KEYWORDS but only for global feeds
+                if feed_url in RSS_FEEDS and matches_keywords_text(text_for_match, RSS_KEYWORDS):
+                    global_items.append({
+                        "feed_title": feed_title,
+                        "title": title,
+                        "link": link,
+                        "summary": summary,
+                        "id": entry_id,
+                        "feed_url": feed_url
+                    })
+
+                rss_last_ids.add(entry_id)
+                count += 1
+
+        except Exception as e:
+            print(f"[ERROR] Failed to parse RSS feed {feed_url}: {e}")
+
+    # Save seen after scanning
+    save_seen(last_post_ids, rss_last_ids)
+
+    # ---------- GLOBAL DELIVERY (unchanged behavior) ----------
+    for item in reversed(global_items):
+        feed_title = item["feed_title"]
+        title = item["title"]
+        link = item["link"]
+        summary = item["summary"] or ""
+        clean_summary = re.sub(r"<[^>]+>", "", summary)
+        if len(clean_summary) > 500:
+            clean_summary = clean_summary[:497] + "..."
+
+        description = f"Feed: **{feed_title}**\nSource: {domain_from_url(link)}\n\n{clean_summary}"
+
+        await send_webhook_embed(title, link, description, color=discord.Color.blurple(), source_type="rss")
+        await notify_channels(title, link, description, color=discord.Color.blurple(), source_type="rss")
+
+        # Global DM list — deliberately IGNORE quiet hours
+        if ENABLE_DM and DISCORD_USER_IDS:
+            dm_text = f"[RSS] {feed_title}\n{title}\n{link}"
+            await notify_dms(dm_text)
+
+    # ---------- PERSONAL DELIVERY (ignores global filters) ----------
+    if user_prefs:
+        for item in reversed(personal_items):
+            feed_title = item["feed_title"]
+            title = item["title"]
+            link = item["link"]
+            summary = item["summary"] or ""
+            clean_summary = re.sub(r"<[^>]+>", "", summary)
+            if len(clean_summary) > 500:
+                clean_summary = clean_summary[:497] + "..."
+            description = f"Feed: **{feed_title}**\nSource: {domain_from_url(link)}\n\n{clean_summary}"
+
+            text_for_match = f"{title}\n{summary}"
+            feed_url = item["feed_url"]
+
+            for uid_str in list(user_prefs.keys()):
+                uid = int(uid_str)
+                p = get_user_prefs(uid)
+
+                # User must be subscribed to the feed to receive personal delivery
+                user_feeds = [u.strip() for u in p.get("feeds", []) if u.strip()]
+                if user_feeds and feed_url not in user_feeds:
+                    continue
+                if not user_feeds:
+                    # If they haven't added any feeds, don't deliver personal RSS to avoid spam
+                    continue
+
+                # Personal keywords for RSS (empty => allow all)
+                p_rss_kw = p.get("rss_keywords", [])
+                if p_rss_kw and not matches_keywords_text(text_for_match, p_rss_kw):
+                    continue
+
+                if is_quiet_now(uid):
+                    continue
+
+                if p.get("digest","off") != "off":
+                    queue_digest_item(uid, {
+                        "type": "rss",
+                        "title": title,
+                        "link": link,
+                        "feed_title": feed_title,
+                        "ts": datetime.utcnow().isoformat(timespec="seconds")
+                    })
+                    continue
+
+                try:
+                    embed = build_source_embed(title, link, description, color=discord.Color.blurple(), source_type="rss")
+                    if p.get("preferred_channel_id"):
+                        ch = client.get_channel(int(p["preferred_channel_id"])) or await client.fetch_channel(int(p["preferred_channel_id"]))
+                        await ch.send(embed=embed)
+                    elif p.get("enable_dm"):
+                        user = await client.fetch_user(uid)
+                        await user.send(embed=embed)
+                except Exception as e:
+                    print(f"[ERROR] Personal RSS delivery to {uid}: {e}")
+
+# ---------- Scheduler ----------
+async def fetch_and_notify():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            await process_reddit()
+        except Exception as e:
+            print(f"[ERROR] Reddit fetch failed: {e}")
+
+        try:
+            await process_rss()
+        except Exception as e:
+            print(f"[ERROR] RSS fetch failed: {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
+async def digest_scheduler():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        # For each user with digest enabled, if due and has items, send and clear
+        try:
+            for uid_str in list(user_prefs.keys()):
+                uid = int(uid_str)
+                p = get_user_prefs(uid)
+                if p.get("digest","off") == "off":
+                    continue
+                if not should_send_digest(uid):
+                    continue
+
+                items = pop_all_digest_items(uid)
+                if not items:
+                    # still mark sent to avoid spamming empty digests
+                    mark_digest_sent(uid)
+                    continue
+
+                # Build digest message(s)
+                # Prefer preferred_channel_id else DMs
+                dest_channel_id = p.get("preferred_channel_id")
+                dest_user = None
+                dest_channel = None
+                try:
+                    if dest_channel_id:
+                        dest_channel = client.get_channel(int(dest_channel_id)) or await client.fetch_channel(int(dest_channel_id))
+                    else:
+                        dest_user = await client.fetch_user(uid)
+                except Exception as e:
+                    print(f"[ERROR] Resolving destination for {uid}: {e}")
+                    continue
+
+                # Chunk items to avoid overlong messages (max ~25 lines per message)
+                def format_line(it):
+                    if it.get("type") == "reddit":
+                        sub = it.get("subreddit","?")
+                        return f"• [Reddit] r/{sub} — {it.get('title','(no title)')}\n{it.get('link','')}"
+                    else:
+                        feed = it.get("feed_title","Feed")
+                        return f"• [RSS] {feed} — {it.get('title','(no title)')}\n{it.get('link','')}"
+
+                lines = [format_line(it) for it in items]
+                CHUNK = 20
+                chunks = [lines[i:i+CHUNK] for i in range(0, len(lines), CHUNK)]
+
+                header = f"\nCollected items: **{len(items)}**"
+                for idx, block in enumerate(chunks, start=1):
+                    desc = "\n".join(block)
+                    title = "Your Daily Digest" if p.get("digest") == "daily" else f"Your Weekly Digest ({p.get('digest_day').capitalize()})"
+                    title = f"{title} — Part {idx}/{len(chunks)}" if len(chunks) > 1 else title
+                    embed = make_embed(title, desc, discord.Color.gold())
+
+                    try:
+                        if dest_channel:
+                            await dest_channel.send(embed=embed)
+                        elif dest_user:
+                            await dest_user.send(embed=embed)
+                    except Exception as e:
+                        print(f"[ERROR] Sending digest to {uid}: {e}")
+
+                mark_digest_sent(uid)
+        except Exception as e:
+            print(f"[ERROR] digest_scheduler: {e}")
+
+        await asyncio.sleep(60)  # check every minute
+
+# ---------- Auth ----------
+def is_admin(interaction: discord.Interaction):
+    return str(interaction.user.id) in ADMIN_USER_IDS
+
+# ---------- Admin Commands (GLOBAL) ----------
+@tree.command(name="setsubreddit", description="Set subreddit to monitor (blank to clear)")
+async def setsubreddit(interaction: discord.Interaction, name: str = ""):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global SUBREDDIT
+    if not name.strip():
+        SUBREDDIT = ""
+        update_env_var("SUBREDDIT", "")
+        return await interaction.response.send_message(embed=make_embed("Subreddit Cleared", "No subreddit is currently being monitored."), ephemeral=True)
+    SUBREDDIT = _norm_sub(name.strip())
+    update_env_var("SUBREDDIT", SUBREDDIT)
+    await interaction.response.send_message(embed=make_embed("Subreddit Updated", f"Now monitoring r/{SUBREDDIT}", discord.Color.green()), ephemeral=True)
+
+@tree.command(name="setinterval", description="Set interval (in seconds)")
+async def setinterval(interaction: discord.Interaction, seconds: int):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global CHECK_INTERVAL
+    CHECK_INTERVAL = seconds
+    update_env_var("CHECK_INTERVAL", str(seconds))
+    await interaction.response.send_message(embed=make_embed("Interval Updated", f"Now checking every {seconds} seconds", discord.Color.green()), ephemeral=True)
+
+@tree.command(name="setpostlimit", description="Set number of Reddit posts to check")
+async def setpostlimit(interaction: discord.Interaction, number: int):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global POST_LIMIT
+    POST_LIMIT = number
+    update_env_var("POST_LIMIT", str(number))
+    await interaction.response.send_message(embed=make_embed("Post Limit Updated", f"Now checking {number} posts", discord.Color.green()), ephemeral=True)
+
+@tree.command(name="setwebhook", description="Set webhook URL or clear")
+async def setwebhook(interaction: discord.Interaction, url: str = ""):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global WEBHOOK_URL
+    WEBHOOK_URL = url.strip()
+    update_env_var("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    shown = WEBHOOK_URL if WEBHOOK_URL else "None"
+    await interaction.response.send_message(embed=make_embed("Webhook Updated", f"Webhook URL set to: `{shown}`", discord.Color.green()), ephemeral=True)
+
+@tree.command(name="setflairs", description="Set allowed Reddit flairs (comma separated, blank to clear)")
+async def setflairs(interaction: discord.Interaction, flairs: str = ""):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global ALLOWED_FLAIRS
+    if not flairs.strip():
+        ALLOWED_FLAIRS = []
+        update_env_var("ALLOWED_FLAIR", "")
+        return await interaction.response.send_message(embed=make_embed("Flairs Cleared", "No flair filter is now set — all flairs allowed."), ephemeral=True)
+    ALLOWED_FLAIRS = [f.strip() for f in flairs.split(",") if f.strip()]
+    update_env_var("ALLOWED_FLAIR", ",".join(ALLOWED_FLAIRS))
+    text = ", ".join(ALLOWED_FLAIRS)
+    await interaction.response.send_message(embed=make_embed("Flairs Updated", f"Now filtering flairs: {text}", discord.Color.green()), ephemeral=True)
+
+@tree.command(name="enabledms", description="Enable or disable DMs")
+async def enabledms(interaction: discord.Interaction, value: bool):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global ENABLE_DM
+    ENABLE_DM = value
+    update_env_var("ENABLE_DM", str(value).lower())
+    await interaction.response.send_message(embed=make_embed("DM Setting Updated", f"DMs {'enabled' if value else 'disabled'}", discord.Color.green()), ephemeral=True)
+
+@tree.command(name="adddmuser", description="Add user to DM list")
+async def adddmuser(interaction: discord.Interaction, user_id: str):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    if user_id not in DISCORD_USER_IDS:
+        DISCORD_USER_IDS.append(user_id)
+        update_env_var("DISCORD_USER_IDS", ",".join(DISCORD_USER_IDS))
+    await interaction.response.send_message(embed=make_embed("DM User Added", f"Added user ID: {user_id}", discord.Color.green()), ephemeral=True)
+
+@tree.command(name="removedmuser", description="Remove user from DM list")
+async def removedmuser(interaction: discord.Interaction, user_id: str):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    if user_id in DISCORD_USER_IDS:
+        DISCORD_USER_IDS.remove(user_id)
+        update_env_var("DISCORD_USER_IDS", ",".join(DISCORD_USER_IDS))
+    await interaction.response.send_message(embed=make_embed("DM User Removed", f"Removed user ID: {user_id}", discord.Color.green()), ephemeral=True)
+
+@tree.command(name="reloadenv", description="Reload process to pick up .env changes")
+async def reloadenv(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    await interaction.response.send_message(embed=make_embed("Reloading", "Restarting process to reload environment..."), ephemeral=True)
+    os.execv(sys.executable, [sys.executable, __file__])
+
+@tree.command(name="whereenv", description="Show current .env path")
+async def whereenv(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=make_embed("Environment File", f"`{ENV_FILE}`"), ephemeral=True)
+
+# ---------- Keyword commands (GLOBAL) ----------
+@tree.command(name="setredditkeywords", description="Set/clear keywords for Reddit posts (comma separated, blank for ALL)")
+async def setredditkeywords(interaction: discord.Interaction, words: str = ""):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized to use this command.", discord.Color.red()), ephemeral=True)
+    global REDDIT_KEYWORDS
+    REDDIT_KEYWORDS = [w.strip().lower() for w in words.split(",") if w.strip()] if words else []
+    update_env_var("REDDIT_KEYWORDS", ",".join(REDDIT_KEYWORDS))
+    if REDDIT_KEYWORDS:
+        await interaction.response.send_message(embed=make_embed("Reddit Keywords Updated", f"Filtering Reddit by: {', '.join(REDDIT_KEYWORDS)}"), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=make_embed("Reddit Keywords Cleared", "No keywords set. ALL Reddit posts will be considered."), ephemeral=True)
+
+@tree.command(name="setrsskeywords", description="Set/clear keywords for RSS items (comma separated, blank for ALL)")
+async def setrsskeywords(interaction: discord.Interaction, words: str = ""):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized to use this command.", discord.Color.red()), ephemeral=True)
+    global RSS_KEYWORDS
+    RSS_KEYWORDS = [w.strip().lower() for w in words.split(",") if w.strip()] if words else []
+    update_env_var("RSS_KEYWORDS", ",".join(RSS_KEYWORDS))
+    if RSS_KEYWORDS:
+        await interaction.response.send_message(embed=make_embed("RSS Keywords Updated", f"Filtering RSS by: {', '.join(RSS_KEYWORDS)}"), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=make_embed("RSS Keywords Cleared", "No keywords set. ALL RSS items will be considered."), ephemeral=True)
+
+# Legacy: set BOTH lists at once
+@tree.command(name="setkeywords", description="(Legacy) Set/clear keywords for BOTH Reddit and RSS")
+async def setkeywords(interaction: discord.Interaction, words: str = ""):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized to use this command.", discord.Color.red()), ephemeral=True)
+    global REDDIT_KEYWORDS, RSS_KEYWORDS
+    new_list = [w.strip().lower() for w in words.split(",") if w.strip()] if words else []
+    REDDIT_KEYWORDS = new_list[:]
+    RSS_KEYWORDS = new_list[:]
+    update_env_var("REDDIT_KEYWORDS", ",".join(REDDIT_KEYWORDS))
+    update_env_var("RSS_KEYWORDS", ",".join(RSS_KEYWORDS))
+    update_env_var("KEYWORDS", ",".join(new_list))  # keep legacy env in sync
+    label = ", ".join(new_list) if new_list else "ALL"
+    await interaction.response.send_message(embed=make_embed("Keywords Updated (Legacy)", f"Reddit & RSS now filter by: {label}"), ephemeral=True)
+
+# ---------- Status & Help ----------
+@tree.command(name="status", description="Show current monitoring status")
+async def status(interaction: discord.Interaction):
+    flair_list = ", ".join(ALLOWED_FLAIRS) if ALLOWED_FLAIRS else "ALL"
+    dm_status = "enabled" if ENABLE_DM else "disabled"
+    webhook_text = WEBHOOK_URL if WEBHOOK_URL else "None"
+    dm_users = ", ".join(DISCORD_USER_IDS) if DISCORD_USER_IDS else "None"
+    reddit_kw = ", ".join(REDDIT_KEYWORDS) if REDDIT_KEYWORDS else "ALL"
+    rss_kw = ", ".join(RSS_KEYWORDS) if RSS_KEYWORDS else "ALL"
+    rss_text = "\n".join([f"- {u}" for u in RSS_FEEDS]) if RSS_FEEDS else "None"
+    chan_text = ", ".join(DISCORD_CHANNEL_IDS) if DISCORD_CHANNEL_IDS else "None"
+    sub_text = f"r/{_norm_sub(SUBREDDIT)}" if SUBREDDIT else "None"
+    msg = (
+        f"Monitoring: **{sub_text}** every **{CHECK_INTERVAL}s**.\n"
+        f"Reddit Post limit: **{POST_LIMIT}**.\n"
+        f"Flairs: **{flair_list}**.\n"
+        f"Reddit Keywords (GLOBAL): **{reddit_kw}**.\n"
+        f"RSS Keywords (GLOBAL): **{rss_kw}**.\n"
+        f"DMs (GLOBAL): **{dm_status}** (Users: {dm_users}).\n"
+        f"Webhook: `{webhook_text}`\n"
+        f"Channels: **{chan_text}**\n"
+        f"RSS Feeds:\n{rss_text}"
+    )
+    await interaction.response.send_message(embed=make_embed("Bot Status", msg), ephemeral=True)
+
+@tree.command(name="help", description="Show help for commands")
+async def help_cmd(interaction: discord.Interaction):
+    commands_text = "\n".join([
+        "Admin (global):",
+        "/setsubreddit <name or blank>",
+        "/setinterval <seconds>",
+        "/setpostlimit <number>",
+        "/setwebhook <url or blank>",
+        "/setflairs [comma separated]",
+        "/setredditkeywords [comma separated]",
+        "/setrsskeywords [comma separated]",
+        "/setkeywords [comma separated]  (legacy: sets both)",
+        "/enabledms <true/false>",
+        "/adddmuser <user_id>",
+        "/removedmuser <user_id>",
+        "/addrss <url>",
+        "/removerss <url>",
+        "/listrss",
+        "/addchannel <channel_id>",
+        "/removechannel <channel_id>",
+        "/listchannels",
+        "/status",
+        "/reloadenv",
+        "/whereenv",
+        "",
+        "Personal (any user):",
+        "/myprefs",
+        "/setmydms <true/false>",
+        "/setmykeywords reddit:<csv> rss:<csv>",
+        "/setquiet <start HH:MM> <end HH:MM>",
+        "/quietoff",
+        "/setchannel <channel_id or blank>",
+        "/myfeeds add <url> | remove <url> | list",
+        "/mysubs add <subreddit> | remove <subreddit> | list",
+        "/setdigest <off|daily|weekly> [HH:MM] [day(mon..sun)]"
+    ])
+    await interaction.response.send_message(embed=make_embed("Help", f"**Available Commands:**\n{commands_text}"), ephemeral=True)
+
+# ---------- RSS feed management (GLOBAL) ----------
+@tree.command(name="addrss", description="Add an RSS/Atom feed URL (GLOBAL)")
+async def addrss(interaction: discord.Interaction, url: str):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global RSS_FEEDS
+    url = url.strip()
+    if url and url not in RSS_FEEDS:
+        RSS_FEEDS.append(url)
+        update_env_var("RSS_FEEDS", ",".join(RSS_FEEDS))
+        await interaction.response.send_message(embed=make_embed("RSS Added", f"Added: {url}", discord.Color.green()), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=make_embed("RSS Not Added", "URL empty or already present."), ephemeral=True)
+
+@tree.command(name="removerss", description="Remove an RSS/Atom feed URL (GLOBAL)")
+async def removerss(interaction: discord.Interaction, url: str):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global RSS_FEEDS
+    url = url.strip()
+    if url in RSS_FEEDS:
+        RSS_FEEDS.remove(url)
+        update_env_var("RSS_FEEDS", ",".join(RSS_FEEDS))
+        await interaction.response.send_message(embed=make_embed("RSS Removed", f"Removed: {url}", discord.Color.green()), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=make_embed("Not Found", "That URL isn't in the list."), ephemeral=True)
+
+@tree.command(name="listrss", description="List configured RSS/Atom feed URLs (GLOBAL)")
+async def listrss(interaction: discord.Interaction):
+    text = "\n".join([f"- {u}" for u in RSS_FEEDS]) if RSS_FEEDS else "None"
+    await interaction.response.send_message(embed=make_embed("RSS Feeds", text), ephemeral=True)
+
+# ---------- Channel management (GLOBAL) ----------
+@tree.command(name="addchannel", description="Add a Discord channel ID for notifications (GLOBAL)")
+async def addchannel(interaction: discord.Interaction, channel_id: str):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global DISCORD_CHANNEL_IDS
+    if channel_id not in DISCORD_CHANNEL_IDS:
+        DISCORD_CHANNEL_IDS.append(channel_id)
+        update_env_var("DISCORD_CHANNEL_IDS", ",".join(DISCORD_CHANNEL_IDS))
+        await interaction.response.send_message(embed=make_embed("Channel Added", f"Added channel ID: {channel_id}", discord.Color.green()), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=make_embed("No Change", "Channel ID already present."), ephemeral=True)
+
+@tree.command(name="removechannel", description="Remove a Discord channel ID from notifications (GLOBAL)")
+async def removechannel(interaction: discord.Interaction, channel_id: str):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(embed=make_embed("Unauthorized", "You are not authorized."), ephemeral=True)
+    global DISCORD_CHANNEL_IDS
+    if channel_id in DISCORD_CHANNEL_IDS:
+        DISCORD_CHANNEL_IDS.remove(channel_id)
+        update_env_var("DISCORD_CHANNEL_IDS", ",".join(DISCORD_CHANNEL_IDS))
+        await interaction.response.send_message(embed=make_embed("Channel Removed", f"Removed channel ID: {channel_id}", discord.Color.green()), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=make_embed("Not Found", "That channel ID isn't in the list."), ephemeral=True)
+
+@tree.command(name="listchannels", description="List Discord channel IDs used for notifications (GLOBAL)")
+async def listchannels(interaction: discord.Interaction):
+    text = ", ".join(DISCORD_CHANNEL_IDS) if DISCORD_CHANNEL_IDS else "None"
+    await interaction.response.send_message(embed=make_embed("Channels", text), ephemeral=True)
+
+# ---------- Personal commands (ANY USER) ----------
+@tree.command(name="myprefs", description="Show your personal notification settings")
+async def myprefs(interaction: discord.Interaction):
+    p = get_user_prefs(interaction.user.id)
+    desc = (
+        f"DMs: **{'on' if p['enable_dm'] else 'off'}**\n"
+        f"Reddit keywords: **{', '.join(p['reddit_keywords']) or 'ALL'}**\n"
+        f"RSS keywords: **{', '.join(p['rss_keywords']) or 'ALL'}**\n"
+        f"Quiet hours (UTC): **{p['quiet_hours'] or 'off'}**\n"
+        f"Digest: **{p['digest']}** at **{p['digest_time']}**{' on **'+p['digest_day']+'**' if p['digest']=='weekly' else ''}\n"
+        f"Preferred channel: **{p['preferred_channel_id'] or 'DMs'}**\n"
+        f"Personal feeds: **{len(p['feeds'])}**\n"
+        f"Personal subreddits: **{len(p['subreddits'])}**"
+    )
+    await interaction.response.send_message(embed=make_embed("Your Preferences", desc), ephemeral=True)
+
+@tree.command(name="setmydms", description="Enable or disable your personal DMs")
+async def setmydms(interaction: discord.Interaction, value: bool):
+    set_user_pref(interaction.user.id, "enable_dm", value)
+    await interaction.response.send_message(
+        embed=make_embed("Updated", f"DMs {'enabled' if value else 'disabled'} for you"),
+        ephemeral=True
+    )
+
+@tree.command(name="setmykeywords", description="Set your personal keywords. Example: reddit:docker,proxmox rss:self-hosted")
+async def setmykeywords(interaction: discord.Interaction, reddit: str = "", rss: str = ""):
+    changed = []
+    if reddit is not None:
+        rlist = [w.strip().lower() for w in reddit.split(",") if w.strip()]
+        set_user_pref(interaction.user.id, "reddit_keywords", rlist)
+        changed.append("Reddit")
+    if rss is not None:
+        rlist = [w.strip().lower() for w in rss.split(",") if w.strip()]
+        set_user_pref(interaction.user.id, "rss_keywords", rlist)
+        changed.append("RSS")
+    label = ", ".join(changed) if changed else "none"
+    await interaction.response.send_message(embed=make_embed("Updated", f"Personal keywords saved ({label})."), ephemeral=True)
+
+@tree.command(name="setquiet", description="Set quiet hours (UTC). Example: 22:00 07:00")
+async def setquiet(interaction: discord.Interaction, start: str, end: str):
+    set_user_pref(interaction.user.id, "quiet_hours", {"start": start, "end": end})
+    await interaction.response.send_message(embed=make_embed("Updated", f"Quiet hours set: {start}–{end} (UTC)"), ephemeral=True)
+
+@tree.command(name="quietoff", description="Disable your quiet hours")
+async def quietoff(interaction: discord.Interaction):
+    set_user_pref(interaction.user.id, "quiet_hours", None)
+    await interaction.response.send_message(embed=make_embed("Updated", "Quiet hours disabled."), ephemeral=True)
+
+@tree.command(name="setchannel", description="Send your notifications to a specific channel instead of DMs (blank to revert to DMs)")
+async def setchannel(interaction: discord.Interaction, channel_id: str = ""):
+    set_user_pref(interaction.user.id, "preferred_channel_id", channel_id or None)
+    where = f"channel {channel_id}" if channel_id else "DMs"
+    await interaction.response.send_message(embed=make_embed("Updated", f"Personal delivery set to {where}"), ephemeral=True)
+
+# ---- Personal RSS feed management ----
+@tree.command(name="myfeeds", description="Manage your personal RSS feeds: add/remove/list")
+async def myfeeds(interaction: discord.Interaction, action: str, url: str = ""):
+    action = (action or "").strip().lower()
+    p = get_user_prefs(interaction.user.id)
+    feeds = [u.strip() for u in p.get("feeds", []) if u.strip()]
+
+    if action == "list":
+        text = "\n".join([f"- {u}" for u in feeds]) if feeds else "You have no personal feeds. Use `/myfeeds add <url>`."
+        return await interaction.response.send_message(embed=make_embed("Your RSS Feeds", text), ephemeral=True)
+
+    if action == "add":
+        url = (url or "").strip()
+        if not url:
+            return await interaction.response.send_message(embed=make_embed("Need URL", "Usage: `/myfeeds add <url>`"), ephemeral=True)
+        if url not in feeds:
+            feeds.append(url)
+            set_user_pref(interaction.user.id, "feeds", feeds)
+            return await interaction.response.send_message(embed=make_embed("Feed Added", f"Added: {url}"), ephemeral=True)
+        else:
+            return await interaction.response.send_message(embed=make_embed("No Change", "That URL is already in your list."), ephemeral=True)
+
+    if action == "remove":
+        url = (url or "").strip()
+        if not url:
+            return await interaction.response.send_message(embed=make_embed("Need URL", "Usage: `/myfeeds remove <url>`"), ephemeral=True)
+        if url in feeds:
+            feeds.remove(url)
+            set_user_pref(interaction.user.id, "feeds", feeds)
+            return await interaction.response.send_message(embed=make_embed("Feed Removed", f"Removed: {url}"), ephemeral=True)
+        else:
+            return await interaction.response.send_message(embed=make_embed("Not Found", "That URL isn't in your list."), ephemeral=True)
+
+    await interaction.response.send_message(embed=make_embed("Invalid Action", "Use: `/myfeeds add <url>`, `/myfeeds remove <url>`, or `/myfeeds list`"), ephemeral=True)
+
+# ---- Personal subreddit management ----
+@tree.command(name="mysubs", description="Manage your personal subreddits: add/remove/list")
+async def mysubs(interaction: discord.Interaction, action: str, name: str = ""):
+    action = (action or "").strip().lower()
+    p = get_user_prefs(interaction.user.id)
+    subs = [_norm_sub(s) for s in p.get("subreddits", []) if _norm_sub(s)]
+
+    if action == "list":
+        text = "\n".join([f"- r/{s}" for s in subs]) if subs else (f"You have no personal subreddits. Default is r/{_norm_sub(SUBREDDIT)}." if SUBREDDIT else "You have no personal subreddits and no global subreddit is set.") + " Use `/mysubs add <subreddit>`."
+        return await interaction.response.send_message(embed=make_embed("Your Subreddits", text), ephemeral=True)
+
+    if action == "add":
+        name = _norm_sub(name)
+        if not name:
+            return await interaction.response.send_message(embed=make_embed("Need Subreddit", "Usage: `/mysubs add <subreddit>` (without r/)"), ephemeral=True)
+        if name not in subs:
+            subs.append(name)
+            set_user_pref(interaction.user.id, "subreddits", subs)
+            return await interaction.response.send_message(embed=make_embed("Sub Added", f"Added: r/{name}"), ephemeral=True)
+        else:
+            return await interaction.response.send_message(embed=make_embed("No Change", f"r/{name} is already in your list."), ephemeral=True)
+
+    if action == "remove":
+        name = _norm_sub(name)
+        if not name:
+            return await interaction.response.send_message(embed=make_embed("Need Subreddit", "Usage: `/mysubs remove <subreddit>` (without r/)"), ephemeral=True)
+        if name in subs:
+            subs.remove(name)
+            set_user_pref(interaction.user.id, "subreddits", subs)
+            return await interaction.response.send_message(embed=make_embed("Sub Removed", f"Removed: r/{name}"), ephemeral=True)
+        else:
+            return await interaction.response.send_message(embed=make_embed("Not Found", "That subreddit isn't in your list."), ephemeral=True)
+
+    await interaction.response.send_message(embed=make_embed("Invalid Action", "Use: `/mysubs add <subreddit>`, `/mysubs remove <subreddit>`, or `/mysubs list`"), ephemeral=True)
+
+# ---- Personal digest management ----
+@tree.command(name="setdigest", description="Set your digest: off|daily|weekly [HH:MM] [day(mon..sun)]")
+async def setdigest(interaction: discord.Interaction, mode: str, time_utc: str = "", day: str = ""):
+    mode = (mode or "").lower()
+    if mode not in ("off","daily","weekly"):
+        return await interaction.response.send_message(embed=make_embed("Invalid", "Mode must be off, daily, or weekly."), ephemeral=True)
+
+    if mode == "off":
+        set_user_pref(interaction.user.id, "digest", "off")
+        await interaction.response.send_message(embed=make_embed("Digest Updated", "Digest disabled for you."), ephemeral=True)
+        return
+
+    # validate time
+    t = (time_utc or "09:00").strip()
+    try:
+        hh, mm = map(int, t.split(":"))
+        assert 0 <= hh < 24 and 0 <= mm < 60
+    except Exception:
+        return await interaction.response.send_message(embed=make_embed("Invalid Time", "Use HH:MM in UTC, e.g., 09:00"), ephemeral=True)
+
+    set_user_pref(interaction.user.id, "digest_time", f"{hh:02d}:{mm:02d}")
+    set_user_pref(interaction.user.id, "digest", mode)
+
+    if mode == "weekly":
+        d = (day or "mon").lower()
+        if d not in ("mon","tue","wed","thu","fri","sat","sun"):
+            return await interaction.response.send_message(embed=make_embed("Invalid Day", "Use one of: mon tue wed thu fri sat sun"), ephemeral=True)
+        set_user_pref(interaction.user.id, "digest_day", d)
+        await interaction.response.send_message(embed=make_embed("Digest Updated", f"Weekly digest set to {t} UTC on {d}."), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=make_embed("Digest Updated", f"Daily digest set to {t} UTC."), ephemeral=True)
+
+# ---------- Discord lifecycle ----------
+@client.event
+async def on_ready():
+    await tree.sync()
+    print(f"Logged in as {client.user}")
+    client.loop.create_task(fetch_and_notify())
+    client.loop.create_task(digest_scheduler())
+
+client.run(DISCORD_TOKEN)

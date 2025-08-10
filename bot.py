@@ -1029,8 +1029,7 @@ async def weather_scheduler():
                                 if sunrise: extras.append(f"🌅 {fmt_sun(sunrise)}")
                                 if sunset: extras.append(f"🌇 {fmt_sun(sunset)}")
                                 if uv is not None: extras.append(f"🔆 UV {round(uv,1)}")
-                                value = "
-".join([line, " - ".join(extras)]) if extras else line)
+                                value = "\n".join([line, " - ".join(extras)]) if extras else line
                                 emb.add_field(name=d, value=value, inline=False)
                             emb.set_footer(text="Chicago time schedule")
                             await user.send(embed=emb)

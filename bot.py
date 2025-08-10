@@ -38,6 +38,9 @@ TRIVIA_REWARD = 120
 TRIVIA_API = "https://opentdb.com/api.php"
 TRIVIA_TOKEN_API = "https://opentdb.com/api_token.php"
 
+# Secondary trivia API (fallback)
+TRIVIA_API_FALLBACK = "https://the-trivia-api.com/v2/questions"
+
 DEFAULT_TZ_NAME = "America/Chicago"
 REMINDER_TICK_SECONDS = 10
 
@@ -699,7 +702,7 @@ async def _reset_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
     except Exception:
         return None
 
-async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Optional[str] = None):
+async def _fetch_from_opentdb(session: aiohttp.ClientSession, difficulty: Optional[str] = None):
     token = await _get_or_create_trivia_token(session)
     params = {"amount": 1, "type": "multiple", "encode": "url3986"}
     if difficulty in {"easy", "medium", "hard"}:
@@ -709,22 +712,63 @@ async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Opti
     async def _do_request():
         async with session.get(TRIVIA_API, params=params, timeout=15) as resp:
             return await resp.json()
-    data = await _do_request()
-    rc = data.get("response_code", 1)
-    if rc == 4 and token:
-        await _reset_trivia_token(session)
+    try:
         data = await _do_request()
         rc = data.get("response_code", 1)
-    if rc != 0 or not data.get("results"):
+        if rc == 4 and token:
+            # Token empty; reset and try once more
+            await _reset_trivia_token(session)
+            data = await _do_request()
+            rc = data.get("response_code", 1)
+        if rc != 0 or not data.get("results"):
+            return None
+        item = data["results"][0]
+        q = urllib.parse.unquote(item["question"])
+        correct = urllib.parse.unquote(item["correct_answer"])
+        incorrect = [urllib.parse.unquote(x) for x in item.get("incorrect_answers", [])]
+        choices = incorrect + [correct]
+        random.shuffle(choices)
+        correct_idx = choices.index(correct)
+        return q, choices, correct_idx
+    except Exception:
         return None
-    item = data["results"][0]
-    q = urllib.parse.unquote(item["question"])
-    correct = urllib.parse.unquote(item["correct_answer"])
-    incorrect = [urllib.parse.unquote(x) for x in item.get("incorrect_answers", [])]
-    choices = incorrect + [correct]
-    random.shuffle(choices)
-    correct_idx = choices.index(correct)
-    return q, choices, correct_idx
+
+async def _fetch_from_the_trivia_api(session: aiohttp.ClientSession, difficulty: Optional[str] = None):
+    # Docs: https://the-trivia-api.com/docs/v2/#get-questions
+    # Use multiple-choice, 1 question, optional difficulty
+    params = {"limit": 1, "types": "multiple"}
+    if difficulty in {"easy", "medium", "hard"}:
+        params["difficulties"] = difficulty
+    try:
+        async with session.get(TRIVIA_API_FALLBACK, params=params, timeout=15) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        if not isinstance(data, list) or not data:
+            return None
+        item = data[0]
+        q = str(item.get("question", {}).get("text", "")) or None
+        correct = str(item.get("correctAnswer", "")) or None
+        incorrect = list(map(str, item.get("incorrectAnswers", []))) if isinstance(item.get("incorrectAnswers", []), list) else []
+        if not q or not correct or not incorrect:
+            return None
+        choices = incorrect + [correct]
+        random.shuffle(choices)
+        correct_idx = choices.index(correct)
+        # Normalize HTML entities if present
+        q = html.unescape(q)
+        choices = [html.unescape(c) for c in choices]
+        return q, choices, correct_idx
+    except Exception:
+        return None
+
+async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Optional[str] = None):
+    # Try OpenTDB first
+    primary = await _fetch_from_opentdb(session, difficulty)
+    if primary:
+        return primary
+    # Fallback
+    return await _fetch_from_the_trivia_api(session, difficulty)
 
 DIFF_CHOICES = [
     app_commands.Choice(name="Any", value=""),

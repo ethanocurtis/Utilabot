@@ -1154,14 +1154,40 @@ async def stats_cmd(inter: discord.Interaction, user: Optional[discord.User] = N
 
 
 # ----- Reminders + Timer -----
-def _default_zone():
+
+def _default_zone_for(yyyy: int, mm: int, dd: int):
+    """Return tzinfo for America/Chicago even if tzdata is missing.
+    If ZoneInfo works, use it. Otherwise approximate US DST.
+    """
     if ZoneInfo is not None:
         try:
             return ZoneInfo(DEFAULT_TZ)
         except Exception:
             pass
-    # Fallback to UTC if zoneinfo not available
-    return timezone(timedelta(0))
+    # Fallback approximate DST: second Sunday in March to first Sunday in November
+    from datetime import datetime, timedelta, timezone as _tz
+    d = datetime(yyyy, mm, dd)
+    march8 = datetime(d.year, 3, 8)
+    second_sun_march = march8 + timedelta(days=(6 - march8.weekday()) % 7)
+    nov1 = datetime(d.year, 11, 1)
+    first_sun_nov = nov1 + timedelta(days=(6 - nov1.weekday()) % 7)
+    is_dst = second_sun_march <= d < first_sun_nov
+    offset = timedelta(hours=-5 if is_dst else -6)
+    return _tz(offset)
+
+def _default_zone():
+    # Backward-compat: keep function, but prefer date-aware version using today's date
+    try:
+        if ZoneInfo is not None:
+            try:
+                return ZoneInfo(DEFAULT_TZ)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    from datetime import datetime as _dt
+    today = _dt.now()
+    return _default_zone_for(today.year, today.month, today.day)
 
 def _parse_date_mmddyyyy(text: str):
     # Accept MM-DD-YYYY, MM/DD/YYYY, or MMDDYYYY
@@ -1215,24 +1241,25 @@ async def remind_at(
     tz_offset: Optional[str] = None,
     dm: bool = False,
 ):
+    await inter.response.defer(ephemeral=True)
     d = _parse_date_mmddyyyy(date)
     if not d:
-        return await inter.response.send_message("Please use date format **MM-DD-YYYY** (e.g., 08-12-2025).", ephemeral=True)
+        return await inter.followup.send("Please use date format **MM-DD-YYYY** (e.g., 08-12-2025).", ephemeral=True)
     yyyy, mm, dd = d
     t = _parse_time(time)
     if not t:
-        return await inter.response.send_message("Please use time like **14:30** (24h) or **2:30pm**.", ephemeral=True)
+        return await inter.followup.send("Please use time like **14:30** (24h) or **2:30pm**.", ephemeral=True)
     hh, mi = t
 
-    tz = _parse_offset(tz_offset) or _default_zone()
+    tz = _parse_offset(tz_offset) or _default_zone_for(yyyy, mm, dd)
     try:
         local_dt = datetime(int(yyyy), int(mm), int(dd), hh, mi, tzinfo=tz)
     except ValueError:
-        return await inter.response.send_message("That date/time isn’t valid.", ephemeral=True)
+        return await inter.followup.send("That date/time isn’t valid.", ephemeral=True)
 
     due_utc = local_dt.astimezone(timezone.utc)
     if due_utc <= datetime.now(timezone.utc) + timedelta(seconds=5):
-        return await inter.response.send_message("That time is in the past. Pick something in the future.", ephemeral=True)
+        return await inter.followup.send("That time is in the past. Pick something in the future.", ephemeral=True)
 
     rid = store.add_reminder({
         "user_id": inter.user.id,
@@ -1244,7 +1271,7 @@ async def remind_at(
     })
 
     when_text = local_dt.strftime("%m-%d-%Y %H:%M %Z")
-    await inter.response.send_message(f"⏰ Reminder **#{rid}** set for **{when_text}** — I’ll remind you: _{message}_", ephemeral=True)
+    await inter.followup.send(f"⏰ Reminder **#{rid}** set for **{when_text}** — I’ll remind you: _{message}_", ephemeral=True)
 
 @tree.command(name="remind_in", description="Remind yourself in N minutes.")
 @app_commands.describe(minutes="Minutes from now", message="Reminder text", dm="Deliver via DM instead of the channel")

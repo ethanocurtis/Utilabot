@@ -2,12 +2,18 @@
 import os
 import json
 import random
+import asyncio
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Dict, List, Tuple
 
 import discord
 from discord.ext import tasks
 from discord import app_commands
+
+# New imports for trivia API
+import aiohttp
+import html
+import urllib.parse
 
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
@@ -22,6 +28,11 @@ WORK_MAX_PAY = 160
 # Daily streak bonus settings
 STREAK_MAX_BONUS = 500
 STREAK_STEP = 50  # +50 per streak day up to max
+
+# Trivia config
+TRIVIA_REWARD = 120
+TRIVIA_API = "https://opentdb.com/api.php"
+TRIVIA_TOKEN_API = "https://opentdb.com/api_token.php"
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -41,6 +52,7 @@ def _ensure_shape(data: dict) -> dict:
     data.setdefault("achievements", {})  # user_id -> [names]
     data.setdefault("work", {})          # user_id -> last ISO timestamp
     data.setdefault("streaks", {})       # user_id -> {"count": int, "last_date": "YYYY-MM-DD"}
+    data.setdefault("trivia", {})        # {"token": "..."}
     return data
 
 
@@ -165,6 +177,19 @@ class Store:
             self.write(data)
             return True
         return False
+
+    # Trivia token helpers
+    def get_trivia_token(self) -> Optional[str]:
+        data = self.read()
+        return data["trivia"].get("token")
+
+    def set_trivia_token(self, token: Optional[str]):
+        data = self.read()
+        if token is None:
+            data["trivia"].pop("token", None)
+        else:
+            data["trivia"]["token"] = token
+        self.write(data)
 
 
 store = Store(DATA_PATH)
@@ -685,12 +710,11 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     await msg.edit(embed=emb, view=None)
 
 
-# ----- New Game: Slot Machine -----
+# ----- New Game: Slot Machine (Animated) -----
 SLOT_SYMBOLS = ["🍒", "🍋", "🔔", "⭐", "🍀", "7️⃣"]
 SLOT_PAYOUTS = {
-    # tuple of 3
     ("7️⃣","7️⃣","7️⃣"): 20,   # Jackpot 20x
-    ("🍀","🍀","🍀"): 10,      # Lucky clovers 10x
+    ("🍀","🍀","🍀"): 10,
     ("⭐","⭐","⭐"): 6,
     ("🔔","🔔","🔔"): 5,
     ("🍋","🍋","🍋"): 4,
@@ -699,45 +723,69 @@ SLOT_PAYOUTS = {
 # Any two of a kind pays 2x (net +bet)
 # Anything else loses
 
+def _slots_result(reels: List[str]) -> Tuple[str, int]:
+    trip = tuple(reels)
+    if trip in SLOT_PAYOUTS:
+        mult = SLOT_PAYOUTS[trip]
+        return (f"Jackpot x{mult}!", mult)
+    # two-of-a-kind?
+    if reels[0] == reels[1] or reels[0] == reels[2] or reels[1] == reels[2]:
+        return ("Nice! Two of a kind x2.", 2)
+    return ("You lose.", 0)
+
 @tree.command(name="slots", description="Spin the slot machine. Matching symbols pay big!")
 @app_commands.describe(bet="Amount to wager")
 async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
     if store.get_balance(inter.user.id) < bet:
         return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
 
-    # Spin
-    reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
-    trip = tuple(reels)
-    payout_mult = 0
-    result = "You lose."
-    if trip in SLOT_PAYOUTS:
-        payout_mult = SLOT_PAYOUTS[trip]
-        result = f"Jackpot x{payout_mult}!"
-    else:
-        # check two-of-a-kind
-        if reels[0] == reels[1] or reels[0] == reels[2] or reels[1] == reels[2]:
-            payout_mult = 2
-            result = "Nice! Two of a kind x2."
-        else:
-            payout_mult = 0
+    # Pre-choose the final symbols so animation lands correctly
+    final_reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
 
-    if payout_mult == 0:
+    # Initial embed
+    spinning = ["⬜", "⬜", "⬜"]
+    emb = discord.Embed(title="🎰 Slot Machine")
+    emb.add_field(name="Spin", value=" | ".join(spinning), inline=False)
+    emb.add_field(name="Bet", value=str(bet), inline=True)
+    emb.set_footer(text="Spinning...")
+    await inter.response.send_message(embed=emb)
+    msg = await inter.original_response()
+
+    # Animate: each reel stops at a different time
+    reels = spinning[:]
+    stops = [12, 16, 20]   # total ticks before each reel locks
+    for t in range(max(stops)):
+        for i in range(3):
+            if t < stops[i] - 1:
+                reels[i] = random.choice(SLOT_SYMBOLS)
+            elif t == stops[i] - 1:
+                reels[i] = final_reels[i]
+        try:
+            anim = discord.Embed(title="🎰 Slot Machine")
+            anim.add_field(name="Spin", value=" | ".join(reels), inline=False)
+            anim.add_field(name="Bet", value=str(bet), inline=True)
+            anim.set_footer(text="Spinning..." if t < max(stops)-1 else "Result")
+            await msg.edit(embed=anim)
+        except discord.HTTPException:
+            pass
+        await asyncio.sleep(0.18)  # gentle pacing without hammering rate limits
+
+    # Settle outcome
+    result_text, mult = _slots_result(final_reels)
+    if mult == 0:
         store.add_balance(inter.user.id, -bet)
         net = -bet
     else:
-        win_amount = bet * payout_mult
+        win_amount = bet * mult
         store.add_balance(inter.user.id, win_amount - bet)  # add net profit
         net = win_amount - bet
 
-    emb = discord.Embed(title="🎰 Slot Machine")
-    emb.add_field(name="Spin", value=" | ".join(reels), inline=False)
-    emb.add_field(name="Bet", value=str(bet), inline=True)
-    emb.add_field(name="Result", value=result, inline=True)
-    if net >= 0:
-        emb.add_field(name="Net", value=f"+{net}", inline=True)
-    else:
-        emb.add_field(name="Net", value=str(net), inline=True)
-    await inter.response.send_message(embed=emb)
+    final = discord.Embed(title="🎰 Slot Machine — Result")
+    final.add_field(name="Spin", value=" | ".join(final_reels), inline=False)
+    final.add_field(name="Bet", value=str(bet), inline=True)
+    final.add_field(name="Result", value=result_text, inline=True)
+    final.add_field(name="Net", value=(f"+{net}" if net >= 0 else str(net)), inline=True)
+    await msg.edit(embed=final)
 
 
 # ----- Earn Command: Work -----
@@ -762,70 +810,125 @@ async def work(inter: discord.Interaction):
     await inter.response.send_message(f"💼 You did a **{job}** shift and earned **{amount}** credits!")
 
 
-# ----- Earn Command: Trivia (Multiple choice) -----
-TRIVIA_QUESTIONS = [
-    {
-        "q": "What does CPU stand for?",
-        "choices": ["Central Processing Unit", "Compute Power Utility", "Central Program Unit", "Control Process Unit"],
-        "answer": 0
-    },
-    {
-        "q": "Which command lists files in Linux?",
-        "choices": ["cd", "ls", "rm", "top"],
-        "answer": 1
-    },
-    {
-        "q": "In networking, what does DNS resolve?",
-        "choices": ["MAC to IP", "IP to MAC", "Domain to IP", "Port to Service"],
-        "answer": 2
-    },
-    {
-        "q": "Which database is key–value only?",
-        "choices": ["PostgreSQL", "MongoDB", "Redis", "MySQL"],
-        "answer": 2
-    },
+# ----- Earn Command: Trivia via OpenTDB -----
+async def _get_or_create_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
+    token = store.get_trivia_token()
+    if token:
+        return token
+    # request a new token
+    try:
+        async with session.get(TRIVIA_TOKEN_API, params={"command": "request"}) as resp:
+            data = await resp.json()
+            t = data.get("token")
+            if t:
+                store.set_trivia_token(t)
+                return t
+    except Exception:
+        return None
+    return None
+
+async def _reset_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
+    token = store.get_trivia_token()
+    if not token:
+        return await _get_or_create_trivia_token(session)
+    try:
+        async with session.get(TRIVIA_TOKEN_API, params={"command": "reset", "token": token}) as resp:
+            _ = await resp.json()
+        return token
+    except Exception:
+        return None
+
+async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Optional[str] = None, category: Optional[int] = None):
+    """
+    Returns (question_text, choices_list, correct_index)
+    Uses URL encoding (RFC3986) to avoid HTML entities then decodes.
+    """
+    token = await _get_or_create_trivia_token(session)
+    params = {
+        "amount": 1,
+        "type": "multiple",
+        "encode": "url3986",  # decode with urllib.parse.unquote
+    }
+    if difficulty in {"easy", "medium", "hard"}:
+        params["difficulty"] = difficulty
+    if isinstance(category, int):
+        params["category"] = category
+    if token:
+        params["token"] = token
+
+    async def _do_request():
+        async with session.get(TRIVIA_API, params=params, timeout=15) as resp:
+            return await resp.json()
+
+    data = await _do_request()
+
+    # Handle response codes (0 OK, 4 token empty -> reset, others we just fallback)
+    rc = data.get("response_code", 1)
+    if rc == 4 and token:  # Token Empty -> reset and try again once
+        await _reset_trivia_token(session)
+        data = await _do_request()
+        rc = data.get("response_code", 1)
+
+    if rc != 0 or not data.get("results"):
+        return None
+
+    item = data["results"][0]
+    q = urllib.parse.unquote(item["question"])
+    correct = urllib.parse.unquote(item["correct_answer"])
+    incorrect = [urllib.parse.unquote(x) for x in item.get("incorrect_answers", [])]
+    choices = incorrect + [correct]
+    random.shuffle(choices)
+    correct_idx = choices.index(correct)
+    return q, choices, correct_idx
+
+
+DIFF_CHOICES = [
+    app_commands.Choice(name="Any", value=""),
+    app_commands.Choice(name="Easy", value="easy"),
+    app_commands.Choice(name="Medium", value="medium"),
+    app_commands.Choice(name="Hard", value="hard"),
 ]
 
-TRIVIA_REWARD = 120
+@tree.command(name="trivia", description="Answer a multiple-choice question for credits (powered by OpenTDB).")
+@app_commands.describe(difficulty="Pick a difficulty (default Any).", category_id="Optional OpenTDB category id (e.g., 18 for Computers)")
+@app_commands.choices(difficulty=DIFF_CHOICES)
+async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.Choice[str]] = None, category_id: Optional[int] = None):
+    diff_val = difficulty.value if difficulty else None
+    async with aiohttp.ClientSession() as session:
+        fetched = await fetch_trivia_question(session, diff_val or None, category_id)
+    if not fetched:
+        # graceful fallback
+        return await inter.response.send_message("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
 
-class TriviaView(discord.ui.View):
-    def __init__(self, uid: int, qidx: int, timeout: float = 30):
-        super().__init__(timeout=timeout)
-        self.uid = uid
-        self.qidx = qidx
-        self.choice: Optional[int] = None
+    q, choices, correct_idx = fetched
 
-        # create buttons A-D
-        labels = ["A", "B", "C", "D"]
-        for i, lab in enumerate(labels):
-            self.add_item(self._make_button(lab, i))
+    emb = discord.Embed(title="🧠 Trivia Time", description=q)
+    letters = ["A","B","C","D"]
+    for i, c in enumerate(choices):
+        emb.add_field(name=letters[i], value=html.unescape(c), inline=False)
+    emb.set_footer(text=f"Correct = +{TRIVIA_REWARD} credits")
 
-    def _make_button(self, label: str, idx: int):
-        async def cb(interaction: discord.Interaction, idx=idx):
-            if interaction.user.id != self.uid:
-                await interaction.response.send_message("This question isn't for you.", ephemeral=True)
-                return
-            self.choice = idx
-            await interaction.response.defer()
-            self.stop()
-        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
-        btn.callback = cb
-        return btn
+    class TriviaView(discord.ui.View):
+        def __init__(self, uid: int, timeout: float = 30):
+            super().__init__(timeout=timeout)
+            self.uid = uid
+            self.choice: Optional[int] = None
+            for i, lab in enumerate(letters):
+                self.add_item(self._make_button(lab, i))
 
+        def _make_button(self, label: str, idx: int):
+            async def cb(interaction: discord.Interaction, idx=idx):
+                if interaction.user.id != self.uid:
+                    await interaction.response.send_message("This question isn't for you.", ephemeral=True)
+                    return
+                self.choice = idx
+                await interaction.response.defer()
+                self.stop()
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+            btn.callback = cb
+            return btn
 
-@tree.command(name="trivia", description="Answer a quick multiple-choice question for credits.")
-async def trivia(inter: discord.Interaction):
-    q = random.choice(TRIVIA_QUESTIONS)
-    qidx = TRIVIA_QUESTIONS.index(q)
-
-    emb = discord.Embed(title="🧠 Trivia Time", description=q["q"])
-    emb.add_field(name="A", value=q["choices"][0], inline=False)
-    emb.add_field(name="B", value=q["choices"][1], inline=False)
-    emb.add_field(name="C", value=q["choices"][2], inline=False)
-    emb.add_field(name="D", value=q["choices"][3], inline=False)
-    emb.set_footer(text="30s to answer. Correct = +120 credits")
-
-    view = TriviaView(uid=inter.user.id, qidx=qidx, timeout=30)
+    view = TriviaView(uid=inter.user.id, timeout=30)
     await inter.response.send_message(embed=emb, view=view)
     msg = await inter.original_response()
     await view.wait()
@@ -833,12 +936,11 @@ async def trivia(inter: discord.Interaction):
     if view.choice is None:
         return await msg.edit(content="⌛ Time's up!", embed=None, view=None)
 
-    if view.choice == q["answer"]:
+    if view.choice == correct_idx:
         store.add_balance(inter.user.id, TRIVIA_REWARD)
         return await msg.edit(content=f"✅ Correct! You earned **{TRIVIA_REWARD}** credits.", embed=None, view=None)
     else:
-        correct_letter = ["A","B","C","D"][q["answer"]]
-        return await msg.edit(content=f"❌ Nope. Correct answer was **{correct_letter}**.", embed=None, view=None)
+        return await msg.edit(content=f"❌ Nope. Correct answer was **{letters[correct_idx]}**.", embed=None, view=None)
 
 
 # ----- Moderation: Purge -----

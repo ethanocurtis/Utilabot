@@ -895,6 +895,7 @@ async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float,
         out.append((d, line, sunrise, sunset, uv, hi))
     return out
 def _fmt_local(dt_utc: datetime):
+    pass
 @tasks.loop(seconds=60)
 async def weather_scheduler():
     try:

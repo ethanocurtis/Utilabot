@@ -3,7 +3,8 @@ import os
 import json
 import random
 import asyncio
-from datetime import datetime, timedelta, timezone, date, time as dtime
+import re
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Dict, List, Tuple
 
 import discord
@@ -17,15 +18,13 @@ import urllib.parse
 
 # Timezone
 try:
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
-    ZoneInfo = None
+    ZoneInfo = None  # Fallback to fixed offsets when missing
 
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
 GUILD_IDS: List[int] = []  # Optional: test guild IDs for faster sync
-
-DEFAULT_TZ_NAME = "America/Chicago"
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120  # seconds to accept/decline PvP challenge
@@ -43,7 +42,8 @@ TRIVIA_API = "https://opentdb.com/api.php"
 TRIVIA_TOKEN_API = "https://opentdb.com/api_token.php"
 
 # Reminders
-REMINDER_SCAN_SEC = 20
+DEFAULT_TZ = "America/Chicago"
+REMINDER_POLL_SECONDS = 15  # background check cadence
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -64,10 +64,8 @@ def _ensure_shape(data: dict) -> dict:
     data.setdefault("work", {})          # user_id -> last ISO timestamp
     data.setdefault("streaks", {})       # user_id -> {"count": int, "last_date": "YYYY-MM-DD"}
     data.setdefault("trivia", {})        # {"token": "..."}
-    data.setdefault("notes", {})         # user_id -> [texts]
-    data.setdefault("pins", {})          # channel_id -> text
-    data.setdefault("reminders", [])     # list of {id, user_id, due_iso, message, channel_id, dm}
-    data.setdefault("polls", {})         # message_id -> {"q":..., "opts":[...], "votes":{user_id: idx}, "author": id, "open": True}
+    # Reminders storage
+    data.setdefault("reminders", {"next_id": 1, "items": {}})
     return data
 
 
@@ -111,11 +109,6 @@ class Store:
         return data["daily"].get(str(user_id))
 
     def set_last_daily(self, user_id: int, iso_ts: str):
-        data = self.read()
-        data["daily"][str[user_id]] = iso_ts  # bug: fix below
-
-    # Fix: set_last_daily must use correct key
-    def safe_set_last_daily(self, user_id: int, iso_ts: str):
         data = self.read()
         data["daily"][str(user_id)] = iso_ts
         self.write(data)
@@ -211,87 +204,49 @@ class Store:
             data["trivia"]["token"] = token
         self.write(data)
 
-    # Notes
-    def add_note(self, user_id: int, text: str):
+    # Reminders
+    def add_reminder(self, rem: dict) -> int:
         data = self.read()
-        arr = data["notes"].get(str(user_id), [])
-        arr.append(text)
-        data["notes"][str(user_id)] = arr
+        nid = int(data["reminders"].get("next_id", 1))
+        data["reminders"]["items"][str(nid)] = rem
+        data["reminders"]["next_id"] = nid + 1
         self.write(data)
+        return nid
 
-    def get_notes(self, user_id: int) -> List[str]:
+    def list_user_reminders(self, user_id: int) -> List[Tuple[int, dict]]:
         data = self.read()
-        return data["notes"].get(str(user_id), [])
+        out = []
+        for rid, r in data["reminders"]["items"].items():
+            if int(r.get("user_id")) == int(user_id):
+                out.append((int(rid), r))
+        out.sort(key=lambda x: x[1].get("due_utc", ""))
+        return out
 
-    def delete_note(self, user_id: int, idx: int) -> bool:
+    def cancel_reminder(self, rid: int) -> bool:
         data = self.read()
-        arr = data["notes"].get(str(user_id), [])
-        if 0 <= idx < len(arr):
-            arr.pop(idx)
-            data["notes"][str(user_id)] = arr
+        if str(rid) in data["reminders"]["items"]:
+            data["reminders"]["items"].pop(str(rid), None)
             self.write(data)
             return True
         return False
 
-    # Pins
-    def set_pin(self, channel_id: int, text: str):
+    def pop_due_reminders(self, now_utc: datetime) -> List[Tuple[int, dict]]:
         data = self.read()
-        data["pins"][str(channel_id)] = text
-        self.write(data)
-
-    def get_pin(self, channel_id: int) -> Optional[str]:
-        data = self.read()
-        return data["pins"].get(str(channel_id))
-
-    def clear_pin(self, channel_id: int):
-        data = self.read()
-        data["pins"].pop(str(channel_id), None)
-        self.write(data)
-
-    # Reminders
-    def add_reminder(self, item: dict) -> int:
-        data = self.read()
-        rid = max([r.get("id", 0) for r in data["reminders"]] + [0]) + 1
-        item["id"] = rid
-        data["reminders"].append(item)
-        self.write(data)
-        return rid
-
-    def list_reminders(self, user_id: Optional[int] = None) -> List[dict]:
-        data = self.read()
-        if user_id is None:
-            return data["reminders"]
-        return [r for r in data["reminders"] if int(r.get("user_id")) == int(user_id)]
-
-    def remove_reminder(self, rid: int) -> bool:
-        data = self.read()
-        before = len(data["reminders"])
-        data["reminders"] = [r for r in data["reminders"] if int(r.get("id")) != int(rid)]
-        self.write(data)
-        return len(data["reminders"]) < before
-
-    def update_reminder(self, rid: int, **kwargs):
-        data = self.read()
-        for r in data["reminders"]:
-            if int(r.get("id")) == int(rid):
-                r.update(kwargs)
-                break
-        self.write(data)
-
-    # Polls
-    def save_poll(self, message_id: int, payload: dict):
-        data = self.read()
-        data["polls"][str(message_id)] = payload
-        self.write(data)
-
-    def get_poll(self, message_id: int) -> Optional[dict]:
-        data = self.read()
-        return data["polls"].get(str(message_id))
-
-    def update_poll(self, message_id: int, payload: dict):
-        data = self.read()
-        data["polls"][str(message_id)] = payload
-        self.write(data)
+        due = []
+        still = {}
+        for rid, r in data["reminders"]["items"].items():
+            try:
+                due_dt = datetime.fromisoformat(r.get("due_utc")).astimezone(timezone.utc)
+            except Exception:
+                continue
+            if due_dt <= now_utc:
+                due.append((int(rid), r))
+            else:
+                still[rid] = r
+        if len(due) > 0:
+            data["reminders"]["items"] = still
+            self.write(data)
+        return due
 
 
 store = Store(DATA_PATH)
@@ -338,15 +293,19 @@ def require_manage_messages():
 
 def _maybe_award_after_hand(user_id: int, bet_delta: int, player_cards: List[Tuple[str, str]], won: bool) -> List[str]:
     newly: List[str] = []
+    # First win
     if won and store.get_stats(user_id).get("wins", 0) == 0:
         if store.award_achievement(user_id, "First Blood"):
             newly.append("First Blood")
+    # Blackjack
     if is_blackjack(player_cards):
         if store.award_achievement(user_id, "Blackjack!"):
             newly.append("Blackjack!")
+    # High Roller
     if won and bet_delta >= 1000:
-        if store.award_achievement(user_id, "High Roller (1k+ )"):
+        if store.award_achievement(user_id, "High Roller (1k+)"):
             newly.append("High Roller (1k+)")
+    # Milestones
     wins = store.get_stats(user_id).get("wins", 0)
     for m in (5, 10, 25, 50, 100):
         name = f"Win Milestone {m}"
@@ -383,6 +342,7 @@ class PvPChallengeView(discord.ui.View):
 
 
 class PvPBlackjackView(discord.ui.View):
+    """One shared view for spectators; only the active player can press buttons."""
     def __init__(self, current_player_id: int, timeout: float = 120):
         super().__init__(timeout=timeout)
         self.current_player_id = current_player_id
@@ -407,7 +367,7 @@ class PvPBlackjackView(discord.ui.View):
         self.stop()
 
 
-# ---------- Commands: Balance ----------
+# ---------- Commands ----------
 @tree.command(name="balance", description="Check your balance.")
 async def balance(inter: discord.Interaction, user: Optional[discord.User] = None):
     target = user or inter.user
@@ -416,6 +376,7 @@ async def balance(inter: discord.Interaction, user: Optional[discord.User] = Non
 
 
 def _update_streak(user_id: int) -> int:
+    """Returns new streak count after updating with today's claim logic."""
     st = store.get_streak(user_id)
     today = date.today().isoformat()
     if st["last_date"] == today:
@@ -432,7 +393,6 @@ def _update_streak(user_id: int) -> int:
     return count
 
 
-# ---------- Daily ----------
 @tree.command(name="daily", description="Claim your daily free credits (with streak bonus).")
 async def daily(inter: discord.Interaction):
     now = datetime.now(timezone.utc)
@@ -454,7 +414,7 @@ async def daily(inter: discord.Interaction):
     amount += bonus
 
     store.add_balance(inter.user.id, amount)
-    store.safe_set_last_daily(inter.user.id, now.isoformat())
+    store.set_last_daily(inter.user.id, now.isoformat())
 
     emb = discord.Embed(title="✅ Daily Claimed")
     emb.add_field(name="Base", value=str(STARTING_DAILY), inline=True)
@@ -464,7 +424,7 @@ async def daily(inter: discord.Interaction):
     await inter.response.send_message(embed=emb)
 
 
-# ---------- Blackjack ----------
+# ----- Blackjack (Dealer or PvP spectator-friendly) -----
 @tree.command(name="blackjack", description="Play Blackjack vs dealer or challenge another user (spectator-friendly).")
 @app_commands.describe(bet="Amount to wager", opponent="Optional: challenge another user for PvP")
 async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], opponent: Optional[discord.User] = None):
@@ -473,6 +433,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
     if bal < bet:
         return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
 
+    # PvP spectator-friendly mode
     if opponent and opponent.id != inter.user.id and not opponent.bot:
         opp_bal = store.get_balance(opponent.id)
         if opp_bal < bet:
@@ -499,7 +460,11 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
             emb = discord.Embed(title=title, description=f"Bet each: **{bet}**")
             emb.add_field(name=f"{inter.user.display_name}", value=fmt_hand(p1), inline=True)
             emb.add_field(name=f"{opponent.display_name}", value=fmt_hand(p2), inline=True)
-            emb.add_field(name="Turn", value=f"▶️ **{inter.user.display_name if current_player_id==inter.user.id else opponent.display_name}**", inline=False)
+            emb.add_field(
+                name="Turn",
+                value=f"▶️ **{inter.user.display_name if current_player_id==inter.user.id else opponent.display_name}**",
+                inline=False
+            )
             return emb
 
         view = PvPBlackjackView(current_player_id=current_player_id)
@@ -513,6 +478,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                 await msg.edit(embed=embed_state(), view=view)
             except discord.HTTPException:
                 pass
+
             while hand_value(hand) < 21:
                 await view.wait()
                 choice = view.choice
@@ -531,6 +497,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                     continue
                 else:
                     break
+
             for child in view.children:
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
@@ -572,8 +539,8 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                 outcome = f"**{opponent.display_name}** wins!"
                 store.add_balance(inter.user.id, -bet)
                 store.add_balance(opponent.id, bet)
-                store.add_result(inter.user.id, "loss")
                 store.add_result(opponent.id, "win")
+                store.add_result(inter.user.id, "loss")
             else:
                 store.add_result(inter.user.id, "push")
                 store.add_result(opponent.id, "push")
@@ -588,7 +555,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         if new1 or new2:
             awards_text = ""
             if new1:
-                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\n"
+                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\\n"
             if new2:
                 awards_text += f"🏆 {opponent.display_name}: " + ", ".join(new2)
             if awards_text:
@@ -696,7 +663,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
     await msg.edit(embed=final, view=None)
 
 
-# ---------- High/Low ----------
+# ----- High/Low -----
 @tree.command(name="highlow", description="Simple High/Low card game. Guess if the next card is higher or lower.")
 @app_commands.describe(bet="Amount to wager")
 async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
@@ -780,7 +747,7 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     await msg.edit(embed=emb, view=None)
 
 
-# ---------- Enhanced Slot Machine ----------
+# ----- Enhanced Slot Machine (Animated, Wilds, Nudge, Spin Again) -----
 SLOT_SYMBOLS_BASE = ["🍒", "🍋", "🔔", "⭐", "🍀", "7️⃣"]
 WILD = "🃏"
 SLOT_SYMBOLS = SLOT_SYMBOLS_BASE + [WILD]
@@ -791,26 +758,32 @@ SLOT_PAYOUTS = {
     ("🔔","🔔","🔔"): 5,
     ("🍋","🍋","🍋"): 4,
     ("🍒","🍒","🍒"): 3,
-    (WILD, WILD, WILD): 25,
+    (WILD, WILD, WILD): 25,  # triple wild jackpot
 }
-NUDGE_UPGRADE_CHANCE = 0.10
+NUDGE_UPGRADE_CHANCE = 0.10  # 10% chance to upgrade a two-of-a-kind to three-of-a-kind
 
 def _best_triplet_with_wilds(reels: List[str]) -> Optional[Tuple[str, int]]:
+    """Return (result_text, mult) for the best possible 3-kind considering wilds."""
     trip = tuple(reels)
     if trip in SLOT_PAYOUTS:
         mult = SLOT_PAYOUTS[trip]
         label = "Jackpot" if mult >= 20 else "Win"
         return (f"{label} x{mult}!", mult)
+
+    # can wilds make a 3-kind?
     for sym in ["7️⃣","🍀","⭐","🔔","🍋","🍒"]:
         match = sum(1 for r in reels if r == sym or r == WILD)
         if match == 3:
             mult = SLOT_PAYOUTS[(sym, sym, sym)]
             label = "Jackpot" if mult >= 20 else "Win"
             return (f"{label} x{mult}!", mult)
+
+    # two of a kind (including wilds)?
     for i in range(3):
         for j in range(i+1, 3):
             if reels[i] == reels[j] or WILD in (reels[i], reels[j]):
                 return ("Nice! Two of a kind x2.", 2)
+
     return None
 
 class SpinAgainView(discord.ui.View):
@@ -833,7 +806,11 @@ class SpinAgainView(discord.ui.View):
 async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
     if store.get_balance(inter_or_ctx.user.id) < bet:
         return await inter_or_ctx.followup.send("❌ Not enough credits for that bet.", ephemeral=True)
+
+    # Choose final reels (before potential nudge)
     final_reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+
+    # Animation start
     spinning = ["⬜", "⬜", "⬜"]
     emb = discord.Embed(title="🎰 Slot Machine")
     emb.add_field(name="Spin", value=" | ".join(spinning), inline=False)
@@ -845,6 +822,8 @@ async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
     except discord.NotFound:
         await inter_or_ctx.response.send_message(embed=emb)
         msg = await inter_or_ctx.original_response()
+
+    # Animate reels
     reels = spinning[:]
     stops = [12, 16, 20]
     for t in range(max(stops)):
@@ -863,6 +842,7 @@ async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
             pass
         await asyncio.sleep(0.18)
 
+    # Lucky nudge
     best = _best_triplet_with_wilds(final_reels)
     if best is None:
         pair = False
@@ -914,17 +894,166 @@ async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_00
     await slots_internal(inter, bet)
 
 
-# ---------- Dice Duel ----------
+# ----- Earn: Work -----
+@tree.command(name="work", description="Work a quick virtual job for credits (1h cooldown).")
+async def work(inter: discord.Interaction):
+    now = datetime.now(timezone.utc)
+    last_iso = store.get_last_work(inter.user.id)
+    if last_iso:
+        last = datetime.fromisoformat(last_iso)
+        cd = timedelta(minutes=WORK_COOLDOWN_MINUTES)
+        if now - last < cd:
+            remaining = cd - (now - last)
+            m = int(remaining.total_seconds() // 60)
+            s = int(remaining.total_seconds() % 60)
+            return await inter.response.send_message(f"⏳ You’re tired. Try again in **{m}m {s}s**.", ephemeral=True)
+
+    amount = random.randint(WORK_MIN_PAY, WORK_MAX_PAY)
+    store.add_balance(inter.user.id, amount)
+    store.set_last_work(inter.user.id, now.isoformat())
+
+    job = random.choice(["bug squash", "barge fueling", "code review", "data entry", "ticket triage", "river nav calc", "crate stacking"])
+    await inter.response.send_message(f"💼 You did a **{job}** shift and earned **{amount}** credits!")
+
+
+# ----- Earn: Trivia via OpenTDB -----
+async def _get_or_create_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
+    token = store.get_trivia_token()
+    if token:
+        return token
+    try:
+        async with session.get(TRIVIA_TOKEN_API, params={"command": "request"}) as resp:
+            data = await resp.json()
+            t = data.get("token")
+            if t:
+                store.set_trivia_token(t)
+                return t
+    except Exception:
+        return None
+    return None
+
+async def _reset_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
+    token = store.get_trivia_token()
+    if not token:
+        return await _get_or_create_trivia_token(session)
+    try:
+        async with session.get(TRIVIA_TOKEN_API, params={"command": "reset", "token": token}) as resp:
+            _ = await resp.json()
+        return token
+    except Exception:
+        return None
+
+async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Optional[str] = None, category: Optional[int] = None):
+    token = await _get_or_create_trivia_token(session)
+    params = {
+        "amount": 1,
+        "type": "multiple",
+        "encode": "url3986",
+    }
+    if difficulty in {"easy", "medium", "hard"}:
+        params["difficulty"] = difficulty
+    if isinstance(category, int):
+        params["category"] = category
+    if token:
+        params["token"] = token
+
+    async def _do_request():
+        async with session.get(TRIVIA_API, params=params, timeout=15) as resp:
+            return await resp.json()
+
+    data = await _do_request()
+    rc = data.get("response_code", 1)
+    if rc == 4 and token:
+        await _reset_trivia_token(session)
+        data = await _do_request()
+        rc = data.get("response_code", 1)
+
+    if rc != 0 or not data.get("results"):
+        return None
+
+    item = data["results"][0]
+    q = urllib.parse.unquote(item["question"])
+    correct = urllib.parse.unquote(item["correct_answer"])
+    incorrect = [urllib.parse.unquote(x) for x in item.get("incorrect_answers", [])]
+    choices = incorrect + [correct]
+    random.shuffle(choices)
+    correct_idx = choices.index(correct)
+    return q, choices, correct_idx
+
+
+DIFF_CHOICES = [
+    app_commands.Choice(name="Any", value=""),
+    app_commands.Choice(name="Easy", value="easy"),
+    app_commands.Choice(name="Medium", value="medium"),
+    app_commands.Choice(name="Hard", value="hard"),
+]
+
+@tree.command(name="trivia", description="Answer a multiple-choice question for credits (powered by OpenTDB).")
+@app_commands.describe(difficulty="Pick a difficulty (default Any).", category_id="Optional OpenTDB category id (e.g., 18 for Computers)")
+@app_commands.choices(difficulty=DIFF_CHOICES)
+async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.Choice[str]] = None, category_id: Optional[int] = None):
+    diff_val = difficulty.value if difficulty else None
+    async with aiohttp.ClientSession() as session:
+        fetched = await fetch_trivia_question(session, diff_val or None, category_id)
+    if not fetched:
+        return await inter.response.send_message("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
+
+    q, choices, correct_idx = fetched
+
+    emb = discord.Embed(title="🧠 Trivia Time", description=q)
+    letters = ["A","B","C","D"]
+    for i, c in enumerate(choices):
+        emb.add_field(name=letters[i], value=html.unescape(c), inline=False)
+    emb.set_footer(text=f"Correct = +{TRIVIA_REWARD} credits")
+
+    class TriviaView(discord.ui.View):
+        def __init__(self, uid: int, timeout: float = 30):
+            super().__init__(timeout=timeout)
+            self.uid = uid
+            self.choice: Optional[int] = None
+            for i, lab in enumerate(letters):
+                self.add_item(self._make_button(lab, i))
+
+        def _make_button(self, label: str, idx: int):
+            async def cb(interaction: discord.Interaction, idx=idx):
+                if interaction.user.id != self.uid:
+                    await interaction.response.send_message("This question isn't for you.", ephemeral=True)
+                    return
+                self.choice = idx
+                await interaction.response.defer()
+                self.stop()
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+            btn.callback = cb
+            return btn
+
+    view = TriviaView(uid=inter.user.id, timeout=30)
+    await inter.response.send_message(embed=emb, view=view)
+    msg = await inter.original_response()
+    await view.wait()
+
+    if view.choice is None:
+        return await msg.edit(content="⌛ Time's up!", embed=None, view=None)
+
+    if view.choice == correct_idx:
+        store.add_balance(inter.user.id, TRIVIA_REWARD)
+        return await msg.edit(content=f"✅ Correct! You earned **{TRIVIA_REWARD}** credits.", embed=None, view=None)
+    else:
+        return await msg.edit(content=f"❌ Nope. Correct answer was **{letters[correct_idx]}**.", embed=None, view=None)
+
+
+# ----- NEW MULTIPLAYER GAME: Dice Duel -----
 @tree.command(name="diceduel", description="Challenge another player to a quick dice duel (2d6 vs 2d6).")
 @app_commands.describe(bet="Optional wager (both must afford it)", opponent="User to challenge")
 async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Optional[app_commands.Range[int, 1, 1_000_000]] = None):
     if opponent.bot or opponent.id == inter.user.id:
         return await inter.response.send_message("Pick a real opponent.", ephemeral=True)
+
     if bet:
         if store.get_balance(inter.user.id) < bet:
             return await inter.response.send_message("❌ You don't have enough credits for that bet.", ephemeral=True)
         if store.get_balance(opponent.id) < bet:
             return await inter.response.send_message(f"❌ {opponent.mention} doesn't have enough credits.", ephemeral=True)
+
     view = PvPChallengeView(challenger_id=inter.user.id, challenged_id=opponent.id)
     await inter.response.send_message(f"🎲 {opponent.mention}, **{inter.user.display_name}** challenges you to a Dice Duel{' for **'+str(bet)+'** credits' if bet else ''}! Accept?", view=view)
     await view.wait()
@@ -932,8 +1061,10 @@ async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Opti
         return await inter.followup.send("⌛ Challenge expired.")
     if not view.accepted:
         return await inter.followup.send("🚫 Challenge declined.")
+
     def roll2():
         return random.randint(1,6), random.randint(1,6)
+
     rerolls = 3
     history = []
     while True:
@@ -944,6 +1075,7 @@ async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Opti
         if sa != sb or rerolls == 0:
             break
         rerolls -= 1
+
     if sa > sb:
         outcome = f"**{inter.user.display_name}** wins! ({a[0]}+{a[1]}={sa} vs {b[0]}+{b[1]}={sb})"
         if bet:
@@ -962,13 +1094,14 @@ async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Opti
         outcome = f"Tie after rerolls ({sa}={sb}). It's a push."
         store.add_result(opponent.id, "push")
         store.add_result(inter.user.id, "push")
+
     desc_lines = [f"Round {i+1}: 🎲 {h[0][0]}+{h[0][1]}={h[1]}  vs  🎲 {h[2][0]}+{h[2][1]}={h[3]}" for i, h in enumerate(history)]
     emb = discord.Embed(title="🎲 Dice Duel Results", description="\n".join(desc_lines))
     emb.add_field(name="Outcome", value=outcome, inline=False)
     await inter.followup.send(embed=emb)
 
 
-# ---------- Utilities: pay, cooldowns, stats ----------
+# ----- Utility: Pay / Cooldowns / Stats -----
 @tree.command(name="pay", description="Transfer credits to another user.")
 @app_commands.describe(user="Recipient", amount="Credits to send")
 async def pay(inter: discord.Interaction, user: discord.User, amount: app_commands.Range[int, 1, 10_000_000]):
@@ -1020,395 +1153,206 @@ async def stats_cmd(inter: discord.Interaction, user: Optional[discord.User] = N
     await inter.response.send_message(embed=emb)
 
 
-# ---------- Notes ----------
-@tree.command(name="note_add", description="Save a personal note.")
-async def note_add(inter: discord.Interaction, text: str):
-    store.add_note(inter.user.id, text)
-    await inter.response.send_message("📝 Note saved.", ephemeral=True)
-
-@tree.command(name="notes", description="List your notes or delete one by index.")
-@app_commands.describe(delete_index="Optional index to delete (starts at 1)")
-async def notes(inter: discord.Interaction, delete_index: Optional[app_commands.Range[int,1,10000]] = None):
-    if delete_index:
-        ok = store.delete_note(inter.user.id, delete_index-1)
-        if ok:
-            return await inter.response.send_message(f"🗑️ Deleted note #{delete_index}.", ephemeral=True)
-        return await inter.response.send_message("Couldn't delete that index.", ephemeral=True)
-    arr = store.get_notes(inter.user.id)
-    if not arr:
-        return await inter.response.send_message("No notes yet.", ephemeral=True)
-    lines = [f"{i+1}. {t}" for i, t in enumerate(arr)]
-    await inter.response.send_message("**Your notes:**\n" + "\n".join(lines), ephemeral=True)
-
-
-# ---------- Channel Pin ----------
-@tree.command(name="pin_set", description="Set a sticky note for this channel.")
-async def pin_set(inter: discord.Interaction, text: str):
-    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    store.set_pin(inter.channel.id, text)
-    await inter.response.send_message("📌 Pin set for this channel.")
-
-@tree.command(name="pin_show", description="Show the channel's sticky note.")
-async def pin_show(inter: discord.Interaction):
-    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    text = store.get_pin(inter.channel.id)
-    if not text:
-        return await inter.response.send_message("No pin set for this channel.", ephemeral=True)
-    await inter.response.send_message(f"📌 {text}")
-
-@tree.command(name="pin_clear", description="Clear the channel's sticky note.")
-async def pin_clear(inter: discord.Interaction):
-    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    store.clear_pin(inter.channel.id)
-    await inter.response.send_message("📌 Pin cleared.")
-
-
-# ---------- Polls ----------
-class PollView(discord.ui.View):
-    def __init__(self, message_id: int, author_id: int, options: List[str], timeout: float = 3600):
-        super().__init__(timeout=timeout)
-        self.message_id = message_id
-        self.author_id = author_id
-        self.options = options
-
-        for idx, opt in enumerate(options):
-            self.add_item(self.make_button(idx, opt))
-
-        close_btn = discord.ui.Button(label="Close Poll", style=discord.ButtonStyle.danger)
-        async def close_cb(interaction: discord.Interaction):
-            if interaction.user.id != self.author_id and not interaction.user.guild_permissions.manage_messages:
-                return await interaction.response.send_message("Only the poll creator or a mod can close it.", ephemeral=True)
-            payload = store.get_poll(self.message_id) or {}
-            payload["open"] = False
-            store.update_poll(self.message_id, payload)
-            await self.update_message(interaction, payload, closed=True)
-        close_btn.callback = close_cb
-        self.add_item(close_btn)
-
-    def make_button(self, idx: int, label: str):
-        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
-        async def on_click(interaction: discord.Interaction):
-            payload = store.get_poll(self.message_id)
-            if not payload or not payload.get("open", True):
-                return await interaction.response.send_message("This poll is closed.", ephemeral=True)
-            votes = payload.get("votes", {})
-            votes[str(interaction.user.id)] = idx
-            payload["votes"] = votes
-            store.update_poll(self.message_id, payload)
-            await self.update_message(interaction, payload, closed=False)
-        btn.callback = on_click
-        return btn
-
-    async def update_message(self, interaction: discord.Interaction, payload: dict, closed: bool):
-        counts = [0]*len(self.options)
-        for _, choice in payload.get("votes", {}).items():
-            if 0 <= int(choice) < len(counts):
-                counts[int(choice)] += 1
-        lines = [f"{self.options[i]} — **{counts[i]}**" for i in range(len(self.options))]
-        title = "📊 Poll (Closed)" if closed else "📊 Poll"
-        emb = discord.Embed(title=title, description=payload.get("q",""))
-        emb.add_field(name="Results", value="\n".join(lines), inline=False)
+# ----- Reminders + Timer -----
+def _default_zone():
+    if ZoneInfo is not None:
         try:
-            msg = await interaction.original_response()
-            await msg.edit(embed=emb, view=(None if closed else self))
-        except discord.NotFound:
-            await interaction.response.edit_message(embed=emb, view=(None if closed else self))
-
-@tree.command(name="poll", description="Create a quick poll with up to 5 options (separate with ;)")
-async def poll(inter: discord.Interaction, question: str, options: str):
-    opts = [o.strip() for o in options.split(";") if o.strip()]
-    if len(opts) < 2 or len(opts) > 5:
-        return await inter.response.send_message("Please provide between 2 and 5 options separated by ';'", ephemeral=True)
-    emb = discord.Embed(title="📊 Poll", description=question)
-    emb.add_field(name="Results", value="\n".join(f"{o} — **0**" for o in opts), inline=False)
-    await inter.response.send_message(embed=emb)
-    msg = await inter.original_response()
-    payload = {"q": question, "opts": opts, "votes": {}, "author": inter.user.id, "open": True}
-    store.save_poll(msg.id, payload)
-    view = PollView(message_id=msg.id, author_id=inter.user.id, options=opts)
-    await msg.edit(view=view)
-
-
-# ---------- Helpers: choose & timer (animated) ----------
-@tree.command(name="choose", description="Pick a random option from a comma-separated list.")
-async def choose(inter: discord.Interaction, options: str):
-    opts = [o.strip() for o in options.split(",") if o.strip()]
-    if len(opts) < 2:
-        return await inter.response.send_message("Give me at least two options separated by commas.", ephemeral=True)
-    pick = random.choice(opts)
-    await inter.response.send_message(f"🎯 I choose: **{pick}**")
-
-@tree.command(name="timer", description="Start a countdown timer that pings you when it ends (animated).")
-async def timer(inter: discord.Interaction, seconds: app_commands.Range[int, 1, 36000]):
-    await inter.response.defer(ephemeral=True)
-    remaining = int(seconds)
-    emb = discord.Embed(title="⏳ Timer", description=f"Time left: **{remaining}s**")
-    await inter.followup.send(embed=emb, ephemeral=True)
-    msg = await inter.original_response()
-
-    # Update rate: every second for <=60s, otherwise every 5s
-    step = 1 if remaining <= 60 else 5
-    while remaining > 0:
-        await asyncio.sleep(step)
-        remaining -= step
-        if remaining < 0: remaining = 0
-        try:
-            upd = discord.Embed(title="⏳ Timer", description=f"Time left: **{remaining}s**")
-            await msg.edit(embed=upd)
-        except discord.HTTPException:
-            pass
-    await msg.edit(embed=discord.Embed(title="⏰ Time's up!", description=f"{inter.user.mention}"))
-
-
-# ---------- Reminders ----------
-def parse_mmddyyyy_date(date_str: str) -> Optional[date]:
-    # Expect MM-DD-YYYY
-    try:
-        mm, dd, yyyy = date_str.split("-")
-        return date(int(yyyy), int(mm), int(dd))
-    except Exception:
-        return None
-
-@tree.command(name="remind_in", description="Remind yourself in N minutes. Optional dm=true for DM delivery.")
-async def remind_in(inter: discord.Interaction, minutes: app_commands.Range[int, 1, 100000], message: str, dm: Optional[bool] = False):
-    due = datetime.now(timezone.utc) + timedelta(minutes=int(minutes))
-    item = {"user_id": inter.user.id, "due_iso": due.isoformat(), "message": message, "channel_id": inter.channel.id if inter.channel else None, "dm": bool(dm)}
-    rid = store.add_reminder(item)
-    await inter.response.send_message(f"⏰ Reminder #{rid} set for **{minutes}** minutes from now.")
-
-@tree.command(name="remind_at", description="Remind at an exact time. Date format MM-DD-YYYY. Time HH:MM (24h). tz_offset optional like -05:00.")
-async def remind_at(inter: discord.Interaction, date_mmddyyyy: str, hhmm: str, message: str, tz_offset: Optional[str] = None, dm: Optional[bool] = False):
-    dt_date = parse_mmddyyyy_date(date_mmddyyyy)
-    if not dt_date:
-        return await inter.response.send_message("Please use date format **MM-DD-YYYY**.", ephemeral=True)
-    try:
-        hh, mm = hhmm.split(":")
-        local_time = dtime(hour=int(hh), minute=int(mm))
-    except Exception:
-        return await inter.response.send_message("Please use time format **HH:MM** (24h).", ephemeral=True)
-
-    # Determine timezone
-    if tz_offset:
-        # parse like -05:00 / +01:30
-        try:
-            sign = 1 if tz_offset.startswith("+") else -1
-            parts = tz_offset[1:].split(":")
-            off = timedelta(hours=int(parts[0]), minutes=int(parts[1]) if len(parts)>1 else 0)
-            tz = timezone(sign*off)
+            return ZoneInfo(DEFAULT_TZ)
         except Exception:
-            return await inter.response.send_message("Invalid tz_offset. Example: -05:00", ephemeral=True)
-        local_dt = datetime.combine(dt_date, local_time, tzinfo=tz)
-    else:
-        if ZoneInfo:
-            tz = ZoneInfo(DEFAULT_TZ_NAME)
-            local_dt = datetime.combine(dt_date, local_time, tzinfo=tz)
-        else:
-            # Fallback to fixed -05:00 (approx CST/CDT not handled)
-            tz = timezone(timedelta(hours=-5))
-            local_dt = datetime.combine(dt_date, local_time, tzinfo=tz)
+            pass
+    # Fallback to UTC if zoneinfo not available
+    return timezone(timedelta(0))
+
+def _parse_date_mmddyyyy(text: str):
+    # Accept MM-DD-YYYY, MM/DD/YYYY, or MMDDYYYY
+    m = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})\s*$", text)
+    if not m:
+        m = re.match(r"^\s*(\d{2})(\d{2})(\d{4})\s*$", text)
+    if not m:
+        return None
+    mm, dd, yyyy = map(int, m.groups())
+    return yyyy, mm, dd
+
+def _parse_time(text: str):
+    # Accept 24h HH:MM, HHMM, or h:mma/pm
+    t = text.strip().lower().replace(" ", "")
+    m = re.match(r"^(\d{1,2}):(\d{2})(am|pm)?$", t)
+    if not m:
+        m = re.match(r"^(\d{2})(\d{2})(am|pm)?$", t)
+    if not m:
+        return None
+    hh, mi, ampm = m.groups()
+    hh, mi = int(hh), int(mi)
+    if ampm:
+        hh = (hh % 12) + (12 if ampm == "pm" else 0)
+    return hh, mi
+
+def _parse_offset(off: Optional[str]):
+    if not off:
+        return None
+    m = re.match(r"^([+-])(\d{1,2}):?(\d{2})$", off.strip())
+    if not m:
+        return None
+    sign, oh, om = m.groups()
+    delta = timedelta(hours=int(oh), minutes=int(om))
+    if sign == "-":
+        delta = -delta
+    return timezone(delta)
+
+@tree.command(name="remind_at", description="Schedule a reminder at a specific date/time.")
+@app_commands.describe(
+    date="MM-DD-YYYY (also accepts MM/DD/YYYY)",
+    time="HH:MM 24h (also accepts HHMM or h:mma/pm)",
+    message="What should I remind you about?",
+    tz_offset="Optional ±HH:MM. If omitted, America/Chicago is used.",
+    dm="Deliver via DM instead of the channel",
+)
+async def remind_at(
+    inter: discord.Interaction,
+    date: str,
+    time: str,
+    message: str,
+    tz_offset: Optional[str] = None,
+    dm: bool = False,
+):
+    d = _parse_date_mmddyyyy(date)
+    if not d:
+        return await inter.response.send_message("Please use date format **MM-DD-YYYY** (e.g., 08-12-2025).", ephemeral=True)
+    yyyy, mm, dd = d
+    t = _parse_time(time)
+    if not t:
+        return await inter.response.send_message("Please use time like **14:30** (24h) or **2:30pm**.", ephemeral=True)
+    hh, mi = t
+
+    tz = _parse_offset(tz_offset) or _default_zone()
+    try:
+        local_dt = datetime(int(yyyy), int(mm), int(dd), hh, mi, tzinfo=tz)
+    except ValueError:
+        return await inter.response.send_message("That date/time isn’t valid.", ephemeral=True)
 
     due_utc = local_dt.astimezone(timezone.utc)
-    if due_utc < datetime.now(timezone.utc) - timedelta(seconds=5):
-        return await inter.response.send_message("That time is in the past.", ephemeral=True)
+    if due_utc <= datetime.now(timezone.utc) + timedelta(seconds=5):
+        return await inter.response.send_message("That time is in the past. Pick something in the future.", ephemeral=True)
 
-    item = {"user_id": inter.user.id, "due_iso": due_utc.isoformat(), "message": message, "channel_id": inter.channel.id if inter.channel else None, "dm": bool(dm)}
-    rid = store.add_reminder(item)
-    human = local_dt.strftime("%m-%d-%Y %H:%M")
-    await inter.response.send_message(f"⏰ Reminder #{rid} set for **{human}** ({DEFAULT_TZ_NAME if not tz_offset else 'UTC'+tz_offset}).")
+    rid = store.add_reminder({
+        "user_id": inter.user.id,
+        "channel_id": inter.channel.id if not dm else None,
+        "dm": bool(dm),
+        "text": message,
+        "due_utc": due_utc.isoformat(),
+        "created_by": inter.user.id,
+    })
+
+    when_text = local_dt.strftime("%m-%d-%Y %H:%M %Z")
+    await inter.response.send_message(f"⏰ Reminder **#{rid}** set for **{when_text}** — I’ll remind you: _{message}_", ephemeral=True)
+
+@tree.command(name="remind_in", description="Remind yourself in N minutes.")
+@app_commands.describe(minutes="Minutes from now", message="Reminder text", dm="Deliver via DM instead of the channel")
+async def remind_in(inter: discord.Interaction, minutes: app_commands.Range[int, 1, 60*24*30], message: str, dm: bool = False):
+    due_utc = datetime.now(timezone.utc) + timedelta(minutes=int(minutes))
+    rid = store.add_reminder({
+        "user_id": inter.user.id,
+        "channel_id": inter.channel.id if not dm else None,
+        "dm": bool(dm),
+        "text": message,
+        "due_utc": due_utc.isoformat(),
+        "created_by": inter.user.id,
+    })
+    await inter.response.send_message(f"⏰ Reminder **#{rid}** in **{minutes}m** — _{message}_", ephemeral=True)
 
 @tree.command(name="reminders", description="List your pending reminders.")
 async def reminders_cmd(inter: discord.Interaction):
-    arr = store.list_reminders(inter.user.id)
-    if not arr:
+    items = store.list_user_reminders(inter.user.id)
+    if not items:
         return await inter.response.send_message("No pending reminders.", ephemeral=True)
-    # sort by due
-    arr.sort(key=lambda r: r.get("due_iso",""))
     lines = []
-    now = datetime.now(timezone.utc)
-    for r in arr:
-        due = datetime.fromisoformat(r["due_iso"])
-        left = due - now
-        mins = int(left.total_seconds()//60)
-        lines.append(f"#{r['id']} — in ~{mins}m — {r['message']}")
-    await inter.response.send_message("**Your reminders:**\n" + "\n".join(lines), ephemeral=True)
+    for rid, r in items:
+        due = datetime.fromisoformat(r["due_utc"]).astimezone(_default_zone())
+        where = "DM" if r.get("dm") else f"Channel {r.get('channel_id')}"
+        lines.append(f"#{rid} — {due.strftime('%m-%d-%Y %H:%M %Z')} — {where} — {r.get('text')}")
+    await inter.response.send_message("**Pending reminders:**\n" + "\n".join(lines), ephemeral=True)
 
 @tree.command(name="remind_cancel", description="Cancel a reminder by id.")
-async def remind_cancel(inter: discord.Interaction, reminder_id: int):
-    # allow mods to cancel any
-    mine = store.list_reminders()
-    target = next((r for r in mine if int(r.get("id")) == int(reminder_id)), None)
-    if not target:
-        return await inter.response.send_message("Not found.", ephemeral=True)
-    if target["user_id"] != inter.user.id:
+@app_commands.describe(rid="Reminder id (see /reminders)")
+async def remind_cancel(inter: discord.Interaction, rid: int):
+    # allow owner or mods
+    allowed = False
+    # owner?
+    for r_id, r in store.list_user_reminders(inter.user.id):
+        if r_id == rid:
+            allowed = True
+            break
+    if not allowed:
+        # mod?
         perms = inter.channel.permissions_for(inter.user) if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None
-        if not perms or not perms.manage_messages:
-            return await inter.response.send_message("You can only cancel your own, unless you have Manage Messages.", ephemeral=True)
-    store.remove_reminder(reminder_id)
-    await inter.response.send_message(f"🗑️ Cancelled reminder #{reminder_id}.", ephemeral=True)
+        if perms and perms.manage_messages:
+            allowed = True
+    if not allowed:
+        return await inter.response.send_message("You can only cancel your own reminders (or need Manage Messages).", ephemeral=True)
+    if store.cancel_reminder(rid):
+        await inter.response.send_message(f"🗑️ Canceled reminder #{rid}.", ephemeral=True)
+    else:
+        await inter.response.send_message("No such reminder.", ephemeral=True)
 
-@tasks.loop(seconds=REMINDER_SCAN_SEC)
-async def reminder_loop():
-    data = store.read()
-    arr = data.get("reminders", [])
-    if not arr:
-        return
+@tree.command(name="timer", description="Simple countdown timer that updates.")
+@app_commands.describe(seconds="How many seconds to count down (max 2 hours)")
+async def timer_cmd(inter: discord.Interaction, seconds: app_commands.Range[int, 1, 7200]):
+    total = int(seconds)
+    await inter.response.send_message(f"⏳ Timer: {total}s")
+    msg = await inter.original_response()
+    step = 1 if total <= 60 else 5
+    left = total
+    while left > 0:
+        await asyncio.sleep(step)
+        left = max(0, left - step)
+        mins, secs = divmod(left, 60)
+        text = f"{mins}m {secs}s" if mins else f"{secs}s"
+        try:
+            await msg.edit(content=f"⏳ Timer: {text}")
+        except discord.HTTPException:
+            pass
+    await msg.edit(content="✅ Timer done!")
+
+@tasks.loop(seconds=REMINDER_POLL_SECONDS)
+async def reminder_dispatcher():
     now = datetime.now(timezone.utc)
-    to_send = [r for r in arr if datetime.fromisoformat(r["due_iso"]) <= now]
-    if not to_send:
-        return
-    # Remove them from store first
-    for r in to_send:
-        store.remove_reminder(r["id"])
-    # Deliver
-    for r in to_send:
+    due = store.pop_due_reminders(now)
+    for rid, r in due:
         try:
             user = await bot.fetch_user(int(r["user_id"]))
-            content = f"⏰ **Reminder:** {r['message']}"
-            if r.get("dm"):
-                await user.send(content)
-            else:
-                channel = bot.get_channel(int(r["channel_id"])) if r.get("channel_id") else None
-                if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                    await channel.send(f"{user.mention} {content}")
-                else:
-                    await user.send(content)
         except Exception:
-            continue
+            user = None
+        text = f"⏰ **Reminder #{rid}** — {r.get('text')}"
+        if r.get("dm") and user is not None:
+            try:
+                await user.send(text)
+            except Exception:
+                pass
+        else:
+            chan_id = r.get("channel_id")
+            ch = bot.get_channel(int(chan_id)) if chan_id else None
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                try:
+                    await ch.send(f"{user.mention if user else ''} {text}")
+                except Exception:
+                    pass
 
-@reminder_loop.before_loop
-async def before_reminder():
+@reminder_dispatcher.before_loop
+async def before_reminders():
     await bot.wait_until_ready()
 
 
-# ---------- Trivia (OpenTDB) ----------
-async def _get_or_create_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
-    token = store.get_trivia_token()
-    if token:
-        return token
-    try:
-        async with session.get(TRIVIA_TOKEN_API, params={"command": "request"}) as resp:
-            data = await resp.json()
-            t = data.get("token")
-            if t:
-                store.set_trivia_token(t)
-                return t
-    except Exception:
-        return None
-    return None
-
-async def _reset_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
-    token = store.get_trivia_token()
-    if not token:
-        return await _get_or_create_trivia_token(session)
-    try:
-        async with session.get(TRIVIA_TOKEN_API, params={"command": "reset", "token": token}) as resp:
-            _ = await resp.json()
-        return token
-    except Exception:
-        return None
-
-async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Optional[str] = None, category: Optional[int] = None):
-    token = await _get_or_create_trivia_token(session)
-    params = {"amount": 1, "type": "multiple", "encode": "url3986"}
-    if difficulty in {"easy", "medium", "hard"}:
-        params["difficulty"] = difficulty
-    if isinstance(category, int):
-        params["category"] = category
-    if token:
-        params["token"] = token
-    async def _do_request():
-        async with session.get(TRIVIA_API, params=params, timeout=15) as resp:
-            return await resp.json()
-    data = await _do_request()
-    rc = data.get("response_code", 1)
-    if rc == 4 and token:
-        await _reset_trivia_token(session)
-        data = await _do_request()
-        rc = data.get("response_code", 1)
-    if rc != 0 or not data.get("results"):
-        return None
-    item = data["results"][0]
-    q = urllib.parse.unquote(item["question"])
-    correct = urllib.parse.unquote(item["correct_answer"])
-    incorrect = [urllib.parse.unquote(x) for x in item.get("incorrect_answers", [])]
-    choices = incorrect + [correct]
-    random.shuffle(choices)
-    correct_idx = choices.index(correct)
-    return q, choices, correct_idx
-
-DIFF_CHOICES = [
-    app_commands.Choice(name="Any", value=""),
-    app_commands.Choice(name="Easy", value="easy"),
-    app_commands.Choice(name="Medium", value="medium"),
-    app_commands.Choice(name="Hard", value="hard"),
-]
-
-@tree.command(name="trivia", description="Answer a multiple-choice question for credits (powered by OpenTDB).")
-@app_commands.describe(difficulty="Pick a difficulty (default Any).", category_id="Optional OpenTDB category id (e.g., 18 for Computers)")
-@app_commands.choices(difficulty=DIFF_CHOICES)
-async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.Choice[str]] = None, category_id: Optional[int] = None):
-    diff_val = difficulty.value if difficulty else None
-    async with aiohttp.ClientSession() as session:
-        fetched = await fetch_trivia_question(session, diff_val or None, category_id)
-    if not fetched:
-        return await inter.response.send_message("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
-    q, choices, correct_idx = fetched
-    emb = discord.Embed(title="🧠 Trivia Time", description=q)
-    letters = ["A","B","C","D"]
-    for i, c in enumerate(choices):
-        emb.add_field(name=letters[i], value=html.unescape(c), inline=False)
-    emb.set_footer(text=f"Correct = +{TRIVIA_REWARD} credits")
-    class TriviaView(discord.ui.View):
-        def __init__(self, uid: int, timeout: float = 30):
-            super().__init__(timeout=timeout)
-            self.uid = uid
-            self.choice: Optional[int] = None
-            for i, lab in enumerate(letters):
-                self.add_item(self._make_button(lab, i))
-        def _make_button(self, label: str, idx: int):
-            async def cb(interaction: discord.Interaction, idx=idx):
-                if interaction.user.id != self.uid:
-                    await interaction.response.send_message("This question isn't for you.", ephemeral=True)
-                    return
-                self.choice = idx
-                await interaction.response.defer()
-                self.stop()
-            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
-            btn.callback = cb
-            return btn
-    view = TriviaView(uid=inter.user.id, timeout=30)
-    await inter.response.send_message(embed=emb, view=view)
-    msg = await inter.original_response()
-    await view.wait()
-    if view.choice is None:
-        return await msg.edit(content="⌛ Time's up!", embed=None, view=None)
-    if view.choice == correct_idx:
-        store.add_balance(inter.user.id, TRIVIA_REWARD)
-        return await msg.edit(content=f"✅ Correct! You earned **{TRIVIA_REWARD}** credits.", embed=None, view=None)
-    else:
-        return await msg.edit(content=f"❌ Nope. Correct answer was **{letters[correct_idx]}**.", embed=None, view=None)
-
-
-# ---------- Moderation: Purge & Auto-delete ----------
-def require_manage_messages():
-    def predicate(inter: discord.Interaction):
-        perms = inter.channel.permissions_for(inter.user) if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None
-        if not perms or not perms.manage_messages:
-            raise app_commands.CheckFailure("You need the **Manage Messages** permission here.")
-        return True
-    return app_commands.check(predicate)
-
+# ----- Moderation: Purge & Auto-delete -----
 @tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
 @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
 @require_manage_messages()
 async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 1000], user: Optional[discord.User] = None):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("This command can only be used in text channels.", ephemeral=True)
+
     def check(m: discord.Message):
         return (user is None) or (m.author.id == user.id)
+
     await inter.response.defer(ephemeral=True)
     try:
         deleted = await inter.channel.purge(limit=limit, check=check, bulk=True)
@@ -1449,96 +1393,7 @@ async def autodelete_status(inter: discord.Interaction):
         await inter.response.send_message("❌ Auto-delete is **OFF** for this channel.", ephemeral=True)
 
 
-# ---------- Leaderboard & Achievements ----------
-@tree.command(name="leaderboard", description="Show the top players.")
-@app_commands.describe(category="Choose 'balance' or 'wins'")
-@app_commands.choices(category=[
-    app_commands.Choice(name="balance", value="balance"),
-    app_commands.Choice(name="wins", value="wins")
-])
-async def leaderboard(inter: discord.Interaction, category: app_commands.Choice[str]):
-    top = store.list_top(category.value, 10)
-    if not top:
-        return await inter.response.send_message("No data yet.")
-    lines = []
-    for i, (uid, val) in enumerate(top, start=1):
-        try:
-            user = await bot.fetch_user(uid)
-            uname = user.display_name
-        except Exception:
-            uname = f"User {uid}"
-        lines.append(f"**{i}. {uname}** — {val} {'credits' if category.value=='balance' else 'wins'}")
-    emb = discord.Embed(title=f"🏆 Leaderboard — {category.value.capitalize()}", description="\n".join(lines))
-    await inter.response.send_message(embed=emb)
-
-@tree.command(name="achievements", description="Show your achievements (or another user's).")
-async def achievements(inter: discord.Interaction, user: Optional[discord.User] = None):
-    target = user or inter.user
-    ach = store.get_achievements(target.id)
-    emb = discord.Embed(title=f"🏆 Achievements — {target.display_name}")
-    if not ach:
-        emb.description = "None yet — go win some games!"
-    else:
-        emb.description = ", ".join(sorted(ach))
-    stats = store.get_stats(target.id)
-    emb.add_field(name="Record", value=f"{stats.get('wins',0)}W / {stats.get('losses',0)}L / {stats.get('pushes',0)}P", inline=False)
-    await inter.response.send_message(embed=emb)
-
-
-# ---------- Info ----------
-@tree.command(name="serverinfo", description="Show server info (members, roles, created date).")
-async def serverinfo(inter: discord.Interaction):
-    if not isinstance(inter.guild, discord.Guild):
-        return await inter.response.send_message("Run this in a server.", ephemeral=True)
-    g = inter.guild
-    emb = discord.Embed(title=f"ℹ️ Server Info — {g.name}")
-    emb.add_field(name="Members", value=str(g.member_count), inline=True)
-    emb.add_field(name="Roles", value=str(len(g.roles)), inline=True)
-    emb.add_field(name="Created", value=g.created_at.strftime("%Y-%m-%d"), inline=True)
-    if g.icon:
-        emb.set_thumbnail(url=g.icon.url)
-    await inter.response.send_message(embed=emb)
-
-@tree.command(name="whois", description="Show info about a user.")
-async def whois(inter: discord.Interaction, user: Optional[discord.User] = None):
-    u = user or inter.user
-    emb = discord.Embed(title=f"👤 {u.display_name}")
-    emb.add_field(name="Account Created", value=u.created_at.strftime("%Y-%m-%d"), inline=True)
-    if isinstance(inter.guild, discord.Guild):
-        try:
-            member = await inter.guild.fetch_member(u.id)
-            emb.add_field(name="Joined Server", value=member.joined_at.strftime("%Y-%m-%d"), inline=True)
-            roles = [r.name for r in member.roles if r.name != "@everyone"]
-            if roles:
-                emb.add_field(name="Roles", value=", ".join(roles[:10]), inline=False)
-        except Exception:
-            pass
-    if u.avatar:
-        emb.set_thumbnail(url=u.avatar.url)
-    await inter.response.send_message(embed=emb)
-
-
-# ---------- Earn: Work ----------
-@tree.command(name="work", description="Work a quick virtual job for credits (1h cooldown).")
-async def work(inter: discord.Interaction):
-    now = datetime.now(timezone.utc)
-    last_iso = store.get_last_work(inter.user.id)
-    if last_iso:
-        last = datetime.fromisoformat(last_iso)
-        cd = timedelta(minutes=WORK_COOLDOWN_MINUTES)
-        if now - last < cd:
-            remaining = cd - (now - last)
-            m = int(remaining.total_seconds() // 60)
-            s = int(remaining.total_seconds() % 60)
-            return await inter.response.send_message(f"⏳ You’re tired. Try again in **{m}m {s}s**.", ephemeral=True)
-    amount = random.randint(WORK_MIN_PAY, WORK_MAX_PAY)
-    store.add_balance(inter.user.id, amount)
-    store.set_last_work(inter.user.id, now.isoformat())
-    job = random.choice(["bug squash", "barge fueling", "code review", "data entry", "ticket triage", "river nav calc", "crate stacking"])
-    await inter.response.send_message(f"💼 You did a **{job}** shift and earned **{amount}** credits!")
-
-
-# ---------- Background Cleaners ----------
+# ---------- Background Cleaner ----------
 @tasks.loop(minutes=2)
 async def cleanup_loop():
     conf = store.get_autodelete()
@@ -1549,9 +1404,14 @@ async def cleanup_loop():
         channel = bot.get_channel(int(chan_id))
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             continue
+
         cutoff = now - timedelta(seconds=int(secs))
         try:
-            await channel.purge(limit=1000, check=lambda m: m.created_at < cutoff, bulk=True)
+            await channel.purge(
+                limit=1000,
+                check=lambda m: m.created_at < cutoff,
+                bulk=True
+            )
         except discord.Forbidden:
             continue
         except discord.HTTPException:
@@ -1565,16 +1425,20 @@ async def before_cleanup():
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
+    # Sync slash commands
     if GUILD_IDS:
         for gid in GUILD_IDS:
             guild = discord.Object(id=gid)
             await tree.sync(guild=guild)
     else:
         await tree.sync()
+
     if not cleanup_loop.is_running():
         cleanup_loop.start()
-    if not reminder_loop.is_running():
-        reminder_loop.start()
+
+    if not reminder_dispatcher.is_running():
+        reminder_dispatcher.start()
+
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 

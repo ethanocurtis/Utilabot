@@ -77,6 +77,9 @@ def _ensure_shape(data: dict) -> dict:
     if not isinstance(data.get("reminder_seq"), int):
         data["reminder_seq"] = 0
 
+    # Admin allowlist (new)
+    ensure_list("admin_allowlist")
+
     return data
 
 
@@ -310,6 +313,35 @@ class Store:
         self.write(data)
         return True
 
+    # ---- Admin allowlist helpers (new) ----
+    def is_allowlisted(self, user_id: int) -> bool:
+        data = self.read()
+        return str(user_id) in {str(x) for x in data["admin_allowlist"]}
+
+    def add_allowlisted(self, user_id: int) -> bool:
+        data = self.read()
+        s = {str(x) for x in data["admin_allowlist"]}
+        if str(user_id) in s:
+            return False
+        s.add(str(user_id))
+        data["admin_allowlist"] = sorted(map(int, s))
+        self.write(data)
+        return True
+
+    def remove_allowlisted(self, user_id: int) -> bool:
+        data = self.read()
+        s = {str(x) for x in data["admin_allowlist"]}
+        if str(user_id) not in s:
+            return False
+        s.remove(str(user_id))
+        data["admin_allowlist"] = sorted(map(int, s))
+        self.write(data)
+        return True
+
+    def list_allowlisted(self) -> List[int]:
+        data = self.read()
+        return list(map(int, data["admin_allowlist"]))
+
 
 store = Store(DATA_PATH)
 
@@ -321,6 +353,35 @@ def require_manage_messages():
         if not perms or not perms.manage_messages:
             raise app_commands.CheckFailure("You need the **Manage Messages** permission here.")
         return True
+    return app_commands.check(predicate)
+
+def _has_guild_admin_perms(inter: discord.Interaction) -> bool:
+    """True if the user has Administrator or Manage Server in this channel/guild."""
+    try:
+        if isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
+            perms = inter.channel.permissions_for(inter.user)
+            return bool(perms.administrator or perms.manage_guild)
+    except Exception:
+        pass
+    return False
+
+def require_admin_or_allowlisted():
+    """
+    Allow real server admins OR users on the admin allowlist.
+    Use this on sensitive commands like purge and autodelete_set/disable.
+    """
+    def predicate(inter: discord.Interaction):
+        if _has_guild_admin_perms(inter) or store.is_allowlisted(inter.user.id):
+            return True
+        raise app_commands.CheckFailure("You need **Administrator/Manage Server** or be on the bot's admin allowlist.")
+    return app_commands.check(predicate)
+
+def require_real_admin():
+    """Only actual server admins can manage the allowlist."""
+    def predicate(inter: discord.Interaction):
+        if _has_guild_admin_perms(inter):
+            return True
+        raise app_commands.CheckFailure("Only users with **Administrator** or **Manage Server** can manage the allowlist.")
     return app_commands.check(predicate)
 
 
@@ -1036,10 +1097,10 @@ async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_00
     await inter.response.defer(); await slots_internal(inter, bet)
 
 
-# ---------- Moderation ----------
+# ---------- Moderation (restricted to admins/allowlist) ----------
 @tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
 @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
-@require_manage_messages()
+@require_admin_or_allowlisted()
 async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 1000], user: Optional[discord.User] = None):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("This command can only be used in text channels.", ephemeral=True)
@@ -1056,7 +1117,7 @@ async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 10
 
 @tree.command(name="autodelete_set", description="Enable auto-delete for this channel after N minutes.")
 @app_commands.describe(minutes="Delete messages older than this many minutes (min 1, max 1440)")
-@require_manage_messages()
+@require_admin_or_allowlisted()
 async def autodelete_set(inter: discord.Interaction, minutes: app_commands.Range[int, 1, 1440]):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
@@ -1064,7 +1125,7 @@ async def autodelete_set(inter: discord.Interaction, minutes: app_commands.Range
     await inter.response.send_message(f"🗑️ Auto-delete enabled: older than **{minutes}** minutes.", ephemeral=True)
 
 @tree.command(name="autodelete_disable", description="Disable auto-delete for this channel.")
-@require_manage_messages()
+@require_admin_or_allowlisted()
 async def autodelete_disable(inter: discord.Interaction):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
@@ -1272,6 +1333,43 @@ async def reminders_scheduler():
 @reminders_scheduler.before_loop
 async def before_reminders():
     await bot.wait_until_ready()
+
+
+# ---------- Admin Allowlist Commands (real admins only) ----------
+@tree.command(name="admin_allow", description="Allow a user to use admin bot commands.")
+@require_real_admin()
+@app_commands.describe(user="User to allow")
+async def admin_allow(inter: discord.Interaction, user: discord.User):
+    added = store.add_allowlisted(user.id)
+    if added:
+        await inter.response.send_message(f"✅ **{user.display_name}** added to the admin allowlist.", ephemeral=True)
+    else:
+        await inter.response.send_message(f"ℹ️ **{user.display_name}** is already on the admin allowlist.", ephemeral=True)
+
+@tree.command(name="admin_revoke", description="Remove a user from the admin bot allowlist.")
+@require_real_admin()
+@app_commands.describe(user="User to remove")
+async def admin_revoke(inter: discord.Interaction, user: discord.User):
+    removed = store.remove_allowlisted(user.id)
+    if removed:
+        await inter.response.send_message(f"✅ **{user.display_name}** removed from the admin allowlist.", ephemeral=True)
+    else:
+        await inter.response.send_message(f"ℹ️ **{user.display_name}** was not on the admin allowlist.", ephemeral=True)
+
+@tree.command(name="admin_list", description="Show users allowed to use admin bot commands.")
+@require_real_admin()
+async def admin_list(inter: discord.Interaction):
+    ids = store.list_allowlisted()
+    if not ids:
+        return await inter.response.send_message("Allowlist is empty.", ephemeral=True)
+    lines = []
+    for uid in ids:
+        try:
+            u = await bot.fetch_user(uid)
+            lines.append(f"- {u.mention} ({u.display_name})")
+        except Exception:
+            lines.append(f"- <@{uid}> (User {uid})")
+    await inter.response.send_message("**Admin allowlist:**\n" + "\n".join(lines), ephemeral=True)
 
 
 # ---------- Startup ----------

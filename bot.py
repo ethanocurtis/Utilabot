@@ -733,6 +733,15 @@ DIFF_CHOICES = [
     app_commands.Choice(name="Hard", value="hard"),
 ]
 
+# Fallback trivia (used if OpenTDB is down)
+BUILTIN_TRIVIA = [
+    ("What is the capital of France?", ["Paris", "Rome", "Berlin", "Madrid"], 0),
+    ("2 + 2 * 2 = ?", ["6", "4", "8", "10"], 0),
+    ("Which planet is known as the Red Planet?", ["Mars", "Venus", "Jupiter", "Mercury"], 0),
+    ("Who wrote '1984'?", ["George Orwell", "Aldous Huxley", "J.K. Rowling", "Ernest Hemingway"], 0),
+    ("HTTP status code 404 means?", ["Not Found", "Bad Request", "Forbidden", "Gateway Timeout"], 0),
+]
+
 @tree.command(name="trivia", description="Answer a multiple-choice question for credits (powered by OpenTDB).")
 @app_commands.describe(difficulty="Pick a difficulty (default Any).")
 @app_commands.choices(difficulty=DIFF_CHOICES)
@@ -741,8 +750,12 @@ async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.C
     async with aiohttp.ClientSession() as session:
         fetched = await fetch_trivia_question(session, diff_val or None)
     if not fetched:
-        return await inter.response.send_message("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
-    q, choices, correct_idx = fetched
+        if not BUILTIN_TRIVIA:
+            return await inter.response.send_message("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
+        q, choices, correct_idx = random.choice(BUILTIN_TRIVIA)
+    else:
+        q, choices, correct_idx = fetched  # (kept for clarity — already set above if fallback used)
+    q, choices, correct_idx = fetched  # (kept for clarity — already set above if fallback used)
     emb = discord.Embed(title="🧠 Trivia Time", description=q)
     letters = ["A","B","C","D"]
     for i, c in enumerate(choices):

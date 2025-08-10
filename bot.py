@@ -10,14 +10,14 @@ import discord
 from discord.ext import tasks
 from discord import app_commands
 
-# New imports for trivia API
+# Trivia deps
 import aiohttp
 import html
 import urllib.parse
 
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
-GUILD_IDS: List[int] = []  # Optional: test guild IDs for faster sync, e.g. [123456789012345678]
+GUILD_IDS: List[int] = []  # Optional: test guild IDs for faster sync
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120  # seconds to accept/decline PvP challenge
@@ -257,34 +257,7 @@ def _maybe_award_after_hand(user_id: int, bet_delta: int, player_cards: List[Tup
     return newly
 
 
-# ---------- Views for PvP Blackjack ----------
-class PvPBlackjackView(discord.ui.View):
-    """One shared view for spectators; only the active player can press buttons."""
-    def __init__(self, current_player_id: int, timeout: float = 120):
-        super().__init__(timeout=timeout)
-        self.current_player_id = current_player_id
-        self.choice: Optional[str] = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Only current player may act
-        if interaction.user.id != self.current_player_id:
-            await interaction.response.send_message("It's not your turn.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
-    async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.choice = "hit"
-        await interaction.response.defer()
-        self.stop()
-
-    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
-    async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.choice = "stand"
-        await interaction.response.defer()
-        self.stop()
-
-
+# ---------- Views for PvP ----------
 class PvPChallengeView(discord.ui.View):
     def __init__(self, challenger_id: int, challenged_id: int, timeout: float = PVP_TIMEOUT):
         super().__init__(timeout=timeout)
@@ -311,6 +284,32 @@ class PvPChallengeView(discord.ui.View):
         self.stop()
 
 
+class PvPBlackjackView(discord.ui.View):
+    """One shared view for spectators; only the active player can press buttons."""
+    def __init__(self, current_player_id: int, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.current_player_id = current_player_id
+        self.choice: Optional[str] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.current_player_id:
+            await interaction.response.send_message("It's not your turn.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
+    async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.choice = "hit"
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
+    async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.choice = "stand"
+        await interaction.response.defer()
+        self.stop()
+
+
 # ---------- Commands ----------
 @tree.command(name="balance", description="Check your balance.")
 async def balance(inter: discord.Interaction, user: Optional[discord.User] = None):
@@ -324,9 +323,7 @@ def _update_streak(user_id: int) -> int:
     st = store.get_streak(user_id)
     today = date.today().isoformat()
     if st["last_date"] == today:
-        # already claimed today
         return st["count"]
-    # Determine if consecutive day
     if st["last_date"]:
         last = date.fromisoformat(st["last_date"])
         if date.fromisoformat(today) - last == timedelta(days=1):
@@ -345,7 +342,7 @@ async def daily(inter: discord.Interaction):
     last_iso = store.get_last_daily(inter.user.id)
     if last_iso:
         last = datetime.fromisoformat(last_iso)
-        if now - last < timedelta(hours=20):  # generous window
+        if now - last < timedelta(hours=20):
             remaining = timedelta(hours=20) - (now - last)
             hrs = int(remaining.total_seconds() // 3600)
             mins = int((remaining.total_seconds() % 3600) // 60)
@@ -354,9 +351,7 @@ async def daily(inter: discord.Interaction):
                 ephemeral=True
             )
 
-    # base
     amount = STARTING_DAILY
-    # streak bonus
     streak = _update_streak(inter.user.id)
     bonus = min(STREAK_STEP * max(0, streak - 1), STREAK_MAX_BONUS)
     amount += bonus
@@ -398,11 +393,10 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         if not view_challenge.accepted:
             return await inter.followup.send("🚫 Challenge declined.")
 
-        # Start game (single shared public message)
         deck = deal_deck()
         p1 = [deck.pop(), deck.pop()]
         p2 = [deck.pop(), deck.pop()]
-        current_player_id = inter.user.id  # challenger goes first
+        current_player_id = inter.user.id
 
         def embed_state(title_suffix: str = ""):
             title = f"♠ PvP Blackjack {title_suffix}".strip()
@@ -419,10 +413,8 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         view = PvPBlackjackView(current_player_id=current_player_id)
         msg = await inter.followup.send(embed=embed_state("— Game Start"), view=view)
 
-        # Turn loop for each player
         async def play_turn(player_id: int, hand: List[Tuple[str, str]], name: str):
             nonlocal view, msg, current_player_id
-            # swap current player in the view
             current_player_id = player_id
             view = PvPBlackjackView(current_player_id=current_player_id)
             try:
@@ -430,7 +422,6 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
             except discord.HTTPException:
                 pass
 
-            # actions until stand or bust or timeout
             while hand_value(hand) < 21:
                 await view.wait()
                 choice = view.choice
@@ -441,7 +432,6 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                         await msg.edit(embed=embed_state())
                     except discord.HTTPException:
                         pass
-                    # refresh view (to reset button state)
                     view = PvPBlackjackView(current_player_id=current_player_id)
                     try:
                         await msg.edit(view=view)
@@ -449,9 +439,8 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                         pass
                     continue
                 else:
-                    break  # stand or timeout
+                    break
 
-            # disable buttons for this turn
             for child in view.children:
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
@@ -460,7 +449,6 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
             except discord.HTTPException:
                 pass
 
-        # Challenger then opponent
         await play_turn(inter.user.id, p1, inter.user.display_name)
         await play_turn(opponent.id, p2, opponent.display_name)
 
@@ -500,7 +488,6 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                 store.add_result(inter.user.id, "push")
                 store.add_result(opponent.id, "push")
 
-        # Achievements announce
         new1 = _maybe_award_after_hand(inter.user.id, bet, p1, "wins" in outcome and inter.user.display_name in outcome)
         new2 = _maybe_award_after_hand(opponent.id, bet, p2, "wins" in outcome and opponent.display_name in outcome)
 
@@ -522,7 +509,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
             await inter.followup.send(embed=emb)
         return
 
-    # Vs Dealer (interactive for the player; spectators see updates)
+    # Vs Dealer
     deck = deal_deck()
     player = [deck.pop(), deck.pop()]
     dealer = [deck.pop(), deck.pop()]
@@ -554,7 +541,6 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
     def dealer_embed(title="♣ Blackjack vs Dealer"):
         emb = discord.Embed(title=title, description=f"Bet: **{bet}**")
         emb.add_field(name="Your Hand", value=fmt_hand(player), inline=True)
-        # show only dealer upcard until stand/bust
         emb.add_field(name="Dealer Shows", value=f"{dealer[0][0]}{dealer[0][1]} ??", inline=True)
         return emb
 
@@ -576,7 +562,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                 await msg.edit(embed=dealer_embed(), view=view)
             except discord.HTTPException:
                 pass
-            view = DealerView(uid=inter.user.id)  # refresh buttons
+            view = DealerView(uid=inter.user.id)
             try:
                 await msg.edit(view=view)
             except discord.HTTPException:
@@ -585,7 +571,6 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         else:
             break
 
-    # Dealer plays
     while hand_value(dealer) < 17:
         dealer.append(deck.pop())
 
@@ -621,9 +606,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
     await msg.edit(embed=final, view=None)
 
 
-# ----- New Mini‑Game: High/Low -----
-# Reveal one card, you guess whether the next card will be Higher or Lower.
-# Payout: 1:1 (equal rank = push)
+# ----- High/Low -----
 @tree.command(name="highlow", description="Simple High/Low card game. Guess if the next card is higher or lower.")
 @app_commands.describe(bet="Amount to wager")
 async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
@@ -634,7 +617,6 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     first = deck.pop()
 
     def rank_value(r: str) -> int:
-        # Treat A as high
         order = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
         return order.index(r)
 
@@ -673,7 +655,6 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     msg = await inter.original_response()
     await view.wait()
 
-    # Draw second card and settle
     second = deck.pop()
     first_v = rank_value(first[0])
     second_v = rank_value(second[0])
@@ -681,7 +662,6 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     outcome = "Push."
     result_tag = "push"
     if view.choice is None:
-        # timeout counts as reveal only
         pass
     elif second_v == first_v:
         outcome = "Equal rank! Push."
@@ -710,56 +690,95 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     await msg.edit(embed=emb, view=None)
 
 
-# ----- New Game: Slot Machine (Animated) -----
-SLOT_SYMBOLS = ["🍒", "🍋", "🔔", "⭐", "🍀", "7️⃣"]
+# ----- Enhanced Slot Machine (Animated, Wilds, Nudge, Spin Again) -----
+SLOT_SYMBOLS_BASE = ["🍒", "🍋", "🔔", "⭐", "🍀", "7️⃣"]
+WILD = "🃏"
+SLOT_SYMBOLS = SLOT_SYMBOLS_BASE + [WILD]
 SLOT_PAYOUTS = {
-    ("7️⃣","7️⃣","7️⃣"): 20,   # Jackpot 20x
+    ("7️⃣","7️⃣","7️⃣"): 20,
     ("🍀","🍀","🍀"): 10,
     ("⭐","⭐","⭐"): 6,
     ("🔔","🔔","🔔"): 5,
     ("🍋","🍋","🍋"): 4,
     ("🍒","🍒","🍒"): 3,
+    (WILD, WILD, WILD): 25,  # triple wild jackpot
 }
-# Any two of a kind pays 2x (net +bet)
-# Anything else loses
+NUDGE_UPGRADE_CHANCE = 0.10  # 10% chance to upgrade a two-of-a-kind to three-of-a-kind
 
-def _slots_result(reels: List[str]) -> Tuple[str, int]:
+def _best_triplet_with_wilds(reels: List[str]) -> Optional[Tuple[str, int]]:
+    """Return (result_text, mult) for the best possible 3-kind considering wilds."""
     trip = tuple(reels)
     if trip in SLOT_PAYOUTS:
         mult = SLOT_PAYOUTS[trip]
-        return (f"Jackpot x{mult}!", mult)
-    # two-of-a-kind?
-    if reels[0] == reels[1] or reels[0] == reels[2] or reels[1] == reels[2]:
-        return ("Nice! Two of a kind x2.", 2)
-    return ("You lose.", 0)
+        label = "Jackpot" if mult >= 20 else "Win"
+        return (f"{label} x{mult}!", mult)
 
-@tree.command(name="slots", description="Spin the slot machine. Matching symbols pay big!")
-@app_commands.describe(bet="Amount to wager")
-async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
-    if store.get_balance(inter.user.id) < bet:
-        return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
+    # can wilds make a 3-kind?
+    for sym in ["7️⃣","🍀","⭐","🔔","🍋","🍒"]:
+        # count matches or wilds
+        match = sum(1 for r in reels if r == sym or r == WILD)
+        if match == 3:
+            mult = SLOT_PAYOUTS[(sym, sym, sym)]
+            label = "Jackpot" if mult >= 20 else "Win"
+            return (f"{label} x{mult}!", mult)
 
-    # Pre-choose the final symbols so animation lands correctly
+    # two of a kind (including wilds)?
+    # treat any pair (including wild+sym) as 2x
+    for i in range(3):
+        for j in range(i+1, 3):
+            if reels[i] == reels[j] or WILD in (reels[i], reels[j]):
+                return ("Nice! Two of a kind x2.", 2)
+
+    return None
+
+class SpinAgainView(discord.ui.View):
+    def __init__(self, uid: int, bet: int, timeout: float = 30):
+        super().__init__(timeout=timeout)
+        self.uid = uid
+        self.bet = bet
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("Only the original spinner can use this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Spin Again", style=discord.ButtonStyle.primary, emoji="🔁")
+    async def spin_again(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await slots_internal(interaction, self.bet)
+
+async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
+    if store.get_balance(inter_or_ctx.user.id) < bet:
+        return await inter_or_ctx.followup.send("❌ Not enough credits for that bet.", ephemeral=True)
+
+    # Choose final reels (before potential nudge)
     final_reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
 
-    # Initial embed
+    # Animation start
     spinning = ["⬜", "⬜", "⬜"]
     emb = discord.Embed(title="🎰 Slot Machine")
     emb.add_field(name="Spin", value=" | ".join(spinning), inline=False)
     emb.add_field(name="Bet", value=str(bet), inline=True)
     emb.set_footer(text="Spinning...")
-    await inter.response.send_message(embed=emb)
-    msg = await inter.original_response()
+    try:
+        msg = await inter_or_ctx.original_response()
+        await msg.edit(embed=emb)
+    except discord.NotFound:
+        await inter_or_ctx.response.send_message(embed=emb)
+        msg = await inter_or_ctx.original_response()
 
-    # Animate: each reel stops at a different time
+    # Animate reels
     reels = spinning[:]
-    stops = [12, 16, 20]   # total ticks before each reel locks
+    stops = [12, 16, 20]
+    glow = ["", "", ""]
     for t in range(max(stops)):
         for i in range(3):
             if t < stops[i] - 1:
                 reels[i] = random.choice(SLOT_SYMBOLS)
             elif t == stops[i] - 1:
                 reels[i] = final_reels[i]
+                glow[i] = "**"  # emphasize stop
         try:
             anim = discord.Embed(title="🎰 Slot Machine")
             anim.add_field(name="Spin", value=" | ".join(reels), inline=False)
@@ -768,16 +787,45 @@ async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_00
             await msg.edit(embed=anim)
         except discord.HTTPException:
             pass
-        await asyncio.sleep(0.18)  # gentle pacing without hammering rate limits
+        await asyncio.sleep(0.18)
 
-    # Settle outcome
-    result_text, mult = _slots_result(final_reels)
+    # Lucky nudge: if two-of-a-kind (incl. wild assist) but not 3-kind, upgrade sometimes
+    best = _best_triplet_with_wilds(final_reels)
+    if best is None:
+        # detect 2-kind ignoring order (including a wild)
+        pair = False
+        for i in range(3):
+            for j in range(i+1, 3):
+                if final_reels[i] == final_reels[j] or WILD in (final_reels[i], final_reels[j]):
+                    pair = True
+        if pair and random.random() < NUDGE_UPGRADE_CHANCE:
+            # upgrade to best possible 3-kind favoring higher payouts
+            target_sym = "7️⃣"
+            for sym in ["7️⃣","🍀","⭐","🔔","🍋","🍒"]:
+                # if we can reach 3-kind with at most one change
+                c = sum(1 for r in final_reels if r == sym or r == WILD)
+                if c >= 2:
+                    target_sym = sym
+                    break
+            # change a non-matching non-wild to target_sym
+            for i in range(3):
+                if final_reels[i] != target_sym and final_reels[i] != WILD:
+                    final_reels[i] = target_sym
+                    break
+            best = _best_triplet_with_wilds(final_reels)
+
+    if best is None:
+        result_text, mult = ("You lose.", 0)
+    else:
+        result_text, mult = best
+
+    # settle
     if mult == 0:
-        store.add_balance(inter.user.id, -bet)
+        store.add_balance(inter_or_ctx.user.id, -bet)
         net = -bet
     else:
         win_amount = bet * mult
-        store.add_balance(inter.user.id, win_amount - bet)  # add net profit
+        store.add_balance(inter_or_ctx.user.id, win_amount - bet)
         net = win_amount - bet
 
     final = discord.Embed(title="🎰 Slot Machine — Result")
@@ -785,10 +833,21 @@ async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_00
     final.add_field(name="Bet", value=str(bet), inline=True)
     final.add_field(name="Result", value=result_text, inline=True)
     final.add_field(name="Net", value=(f"+{net}" if net >= 0 else str(net)), inline=True)
-    await msg.edit(embed=final)
+    view = SpinAgainView(uid=inter_or_ctx.user.id, bet=bet)
+    try:
+        await msg.edit(embed=final, view=view)
+    except discord.HTTPException:
+        await inter_or_ctx.followup.send(embed=final, view=view)
+
+@tree.command(name="slots", description="Spin the slot machine. Matching symbols (with 🃏 wilds) pay big!")
+@app_commands.describe(bet="Amount to wager")
+async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
+    # Create initial response so we can edit during animation
+    await inter.response.defer()
+    await slots_internal(inter, bet)
 
 
-# ----- Earn Command: Work -----
+# ----- Earn: Work -----
 @tree.command(name="work", description="Work a quick virtual job for credits (1h cooldown).")
 async def work(inter: discord.Interaction):
     now = datetime.now(timezone.utc)
@@ -810,12 +869,11 @@ async def work(inter: discord.Interaction):
     await inter.response.send_message(f"💼 You did a **{job}** shift and earned **{amount}** credits!")
 
 
-# ----- Earn Command: Trivia via OpenTDB -----
+# ----- Earn: Trivia via OpenTDB -----
 async def _get_or_create_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
     token = store.get_trivia_token()
     if token:
         return token
-    # request a new token
     try:
         async with session.get(TRIVIA_TOKEN_API, params={"command": "request"}) as resp:
             data = await resp.json()
@@ -839,15 +897,11 @@ async def _reset_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
         return None
 
 async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Optional[str] = None, category: Optional[int] = None):
-    """
-    Returns (question_text, choices_list, correct_index)
-    Uses URL encoding (RFC3986) to avoid HTML entities then decodes.
-    """
     token = await _get_or_create_trivia_token(session)
     params = {
         "amount": 1,
         "type": "multiple",
-        "encode": "url3986",  # decode with urllib.parse.unquote
+        "encode": "url3986",
     }
     if difficulty in {"easy", "medium", "hard"}:
         params["difficulty"] = difficulty
@@ -861,10 +915,8 @@ async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Opti
             return await resp.json()
 
     data = await _do_request()
-
-    # Handle response codes (0 OK, 4 token empty -> reset, others we just fallback)
     rc = data.get("response_code", 1)
-    if rc == 4 and token:  # Token Empty -> reset and try again once
+    if rc == 4 and token:
         await _reset_trivia_token(session)
         data = await _do_request()
         rc = data.get("response_code", 1)
@@ -897,7 +949,6 @@ async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.C
     async with aiohttp.ClientSession() as session:
         fetched = await fetch_trivia_question(session, diff_val or None, category_id)
     if not fetched:
-        # graceful fallback
         return await inter.response.send_message("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
 
     q, choices, correct_idx = fetched
@@ -943,7 +994,130 @@ async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.C
         return await msg.edit(content=f"❌ Nope. Correct answer was **{letters[correct_idx]}**.", embed=None, view=None)
 
 
-# ----- Moderation: Purge -----
+# ----- NEW MULTIPLAYER GAME: Dice Duel -----
+@tree.command(name="diceduel", description="Challenge another player to a quick dice duel (2d6 vs 2d6).")
+@app_commands.describe(bet="Optional wager (both must afford it)", opponent="User to challenge")
+async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Optional[app_commands.Range[int, 1, 1_000_000]] = None):
+    if opponent.bot or opponent.id == inter.user.id:
+        return await inter.response.send_message("Pick a real opponent.", ephemeral=True)
+
+    if bet:
+        if store.get_balance(inter.user.id) < bet:
+            return await inter.response.send_message("❌ You don't have enough credits for that bet.", ephemeral=True)
+        if store.get_balance(opponent.id) < bet:
+            return await inter.response.send_message(f"❌ {opponent.mention} doesn't have enough credits.", ephemeral=True)
+
+    view = PvPChallengeView(challenger_id=inter.user.id, challenged_id=opponent.id)
+    await inter.response.send_message(f"🎲 {opponent.mention}, **{inter.user.display_name}** challenges you to a Dice Duel{' for **'+str(bet)+'** credits' if bet else ''}! Accept?", view=view)
+    await view.wait()
+    if view.accepted is None:
+        return await inter.followup.send("⌛ Challenge expired.")
+    if not view.accepted:
+        return await inter.followup.send("🚫 Challenge declined.")
+
+    def roll2():
+        return random.randint(1,6), random.randint(1,6)
+
+    rerolls = 3
+    history = []
+    while True:
+        a = roll2()
+        b = roll2()
+        sa, sb = sum(a), sum(b)
+        history.append((a, sa, b, sb))
+        if sa != sb or rerolls == 0:
+            break
+        rerolls -= 1
+
+    # settle
+    if sa > sb:
+        outcome = f"**{inter.user.display_name}** wins! ({a[0]}+{a[1]}={sa} vs {b[0]}+{b[1]}={sb})"
+        if bet:
+            store.add_balance(inter.user.id, bet)
+            store.add_balance(opponent.id, -bet)
+        store.add_result(inter.user.id, "win")
+        store.add_result(opponent.id, "loss")
+    elif sb > sa:
+        outcome = f"**{opponent.display_name}** wins! ({b[0]}+{b[1]}={sb} vs {a[0]}+{a[1]}={sa})"
+        if bet:
+            store.add_balance(inter.user.id, -bet)
+            store.add_balance(opponent.id, bet)
+        store.add_result(opponent.id, "win")
+        store.add_result(inter.user.id, "loss")
+    else:
+        outcome = f"Tie after rerolls ({sa}={sb}). It's a push."
+        store.add_result(opponent.id, "push")
+        store.add_result(inter.user.id, "push")
+
+    desc_lines = [f"Round {i+1}: 🎲 {h[0][0]}+{h[0][1]}={h[1]}  vs  🎲 {h[2][0]}+{h[2][1]}={h[3]}" for i, h in enumerate(history)]
+    emb = discord.Embed(title="🎲 Dice Duel Results", description="\n".join(desc_lines))
+    emb.add_field(name="Outcome", value=outcome, inline=False)
+    await inter.followup.send(embed=emb)
+
+
+# ----- Utility: Pay / Cooldowns / Stats -----
+@tree.command(name="pay", description="Transfer credits to another user.")
+@app_commands.describe(user="Recipient", amount="Credits to send")
+async def pay(inter: discord.Interaction, user: discord.User, amount: app_commands.Range[int, 1, 10_000_000]):
+    if user.id == inter.user.id or user.bot:
+        return await inter.response.send_message("Pick a real recipient.", ephemeral=True)
+    bal = store.get_balance(inter.user.id)
+    if bal < amount:
+        return await inter.response.send_message("❌ You don't have that many credits.", ephemeral=True)
+    store.add_balance(inter.user.id, -amount)
+    store.add_balance(user.id, amount)
+    await inter.response.send_message(f"✅ Sent **{amount}** credits to **{user.display_name}**.")
+
+@tree.command(name="cooldowns", description="See your time left for daily and work.")
+async def cooldowns(inter: discord.Interaction):
+    now = datetime.now(timezone.utc)
+    # daily
+    daily_left = "Ready ✅"
+    last_iso = store.get_last_daily(inter.user.id)
+    if last_iso:
+        last = datetime.fromisoformat(last_iso)
+        cd = timedelta(hours=20) - (now - last)
+        if cd.total_seconds() > 0:
+            h = int(cd.total_seconds() // 3600)
+            m = int((cd.total_seconds() % 3600) // 60)
+            daily_left = f"{h}h {m}m"
+    # work
+    work_left = "Ready ✅"
+    wlast_iso = store.get_last_work(inter.user.id)
+    if wlast_iso:
+        wlast = datetime.fromisoformat(wlast_iso)
+        wcd = timedelta(minutes=WORK_COOLDOWN_MINUTES) - (now - wlast)
+        if wcd.total_seconds() > 0:
+            mm = int(wcd.total_seconds() // 60)
+            ss = int(wcd.total_seconds() % 60)
+            work_left = f"{mm}m {ss}s"
+    emb = discord.Embed(title="⏱️ Cooldowns")
+    emb.add_field(name="Daily", value=daily_left, inline=True)
+    emb.add_field(name="Work", value=work_left, inline=True)
+    await inter.response.send_message(embed=emb, ephemeral=True)
+
+@tree.command(name="stats", description="Show your game stats and streak.")
+async def stats_cmd(inter: discord.Interaction, user: Optional[discord.User] = None):
+    target = user or inter.user
+    s = store.get_stats(target.id)
+    bal = store.get_balance(target.id)
+    st = store.get_streak(target.id)
+    emb = discord.Embed(title=f"📊 Stats — {target.display_name}")
+    emb.add_field(name="Balance", value=f"{bal} credits", inline=True)
+    emb.add_field(name="Record", value=f"{s.get('wins',0)}W / {s.get('losses',0)}L / {s.get('pushes',0)}P", inline=True)
+    emb.add_field(name="Daily Streak", value=f"{st.get('count',0)} days", inline=True)
+    await inter.response.send_message(embed=emb)
+
+
+# ----- Moderation: Purge & Auto-delete -----
+def require_manage_messages():
+    def predicate(inter: discord.Interaction):
+        perms = inter.channel.permissions_for(inter.user) if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None
+        if not perms or not perms.manage_messages:
+            raise app_commands.CheckFailure("You need the **Manage Messages** permission here.")
+        return True
+    return app_commands.check(predicate)
+
 @tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
 @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
 @require_manage_messages()
@@ -963,8 +1137,6 @@ async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 10
     except discord.HTTPException as e:
         await inter.followup.send(f"Error while deleting: {e}", ephemeral=True)
 
-
-# ----- Auto-Delete: set/disable/status -----
 @tree.command(name="autodelete_set", description="Enable auto-delete for this channel after N minutes.")
 @app_commands.describe(minutes="Delete messages older than this many minutes (min 1, max 1440)")
 @require_manage_messages()
@@ -975,7 +1147,6 @@ async def autodelete_set(inter: discord.Interaction, minutes: app_commands.Range
     store.set_autodelete(inter.channel.id, seconds)
     await inter.response.send_message(f"🗑️ Auto-delete enabled: messages older than **{minutes}** minutes will be cleaned up periodically.", ephemeral=True)
 
-
 @tree.command(name="autodelete_disable", description="Disable auto-delete for this channel.")
 @require_manage_messages()
 async def autodelete_disable(inter: discord.Interaction):
@@ -983,7 +1154,6 @@ async def autodelete_disable(inter: discord.Interaction):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
     store.remove_autodelete(inter.channel.id)
     await inter.response.send_message("🛑 Auto-delete disabled for this channel.", ephemeral=True)
-
 
 @tree.command(name="autodelete_status", description="Show auto-delete settings for this channel.")
 async def autodelete_status(inter: discord.Interaction):
@@ -1019,7 +1189,6 @@ async def leaderboard(inter: discord.Interaction, category: app_commands.Choice[
         lines.append(f"**{i}. {uname}** — {val} {'credits' if category.value=='balance' else 'wins'}")
     emb = discord.Embed(title=f"🏆 Leaderboard — {category.value.capitalize()}", description="\\n".join(lines))
     await inter.response.send_message(embed=emb)
-
 
 @tree.command(name="achievements", description="Show your achievements (or another user's).")
 async def achievements(inter: discord.Interaction, user: Optional[discord.User] = None):
@@ -1059,7 +1228,6 @@ async def cleanup_loop():
         except discord.HTTPException:
             continue
 
-
 @cleanup_loop.before_loop
 async def before_cleanup():
     await bot.wait_until_ready()
@@ -1068,7 +1236,6 @@ async def before_cleanup():
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
-    # Sync slash commands
     if GUILD_IDS:
         for gid in GUILD_IDS:
             guild = discord.Object(id=gid)

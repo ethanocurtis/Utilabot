@@ -1044,17 +1044,42 @@ async def weather_subscribe(
     except Exception as e:
         await inter.followup.send(f"⚠️ {type(e).__name__}: {e}", ephemeral=True)
 
+
 @tree.command(name="weather_subscriptions", description="List your weather subscriptions and next send time.")
 async def weather_subscriptions(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True)
     items = store.list_weather_subs(inter.user.id)
     if not items:
         return await inter.followup.send("You have no weather subscriptions.", ephemeral=True)
-    lines = []
+
+    out_lines = []
+    tz = _chicago_tz_for(datetime.now())
+    now_local = datetime.now(tz)
+
     for s in items:
-        next_run = datetime.fromisoformat(s["next_run_utc"]).replace(tzinfo=timezone.utc)
-        lines.append(f"**#{s['id']}** — {s['cadence']} at {s['hh']:02d}:{s['mi']:02d} CT - ZIP {s['zip']} - next: {_fmt_local(next_run)}")
-    await inter.followup.send("\n".join(lines), ephemeral=True)
+        next_txt = "None"
+        try:
+            raw = s.get("next_run_utc")
+            if raw:
+                nxt = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+                next_txt = _fmt_local(nxt)
+            else:
+                raise ValueError("missing")
+        except Exception:
+            hh = int(s.get("hh", 8))
+            mi = int(s.get("mi", 0))
+            cadence = s.get("cadence", "daily")
+            first_local = _next_local_run(now_local, hh, mi, cadence)
+            nxt = first_local.astimezone(timezone.utc)
+            store.update_weather_sub(s["id"], next_run_utc=nxt.isoformat())
+            next_txt = _fmt_local(nxt)
+
+        out_lines.append(
+            f"**#{s['id']}** — {s.get('cadence','?')} at {int(s.get('hh',0)):02d}:{int(s.get('mi',0)):02d} CT - "
+            f"ZIP {s.get('zip','?????')} - next: {next_txt}"
+        )
+
+    await inter.followup.send("\n".join(out_lines), ephemeral=True)
 
 @tree.command(name="weather_unsubscribe", description="Unsubscribe from weather DMs by ID.")
 async def weather_unsubscribe(inter: discord.Interaction, sub_id: int):

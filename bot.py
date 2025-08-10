@@ -1,7 +1,8 @@
+
 import os
 import json
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Dict, List, Tuple
 
 import discord
@@ -14,6 +15,13 @@ GUILD_IDS: List[int] = []  # Optional: test guild IDs for faster sync, e.g. [123
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120  # seconds to accept/decline PvP challenge
+WORK_COOLDOWN_MINUTES = 60
+WORK_MIN_PAY = 80
+WORK_MAX_PAY = 160
+
+# Daily streak bonus settings
+STREAK_MAX_BONUS = 500
+STREAK_STEP = 50  # +50 per streak day up to max
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -31,6 +39,8 @@ def _ensure_shape(data: dict) -> dict:
     data.setdefault("autodelete", {})
     data.setdefault("stats", {})         # user_id -> {"wins":0,"losses":0,"pushes":0}
     data.setdefault("achievements", {})  # user_id -> [names]
+    data.setdefault("work", {})          # user_id -> last ISO timestamp
+    data.setdefault("streaks", {})       # user_id -> {"count": int, "last_date": "YYYY-MM-DD"}
     return data
 
 
@@ -76,6 +86,26 @@ class Store:
     def set_last_daily(self, user_id: int, iso_ts: str):
         data = self.read()
         data["daily"][str(user_id)] = iso_ts
+        self.write(data)
+
+    # Streak helpers
+    def get_streak(self, user_id: int) -> Dict[str, object]:
+        data = self.read()
+        return data["streaks"].get(str(user_id), {"count": 0, "last_date": None})
+
+    def set_streak(self, user_id: int, count: int, last_date: Optional[str]):
+        data = self.read()
+        data["streaks"][str(user_id)] = {"count": int(count), "last_date": last_date}
+        self.write(data)
+
+    # Work cooldown
+    def get_last_work(self, user_id: int) -> Optional[str]:
+        data = self.read()
+        return data["work"].get(str(user_id))
+
+    def set_last_work(self, user_id: int, iso_ts: str):
+        data = self.read()
+        data["work"][str(user_id)] = iso_ts
         self.write(data)
 
     # Auto-delete config: {channel_id: seconds}
@@ -264,7 +294,27 @@ async def balance(inter: discord.Interaction, user: Optional[discord.User] = Non
     await inter.response.send_message(f"💰 **{target.display_name}** has **{bal}** credits.")
 
 
-@tree.command(name="daily", description="Claim your daily free credits.")
+def _update_streak(user_id: int) -> int:
+    """Returns new streak count after updating with today's claim logic."""
+    st = store.get_streak(user_id)
+    today = date.today().isoformat()
+    if st["last_date"] == today:
+        # already claimed today
+        return st["count"]
+    # Determine if consecutive day
+    if st["last_date"]:
+        last = date.fromisoformat(st["last_date"])
+        if date.fromisoformat(today) - last == timedelta(days=1):
+            count = int(st["count"]) + 1
+        else:
+            count = 1
+    else:
+        count = 1
+    store.set_streak(user_id, count=count, last_date=today)
+    return count
+
+
+@tree.command(name="daily", description="Claim your daily free credits (with streak bonus).")
 async def daily(inter: discord.Interaction):
     now = datetime.now(timezone.utc)
     last_iso = store.get_last_daily(inter.user.id)
@@ -278,9 +328,23 @@ async def daily(inter: discord.Interaction):
                 f"⏳ You already claimed. Try again in **{hrs}h {mins}m**.",
                 ephemeral=True
             )
-    store.add_balance(inter.user.id, STARTING_DAILY)
+
+    # base
+    amount = STARTING_DAILY
+    # streak bonus
+    streak = _update_streak(inter.user.id)
+    bonus = min(STREAK_STEP * max(0, streak - 1), STREAK_MAX_BONUS)
+    amount += bonus
+
+    store.add_balance(inter.user.id, amount)
     store.set_last_daily(inter.user.id, now.isoformat())
-    await inter.response.send_message(f"✅ You claimed **{STARTING_DAILY}** credits. Use `/blackjack` or `/highlow` to play!")
+
+    emb = discord.Embed(title="✅ Daily Claimed")
+    emb.add_field(name="Base", value=str(STARTING_DAILY), inline=True)
+    emb.add_field(name="Streak Bonus", value=f"+{bonus} (Streak: {streak}🔥)", inline=True)
+    emb.add_field(name="Total", value=f"**{amount}** credits", inline=False)
+    emb.set_footer(text="Tip: /work every hour, /slots and /highlow to play, /trivia for quick cash.")
+    await inter.response.send_message(embed=emb)
 
 
 # ----- Blackjack (Dealer or PvP spectator-friendly) -----
@@ -422,7 +486,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         if new1 or new2:
             awards_text = ""
             if new1:
-                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\n"
+                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\\n"
             if new2:
                 awards_text += f"🏆 {opponent.display_name}: " + ", ".join(new2)
             if awards_text:
@@ -621,6 +685,162 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     await msg.edit(embed=emb, view=None)
 
 
+# ----- New Game: Slot Machine -----
+SLOT_SYMBOLS = ["🍒", "🍋", "🔔", "⭐", "🍀", "7️⃣"]
+SLOT_PAYOUTS = {
+    # tuple of 3
+    ("7️⃣","7️⃣","7️⃣"): 20,   # Jackpot 20x
+    ("🍀","🍀","🍀"): 10,      # Lucky clovers 10x
+    ("⭐","⭐","⭐"): 6,
+    ("🔔","🔔","🔔"): 5,
+    ("🍋","🍋","🍋"): 4,
+    ("🍒","🍒","🍒"): 3,
+}
+# Any two of a kind pays 2x (net +bet)
+# Anything else loses
+
+@tree.command(name="slots", description="Spin the slot machine. Matching symbols pay big!")
+@app_commands.describe(bet="Amount to wager")
+async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
+    if store.get_balance(inter.user.id) < bet:
+        return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
+
+    # Spin
+    reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+    trip = tuple(reels)
+    payout_mult = 0
+    result = "You lose."
+    if trip in SLOT_PAYOUTS:
+        payout_mult = SLOT_PAYOUTS[trip]
+        result = f"Jackpot x{payout_mult}!"
+    else:
+        # check two-of-a-kind
+        if reels[0] == reels[1] or reels[0] == reels[2] or reels[1] == reels[2]:
+            payout_mult = 2
+            result = "Nice! Two of a kind x2."
+        else:
+            payout_mult = 0
+
+    if payout_mult == 0:
+        store.add_balance(inter.user.id, -bet)
+        net = -bet
+    else:
+        win_amount = bet * payout_mult
+        store.add_balance(inter.user.id, win_amount - bet)  # add net profit
+        net = win_amount - bet
+
+    emb = discord.Embed(title="🎰 Slot Machine")
+    emb.add_field(name="Spin", value=" | ".join(reels), inline=False)
+    emb.add_field(name="Bet", value=str(bet), inline=True)
+    emb.add_field(name="Result", value=result, inline=True)
+    if net >= 0:
+        emb.add_field(name="Net", value=f"+{net}", inline=True)
+    else:
+        emb.add_field(name="Net", value=str(net), inline=True)
+    await inter.response.send_message(embed=emb)
+
+
+# ----- Earn Command: Work -----
+@tree.command(name="work", description="Work a quick virtual job for credits (1h cooldown).")
+async def work(inter: discord.Interaction):
+    now = datetime.now(timezone.utc)
+    last_iso = store.get_last_work(inter.user.id)
+    if last_iso:
+        last = datetime.fromisoformat(last_iso)
+        cd = timedelta(minutes=WORK_COOLDOWN_MINUTES)
+        if now - last < cd:
+            remaining = cd - (now - last)
+            m = int(remaining.total_seconds() // 60)
+            s = int(remaining.total_seconds() % 60)
+            return await inter.response.send_message(f"⏳ You’re tired. Try again in **{m}m {s}s**.", ephemeral=True)
+
+    amount = random.randint(WORK_MIN_PAY, WORK_MAX_PAY)
+    store.add_balance(inter.user.id, amount)
+    store.set_last_work(inter.user.id, now.isoformat())
+
+    job = random.choice(["bug squash", "barge fueling", "code review", "data entry", "ticket triage", "river nav calc", "crate stacking"])
+    await inter.response.send_message(f"💼 You did a **{job}** shift and earned **{amount}** credits!")
+
+
+# ----- Earn Command: Trivia (Multiple choice) -----
+TRIVIA_QUESTIONS = [
+    {
+        "q": "What does CPU stand for?",
+        "choices": ["Central Processing Unit", "Compute Power Utility", "Central Program Unit", "Control Process Unit"],
+        "answer": 0
+    },
+    {
+        "q": "Which command lists files in Linux?",
+        "choices": ["cd", "ls", "rm", "top"],
+        "answer": 1
+    },
+    {
+        "q": "In networking, what does DNS resolve?",
+        "choices": ["MAC to IP", "IP to MAC", "Domain to IP", "Port to Service"],
+        "answer": 2
+    },
+    {
+        "q": "Which database is key–value only?",
+        "choices": ["PostgreSQL", "MongoDB", "Redis", "MySQL"],
+        "answer": 2
+    },
+]
+
+TRIVIA_REWARD = 120
+
+class TriviaView(discord.ui.View):
+    def __init__(self, uid: int, qidx: int, timeout: float = 30):
+        super().__init__(timeout=timeout)
+        self.uid = uid
+        self.qidx = qidx
+        self.choice: Optional[int] = None
+
+        # create buttons A-D
+        labels = ["A", "B", "C", "D"]
+        for i, lab in enumerate(labels):
+            self.add_item(self._make_button(lab, i))
+
+    def _make_button(self, label: str, idx: int):
+        async def cb(interaction: discord.Interaction, idx=idx):
+            if interaction.user.id != self.uid:
+                await interaction.response.send_message("This question isn't for you.", ephemeral=True)
+                return
+            self.choice = idx
+            await interaction.response.defer()
+            self.stop()
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+        btn.callback = cb
+        return btn
+
+
+@tree.command(name="trivia", description="Answer a quick multiple-choice question for credits.")
+async def trivia(inter: discord.Interaction):
+    q = random.choice(TRIVIA_QUESTIONS)
+    qidx = TRIVIA_QUESTIONS.index(q)
+
+    emb = discord.Embed(title="🧠 Trivia Time", description=q["q"])
+    emb.add_field(name="A", value=q["choices"][0], inline=False)
+    emb.add_field(name="B", value=q["choices"][1], inline=False)
+    emb.add_field(name="C", value=q["choices"][2], inline=False)
+    emb.add_field(name="D", value=q["choices"][3], inline=False)
+    emb.set_footer(text="30s to answer. Correct = +120 credits")
+
+    view = TriviaView(uid=inter.user.id, qidx=qidx, timeout=30)
+    await inter.response.send_message(embed=emb, view=view)
+    msg = await inter.original_response()
+    await view.wait()
+
+    if view.choice is None:
+        return await msg.edit(content="⌛ Time's up!", embed=None, view=None)
+
+    if view.choice == q["answer"]:
+        store.add_balance(inter.user.id, TRIVIA_REWARD)
+        return await msg.edit(content=f"✅ Correct! You earned **{TRIVIA_REWARD}** credits.", embed=None, view=None)
+    else:
+        correct_letter = ["A","B","C","D"][q["answer"]]
+        return await msg.edit(content=f"❌ Nope. Correct answer was **{correct_letter}**.", embed=None, view=None)
+
+
 # ----- Moderation: Purge -----
 @tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
 @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
@@ -695,7 +915,7 @@ async def leaderboard(inter: discord.Interaction, category: app_commands.Choice[
         except Exception:
             uname = f"User {uid}"
         lines.append(f"**{i}. {uname}** — {val} {'credits' if category.value=='balance' else 'wins'}")
-    emb = discord.Embed(title=f"🏆 Leaderboard — {category.value.capitalize()}", description="\n".join(lines))
+    emb = discord.Embed(title=f"🏆 Leaderboard — {category.value.capitalize()}", description="\\n".join(lines))
     await inter.response.send_message(embed=emb)
 
 

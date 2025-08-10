@@ -891,7 +891,7 @@ async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float,
         if pp is not None:
             parts.append(f"☔ {int(pp)}%")
         parts.append(f"📏 {pr:.2f} in")
-        line = f"{icon} {desc} — " + " • ".join(parts)
+        line = f"{icon} {desc} — " + " - ".join(parts)
         out.append((d, line, sunrise, sunset, uv, hi))
     return out
 def _fmt_local(dt_utc: datetime):
@@ -961,7 +961,7 @@ async def weather_subscriptions(inter: discord.Interaction):
     lines = []
     for s in items:
         next_run = datetime.fromisoformat(s["next_run_utc"]).replace(tzinfo=timezone.utc)
-        lines.append(f"**#{s['id']}** — {s['cadence']} at {s['hh']:02d}:{s['mi']:02d} CT • ZIP {s['zip']} • next: {_fmt_local(next_run)}")
+        lines.append(f"**#{s['id']}** — {s['cadence']} at {s['hh']:02d}:{s['mi']:02d} CT - ZIP {s['zip']} - next: {_fmt_local(next_run)}")
     await inter.followup.send("\n".join(lines), ephemeral=True)
 
 @tree.command(name="weather_unsubscribe", description="Unsubscribe from weather DMs by ID.")
@@ -1000,8 +1000,8 @@ async def weather_scheduler():
                                 if sunrise: extras.append(f"🌅 {fmt_sun(sunrise)}")
                                 if sunset: extras.append(f"🌇 {fmt_sun(sunset)}")
                                 if uv is not None: extras.append(f"🔆 UV {round(uv,1)}")
-                                value = line + ("\n" + " • ".join(extras) if extras else "")
-" + " • ".join(extras)) if extras else "")
+                                value = (line + ("\n" + " - ".join(extras))) if extras else line
+" + " - ".join(extras)) if extras else "")
                                 emb.add_field(name=d, value=value, inline=False)
                             emb.set_footer(text="Chicago time schedule")
                             await user.send(embed=emb)
@@ -1067,7 +1067,7 @@ async def shop_cmd(inter: discord.Interaction):
     for name, meta in SHOP_CATALOG.items():
         price = meta["price"]
         price_str = f"{price} cr" if isinstance(price, int) else "–"
-        lines.append(f"**{name}** — Buy: {price_str} • Sell: {meta['sell'] if meta['sell'] is not None else 0} • _{meta['desc']}_")
+        lines.append(f"**{name}** — Buy: {price_str} - Sell: {meta['sell'] if meta['sell'] is not None else 0} - _{meta['desc']}_")
     emb = discord.Embed(title="🛒 Shop")
     emb.description = "\n".join(lines)
     await inter.response.send_message(embed=emb)
@@ -2000,7 +2000,7 @@ async def reminders_cmd(inter: discord.Interaction):
         remaining = int((due - now_ct).total_seconds())
         if remaining < 0: remaining = 0
         local = due.astimezone(_chicago_tz_for(datetime.now()))
-        lines.append(f"**#{r.get('id','?')}** — {local.strftime('%m-%d-%Y %H:%M %Z')}  •  in ~{remaining//3600}h {(remaining%3600)//60}m — _{r['text']}_")
+        lines.append(f"**#{r.get('id','?')}** — {local.strftime('%m-%d-%Y %H:%M %Z')}  -  in ~{remaining//3600}h {(remaining%3600)//60}m — _{r['text']}_")
     await inter.followup.send("\n".join(lines), ephemeral=True)
 
 @tree.command(name="remind_cancel", description="Cancel a reminder by id.")

@@ -41,6 +41,28 @@ TRIVIA_TOKEN_API = "https://opentdb.com/api_token.php"
 # Secondary trivia API (fallback)
 TRIVIA_API_FALLBACK = "https://the-trivia-api.com/v2/questions"
 
+# HTTP headers to avoid 403s on some free APIs
+HTTP_HEADERS = {
+    "User-Agent": "UtilaBot/1.0 (+https://github.com/ethanocurtis/Utilabot)",
+    "Accept": "application/json",
+}
+
+# Local offline fallback so trivia always works even if external APIs are down
+OFFLINE_TRIVIA = [
+    {"q": "What is the capital of France?", "choices": ["Berlin", "Madrid", "Paris", "Rome"], "answer_idx": 2},
+    {"q": "Which planet is known as the Red Planet?", "choices": ["Venus", "Mars", "Jupiter", "Mercury"], "answer_idx": 1},
+    {"q": "Who wrote '1984'?", "choices": ["George Orwell", "Aldous Huxley", "Ray Bradbury", "Ernest Hemingway"], "answer_idx": 0},
+    {"q": "What gas do plants primarily absorb for photosynthesis?", "choices": ["Oxygen", "Carbon Dioxide", "Nitrogen", "Hydrogen"], "answer_idx": 1},
+    {"q": "What is the largest ocean on Earth?", "choices": ["Atlantic", "Pacific", "Indian", "Arctic"], "answer_idx": 1},
+    {"q": "How many continents are there?", "choices": ["5", "6", "7", "8"], "answer_idx": 2},
+    {"q": "Which language has the most native speakers?", "choices": ["English", "Mandarin Chinese", "Spanish", "Hindi"], "answer_idx": 1},
+    {"q": "What is H2O commonly known as?", "choices": ["Salt", "Water", "Hydrogen Peroxide", "Oxygen"], "answer_idx": 1},
+    {"q": "Which metal is liquid at room temperature?", "choices": ["Mercury", "Iron", "Aluminum", "Copper"], "answer_idx": 0},
+    {"q": "What is the smallest prime number?", "choices": ["0", "1", "2", "3"], "answer_idx": 2},
+    {"q": "Which country gifted the Statue of Liberty to the USA?", "choices": ["France", "UK", "Spain", "Italy"], "answer_idx": 0},
+    {"q": "Which instrument has keys, pedals, and strings?", "choices": ["Guitar", "Piano", "Violin", "Flute"], "answer_idx": 1},
+]
+
 DEFAULT_TZ_NAME = "America/Chicago"
 REMINDER_TICK_SECONDS = 10
 
@@ -709,55 +731,100 @@ async def _fetch_from_opentdb(session: aiohttp.ClientSession, difficulty: Option
         params["difficulty"] = difficulty
     if token:
         params["token"] = token
+
     async def _do_request():
-        async with session.get(TRIVIA_API, params=params, timeout=15) as resp:
-            return await resp.json()
+        async with session.get(TRIVIA_API, params=params, timeout=aiohttp.ClientTimeout(total=15), headers=HTTP_HEADERS) as resp:
+            if resp.status != 200:
+                return None
+            try:
+                return await resp.json()
+            except Exception:
+                return None
+
     try:
         data = await _do_request()
+        if not data:
+            return None
         rc = data.get("response_code", 1)
         if rc == 4 and token:
             # Token empty; reset and try once more
             await _reset_trivia_token(session)
             data = await _do_request()
+            if not data:
+                return None
             rc = data.get("response_code", 1)
         if rc != 0 or not data.get("results"):
             return None
         item = data["results"][0]
-        q = urllib.parse.unquote(item["question"])
-        correct = urllib.parse.unquote(item["correct_answer"])
-        incorrect = [urllib.parse.unquote(x) for x in item.get("incorrect_answers", [])]
+        q = html.unescape(urllib.parse.unquote(item.get("question", "")))
+        correct = html.unescape(urllib.parse.unquote(item.get("correct_answer", "")))
+        incorrect = [html.unescape(urllib.parse.unquote(x)) for x in item.get("incorrect_answers", [])]
+        if not q or not correct or len(incorrect) < 1:
+            return None
         choices = incorrect + [correct]
+        # Ensure exactly 4 options if possible
+        while len(choices) < 4:
+            choices.append("None of the above")
+        choices = choices[:4]
         random.shuffle(choices)
-        correct_idx = choices.index(correct)
+        correct_idx = choices.index(correct) if correct in choices else 3
         return q, choices, correct_idx
+    except Exception:
+        return None
     except Exception:
         return None
 
 async def _fetch_from_the_trivia_api(session: aiohttp.ClientSession, difficulty: Optional[str] = None):
     # Docs: https://the-trivia-api.com/docs/v2/#get-questions
-    # Use multiple-choice, 1 question, optional difficulty
     params = {"limit": 1, "types": "multiple"}
     if difficulty in {"easy", "medium", "hard"}:
         params["difficulties"] = difficulty
     try:
-        async with session.get(TRIVIA_API_FALLBACK, params=params, timeout=15) as resp:
+        async with session.get(TRIVIA_API_FALLBACK, params=params, timeout=aiohttp.ClientTimeout(total=15), headers=HTTP_HEADERS) as resp:
             if resp.status != 200:
                 return None
-            data = await resp.json()
+            try:
+                data = await resp.json()
+            except Exception:
+                return None
         if not isinstance(data, list) or not data:
             return None
         item = data[0]
-        q = str(item.get("question", {}).get("text", "")) or None
-        correct = str(item.get("correctAnswer", "")) or None
-        incorrect = list(map(str, item.get("incorrectAnswers", []))) if isinstance(item.get("incorrectAnswers", []), list) else []
+        q = str(item.get("question", {}).get("text", "")).strip()
+        correct = str(item.get("correctAnswer", "")).strip()
+        incorrect_raw = item.get("incorrectAnswers", [])
+        incorrect = [str(x).strip() for x in incorrect_raw] if isinstance(incorrect_raw, list) else []
         if not q or not correct or not incorrect:
             return None
         choices = incorrect + [correct]
+        while len(choices) < 4:
+            choices.append("None of the above")
+        choices = choices[:4]
         random.shuffle(choices)
-        correct_idx = choices.index(correct)
-        # Normalize HTML entities if present
+        # Unescape possible HTML entities
         q = html.unescape(q)
         choices = [html.unescape(c) for c in choices]
+        correct_idx = choices.index(correct) if correct in choices else 3
+        return q, choices, correct_idx
+    except Exception:
+        return None
+    except Exception:
+        return None
+
+async def _fetch_from_offline():
+    try:
+        item = random.choice(OFFLINE_TRIVIA)
+        q = item["q"]
+        choices = list(item["choices"])
+        correct_idx = int(item["answer_idx"])
+        # shuffle but keep track of the correct index
+        paired = list(enumerate(choices))
+        random.shuffle(paired)
+        choices = [c for _, c in paired]
+        for new_idx, (old_idx, _) in enumerate(paired):
+            if old_idx == correct_idx:
+                correct_idx = new_idx
+                break
         return q, choices, correct_idx
     except Exception:
         return None
@@ -767,8 +834,12 @@ async def fetch_trivia_question(session: aiohttp.ClientSession, difficulty: Opti
     primary = await _fetch_from_opentdb(session, difficulty)
     if primary:
         return primary
-    # Fallback
-    return await _fetch_from_the_trivia_api(session, difficulty)
+    # Then The Trivia API
+    secondary = await _fetch_from_the_trivia_api(session, difficulty)
+    if secondary:
+        return secondary
+    # Finally, offline pack
+    return await _fetch_from_offline()
 
 DIFF_CHOICES = [
     app_commands.Choice(name="Any", value=""),

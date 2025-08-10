@@ -746,6 +746,7 @@ BUILTIN_TRIVIA = [
 @app_commands.describe(difficulty="Pick a difficulty (default Any).")
 @app_commands.choices(difficulty=DIFF_CHOICES)
 async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.Choice[str]] = None):
+    await inter.response.defer()
     diff_val = difficulty.value if difficulty else None
     async with aiohttp.ClientSession() as session:
         fetched = await fetch_trivia_question(session, diff_val or None)
@@ -773,8 +774,7 @@ async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.C
                 self.choice = idx; await interaction.response.defer(); self.stop()
             btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary); btn.callback = cb; return btn
     view = TriviaView(uid=inter.user.id, timeout=30)
-    await inter.response.send_message(embed=emb, view=view)
-    msg = await inter.original_response()
+    msg = await inter.followup.send(embed=emb, view=view)
     await view.wait()
     if view.choice is None:
         return await msg.edit(content="⌛ Time's up!", embed=None, view=None)

@@ -971,97 +971,6 @@ async def weather_unsubscribe(inter: discord.Interaction, sub_id: int):
     await inter.followup.send("Removed." if ok else "Couldn't remove that ID.", ephemeral=True)
 
 
-@tasks.loop(seconds=60)
-async def weather_scheduler():
-    try:
-        now_utc = datetime.now(timezone.utc)
-        subs = store.list_weather_subs(None)
-        if not subs:
-            return
-
-        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
-            for s in subs:
-                due = datetime.fromisoformat(s["next_run_utc"]).replace(tzinfo=timezone.utc)
-                if due > now_utc:
-                    continue
-
-                try:
-                    user = await bot.fetch_user(int(s["user_id"]))
-                    city, state, lat, lon = await _zip_to_place_and_coords(session, s["zip"])
-
-                    if s["cadence"] == "daily":
-                        outlook = await _fetch_outlook(session, lat, lon, days=2, tz_name=DEFAULT_TZ_NAME)
-                        first_hi = outlook[0][5] if outlook and outlook[0][5] is not None else None
-
-                        emb = discord.Embed(
-                            title=f"🌤️ Daily Outlook — {city}, {state} {s['zip']}",
-                            colour=wx_color_from_temp_f(first_hi if first_hi is not None else 70)
-                        )
-
-                        for (d, line, sunrise, sunset, uv, _hi) in outlook:
-                            details = [line]
-                            extra_bits = []
-                            if sunrise:
-                                extra_bits.append(f"🌅 {fmt_sun(sunrise)}")
-                            if sunset:
-                                extra_bits.append(f"🌇 {fmt_sun(sunset)}")
-                            if uv is not None:
-                                extra_bits.append(f"🔆 UV {round(uv, 1)}")
-                            if extra_bits:
-                                details.append(" - ".join(extra_bits))
-                            value = "
-".join(details)
-                            emb.add_field(name=d, value=value, inline=False)
-
-                        emb.set_footer(text="Chicago time schedule")
-                        await user.send(embed=emb)
-
-                        tz = _chicago_tz_for(datetime.now())
-                        next_local = datetime.now(tz).replace(
-                            hour=int(s["hh"]), minute=int(s["mi"]), second=0, microsecond=0
-                        )
-                        if next_local <= datetime.now(tz):
-                            next_local += timedelta(days=1)
-                        store.update_weather_sub(s["id"], next_run_utc=next_local.astimezone(timezone.utc).isoformat())
-
-                    else:
-                        days = int(s.get("weekly_days", 7))
-                        days = 10 if days > 10 else (3 if days < 3 else days)
-                        outlook = await _fetch_outlook(session, lat, lon, days=days, tz_name=DEFAULT_TZ_NAME)
-                        first_hi = outlook[0][5] if outlook and outlook[0][5] is not None else None
-
-                        emb = discord.Embed(
-                            title=f"🗓️ Weekly Outlook ({days} days) — {city}, {state} {s['zip']}",
-                            colour=wx_color_from_temp_f(first_hi if first_hi is not None else 70)
-                        )
-
-                        for (d, line, _sunrise, _sunset, _uv, _hi) in outlook:
-                            emb.add_field(name=d, value=line, inline=False)
-
-                        emb.set_footer(text="Chicago time schedule")
-                        await user.send(embed=emb)
-
-                        tz = _chicago_tz_for(datetime.now())
-                        next_local = datetime.now(tz).replace(
-                            hour=int(s["hh"]), minute=int(s["mi"]), second=0, microsecond=0
-                        )
-                        if next_local <= datetime.now(tz):
-                            next_local += timedelta(days=7)
-                        else:
-                            next_local += timedelta(days=7)
-                        store.update_weather_sub(s["id"], next_run_utc=next_local.astimezone(timezone.utc).isoformat())
-
-                except Exception:
-                    fallback = now_utc + timedelta(minutes=5)
-                    store.update_weather_sub(s["id"], next_run_utc=fallback.isoformat())
-
-    except Exception:
-        pass
-
-
-@weather_scheduler.before_loop
-async def before_weather():
-    await bot.wait_until_ready()
 @weather_scheduler.before_loop
 async def before_weather():
     await bot.wait_until_ready()
@@ -2137,3 +2046,94 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+@tasks.loop(seconds=60)
+async def weather_scheduler():
+    try:
+        now_utc = datetime.now(timezone.utc)
+        subs = store.list_weather_subs(None)
+        if not subs:
+            return
+
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            for s in subs:
+                due = datetime.fromisoformat(s["next_run_utc"]).replace(tzinfo=timezone.utc)
+                if due > now_utc:
+                    continue
+
+                try:
+                    user = await bot.fetch_user(int(s["user_id"]))
+                    city, state, lat, lon = await _zip_to_place_and_coords(session, s["zip"])
+
+                    if s["cadence"] == "daily":
+                        outlook = await _fetch_outlook(session, lat, lon, days=2, tz_name=DEFAULT_TZ_NAME)
+                        first_hi = outlook[0][5] if outlook and outlook[0][5] is not None else None
+
+                        emb = discord.Embed(
+                            title=f"🌤️ Daily Outlook — {city}, {state} {s['zip']}",
+                            colour=wx_color_from_temp_f(first_hi if first_hi is not None else 70)
+                        )
+
+                        for (d, line, sunrise, sunset, uv, _hi) in outlook:
+                            details = [line]
+                            extra_bits = []
+                            if sunrise:
+                                extra_bits.append(f"🌅 {fmt_sun(sunrise)}")
+                            if sunset:
+                                extra_bits.append(f"🌇 {fmt_sun(sunset)}")
+                            if uv is not None:
+                                extra_bits.append(f"🔆 UV {round(uv, 1)}")
+                            if extra_bits:
+                                details.append(" - ".join(extra_bits))
+                            value = "\n".join(details)
+                            emb.add_field(name=d, value=value, inline=False)
+
+                        emb.set_footer(text="Chicago time schedule")
+                        await user.send(embed=emb)
+
+                        tz = _chicago_tz_for(datetime.now())
+                        next_local = datetime.now(tz).replace(
+                            hour=int(s["hh"]), minute=int(s["mi"]), second=0, microsecond=0
+                        )
+                        if next_local <= datetime.now(tz):
+                            next_local += timedelta(days=1)
+                        store.update_weather_sub(s["id"], next_run_utc=next_local.astimezone(timezone.utc).isoformat())
+
+                    else:
+                        days = int(s.get("weekly_days", 7))
+                        days = 10 if days > 10 else (3 if days < 3 else days)
+                        outlook = await _fetch_outlook(session, lat, lon, days=days, tz_name=DEFAULT_TZ_NAME)
+                        first_hi = outlook[0][5] if outlook and outlook[0][5] is not None else None
+
+                        emb = discord.Embed(
+                            title=f"🗓️ Weekly Outlook ({days} days) — {city}, {state} {s['zip']}",
+                            colour=wx_color_from_temp_f(first_hi if first_hi is not None else 70)
+                        )
+
+                        for (d, line, _sunrise, _sunset, _uv, _hi) in outlook:
+                            emb.add_field(name=d, value=line, inline=False)
+
+                        emb.set_footer(text="Chicago time schedule")
+                        await user.send(embed=emb)
+
+                        tz = _chicago_tz_for(datetime.now())
+                        next_local = datetime.now(tz).replace(
+                            hour=int(s["hh"]), minute=int(s["mi"]), second=0, microsecond=0
+                        )
+                        if next_local <= datetime.now(tz):
+                            next_local += timedelta(days=7)
+                        else:
+                            next_local += timedelta(days=7)
+                        store.update_weather_sub(s["id"], next_run_utc=next_local.astimezone(timezone.utc).isoformat())
+
+                except Exception:
+                    fallback = now_utc + timedelta(minutes=5)
+                    store.update_weather_sub(s["id"], next_run_utc=fallback.isoformat())
+
+    except Exception:
+        pass
+
+
+@weather_scheduler.before_loop
+async def before_weather():
+    await bot.wait_until_ready()

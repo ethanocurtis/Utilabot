@@ -15,9 +15,17 @@ import aiohttp
 import html
 import urllib.parse
 
+# Timezone for reminders default
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
 GUILD_IDS: List[int] = []  # Optional: test guild IDs for faster sync
+
+DEFAULT_TZ = "America/Chicago"  # <- requested default
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120  # seconds to accept/decline PvP challenge
@@ -53,6 +61,10 @@ def _ensure_shape(data: dict) -> dict:
     data.setdefault("work", {})          # user_id -> last ISO timestamp
     data.setdefault("streaks", {})       # user_id -> {"count": int, "last_date": "YYYY-MM-DD"}
     data.setdefault("trivia", {})        # {"token": "..."}
+    # Utilities
+    data.setdefault("notes", {})         # user_id -> [str]
+    data.setdefault("pins", {})          # channel_id -> str
+    data.setdefault("reminders", [])     # list of dicts
     return data
 
 
@@ -190,6 +202,87 @@ class Store:
         else:
             data["trivia"]["token"] = token
         self.write(data)
+
+    # Notes, Pins, Reminders
+    def add_note(self, user_id: int, text: str):
+        data = self.read()
+        arr = data["notes"].get(str(user_id), [])
+        arr.append(text)
+        data["notes"][str(user_id)] = arr
+        self.write(data)
+
+    def list_notes(self, user_id: int) -> List[str]:
+        data = self.read()
+        return data["notes"].get(str(user_id), [])
+
+    def delete_note(self, user_id: int, index: int) -> bool:
+        data = self.read()
+        arr = data["notes"].get(str(user_id), [])
+        if 0 <= index < len(arr):
+            arr.pop(index)
+            data["notes"][str(user_id)] = arr
+            self.write(data)
+            return True
+        return False
+
+    def set_pin(self, channel_id: int, text: str):
+        data = self.read()
+        data["pins"][str(channel_id)] = text
+        self.write(data)
+
+    def get_pin(self, channel_id: int) -> Optional[str]:
+        data = self.read()
+        return data["pins"].get(str(channel_id))
+
+    def clear_pin(self, channel_id: int):
+        data = self.read()
+        data["pins"].pop(str(channel_id), None)
+        self.write(data)
+
+    def add_reminder(self, reminder: dict) -> int:
+        data = self.read()
+        arr = data["reminders"]
+        reminder["id"] = (max([r.get("id", 0) for r in arr]) + 1) if arr else 1
+        arr.append(reminder)
+        self.write(data)
+        return reminder["id"]
+
+    def list_reminders(self, user_id: Optional[int] = None) -> List[dict]:
+        data = self.read()
+        arr = data["reminders"]
+        if user_id is None:
+            return arr
+        return [r for r in arr if r.get("user_id") == user_id]
+
+    def remove_reminder(self, reminder_id: int) -> bool:
+        data = self.read()
+        arr = data["reminders"]
+        new_arr = [r for r in arr if r.get("id") != reminder_id]
+        if len(new_arr) != len(arr):
+            data["reminders"] = new_arr
+            self.write(data)
+            return True
+        return False
+
+    def pop_due_reminders(self, now_iso: str) -> List[dict]:
+        """Pop reminders whose due time <= now."""
+        data = self.read()
+        arr = data["reminders"]
+        now_dt = datetime.fromisoformat(now_iso)
+        due, future = [], []
+        for r in arr:
+            try:
+                due_dt = datetime.fromisoformat(r.get("when_iso"))
+            except Exception:
+                continue
+            if due_dt <= now_dt:
+                due.append(r)
+            else:
+                future.append(r)
+        if due:
+            data["reminders"] = future
+            self.write(data)
+        return due
 
 
 store = Store(DATA_PATH)
@@ -393,10 +486,11 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         if not view_challenge.accepted:
             return await inter.followup.send("🚫 Challenge declined.")
 
+        # Start game (single shared public message)
         deck = deal_deck()
         p1 = [deck.pop(), deck.pop()]
         p2 = [deck.pop(), deck.pop()]
-        current_player_id = inter.user.id
+        current_player_id = inter.user.id  # challenger goes first
 
         def embed_state(title_suffix: str = ""):
             title = f"♠ PvP Blackjack {title_suffix}".strip()
@@ -413,8 +507,10 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         view = PvPBlackjackView(current_player_id=current_player_id)
         msg = await inter.followup.send(embed=embed_state("— Game Start"), view=view)
 
+        # Turn loop for each player
         async def play_turn(player_id: int, hand: List[Tuple[str, str]], name: str):
             nonlocal view, msg, current_player_id
+            # swap current player in the view
             current_player_id = player_id
             view = PvPBlackjackView(current_player_id=current_player_id)
             try:
@@ -422,6 +518,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
             except discord.HTTPException:
                 pass
 
+            # actions until stand or bust or timeout
             while hand_value(hand) < 21:
                 await view.wait()
                 choice = view.choice
@@ -432,6 +529,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                         await msg.edit(embed=embed_state())
                     except discord.HTTPException:
                         pass
+                    # refresh view (to reset button state)
                     view = PvPBlackjackView(current_player_id=current_player_id)
                     try:
                         await msg.edit(view=view)
@@ -439,8 +537,9 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                         pass
                     continue
                 else:
-                    break
+                    break  # stand or timeout
 
+            # disable buttons for this turn
             for child in view.children:
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
@@ -449,6 +548,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
             except discord.HTTPException:
                 pass
 
+        # Challenger then opponent
         await play_turn(inter.user.id, p1, inter.user.display_name)
         await play_turn(opponent.id, p2, opponent.display_name)
 
@@ -488,6 +588,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                 store.add_result(inter.user.id, "push")
                 store.add_result(opponent.id, "push")
 
+        # Achievements announce
         new1 = _maybe_award_after_hand(inter.user.id, bet, p1, "wins" in outcome and inter.user.display_name in outcome)
         new2 = _maybe_award_after_hand(opponent.id, bet, p2, "wins" in outcome and opponent.display_name in outcome)
 
@@ -498,7 +599,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         if new1 or new2:
             awards_text = ""
             if new1:
-                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\\n"
+                awards_text += f"🏆 {inter.user.display_name}: " + ", ".join(new1) + "\n"
             if new2:
                 awards_text += f"🏆 {opponent.display_name}: " + ", ".join(new2)
             if awards_text:
@@ -509,7 +610,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
             await inter.followup.send(embed=emb)
         return
 
-    # Vs Dealer
+    # Vs Dealer (interactive for the player; spectators see updates)
     deck = deal_deck()
     player = [deck.pop(), deck.pop()]
     dealer = [deck.pop(), deck.pop()]
@@ -541,6 +642,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
     def dealer_embed(title="♣ Blackjack vs Dealer"):
         emb = discord.Embed(title=title, description=f"Bet: **{bet}**")
         emb.add_field(name="Your Hand", value=fmt_hand(player), inline=True)
+        # show only dealer upcard until stand/bust
         emb.add_field(name="Dealer Shows", value=f"{dealer[0][0]}{dealer[0][1]} ??", inline=True)
         return emb
 
@@ -562,7 +664,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
                 await msg.edit(embed=dealer_embed(), view=view)
             except discord.HTTPException:
                 pass
-            view = DealerView(uid=inter.user.id)
+            view = DealerView(uid=inter.user.id)  # refresh buttons
             try:
                 await msg.edit(view=view)
             except discord.HTTPException:
@@ -571,6 +673,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
         else:
             break
 
+    # Dealer plays
     while hand_value(dealer) < 17:
         dealer.append(deck.pop())
 
@@ -701,34 +804,26 @@ SLOT_PAYOUTS = {
     ("🔔","🔔","🔔"): 5,
     ("🍋","🍋","🍋"): 4,
     ("🍒","🍒","🍒"): 3,
-    (WILD, WILD, WILD): 25,  # triple wild jackpot
+    (WILD, WILD, WILD): 25,
 }
 NUDGE_UPGRADE_CHANCE = 0.10  # 10% chance to upgrade a two-of-a-kind to three-of-a-kind
 
 def _best_triplet_with_wilds(reels: List[str]) -> Optional[Tuple[str, int]]:
-    """Return (result_text, mult) for the best possible 3-kind considering wilds."""
     trip = tuple(reels)
     if trip in SLOT_PAYOUTS:
         mult = SLOT_PAYOUTS[trip]
         label = "Jackpot" if mult >= 20 else "Win"
         return (f"{label} x{mult}!", mult)
-
-    # can wilds make a 3-kind?
     for sym in ["7️⃣","🍀","⭐","🔔","🍋","🍒"]:
-        # count matches or wilds
         match = sum(1 for r in reels if r == sym or r == WILD)
         if match == 3:
             mult = SLOT_PAYOUTS[(sym, sym, sym)]
             label = "Jackpot" if mult >= 20 else "Win"
             return (f"{label} x{mult}!", mult)
-
-    # two of a kind (including wilds)?
-    # treat any pair (including wild+sym) as 2x
     for i in range(3):
         for j in range(i+1, 3):
             if reels[i] == reels[j] or WILD in (reels[i], reels[j]):
                 return ("Nice! Two of a kind x2.", 2)
-
     return None
 
 class SpinAgainView(discord.ui.View):
@@ -771,14 +866,12 @@ async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
     # Animate reels
     reels = spinning[:]
     stops = [12, 16, 20]
-    glow = ["", "", ""]
     for t in range(max(stops)):
         for i in range(3):
             if t < stops[i] - 1:
                 reels[i] = random.choice(SLOT_SYMBOLS)
             elif t == stops[i] - 1:
                 reels[i] = final_reels[i]
-                glow[i] = "**"  # emphasize stop
         try:
             anim = discord.Embed(title="🎰 Slot Machine")
             anim.add_field(name="Spin", value=" | ".join(reels), inline=False)
@@ -789,25 +882,21 @@ async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
             pass
         await asyncio.sleep(0.18)
 
-    # Lucky nudge: if two-of-a-kind (incl. wild assist) but not 3-kind, upgrade sometimes
+    # Lucky nudge
     best = _best_triplet_with_wilds(final_reels)
     if best is None:
-        # detect 2-kind ignoring order (including a wild)
         pair = False
         for i in range(3):
             for j in range(i+1, 3):
                 if final_reels[i] == final_reels[j] or WILD in (final_reels[i], final_reels[j]):
                     pair = True
         if pair and random.random() < NUDGE_UPGRADE_CHANCE:
-            # upgrade to best possible 3-kind favoring higher payouts
             target_sym = "7️⃣"
             for sym in ["7️⃣","🍀","⭐","🔔","🍋","🍒"]:
-                # if we can reach 3-kind with at most one change
                 c = sum(1 for r in final_reels if r == sym or r == WILD)
                 if c >= 2:
                     target_sym = sym
                     break
-            # change a non-matching non-wild to target_sym
             for i in range(3):
                 if final_reels[i] != target_sym and final_reels[i] != WILD:
                     final_reels[i] = target_sym
@@ -842,7 +931,6 @@ async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
 @tree.command(name="slots", description="Spin the slot machine. Matching symbols (with 🃏 wilds) pay big!")
 @app_commands.describe(bet="Amount to wager")
 async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
-    # Create initial response so we can edit during animation
     await inter.response.defer()
     await slots_internal(inter, bet)
 
@@ -1109,102 +1197,273 @@ async def stats_cmd(inter: discord.Interaction, user: Optional[discord.User] = N
     await inter.response.send_message(embed=emb)
 
 
-# ----- Moderation: Purge & Auto-delete -----
-def require_manage_messages():
-    def predicate(inter: discord.Interaction):
-        perms = inter.channel.permissions_for(inter.user) if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None
-        if not perms or not perms.manage_messages:
-            raise app_commands.CheckFailure("You need the **Manage Messages** permission here.")
-        return True
-    return app_commands.check(predicate)
+# ----- Notes -----
+@tree.command(name="note_add", description="Save a personal note.")
+@app_commands.describe(text="Your note text")
+async def note_add(inter: discord.Interaction, text: str):
+    if len(text) > 500:
+        text = text[:500]
+    store.add_note(inter.user.id, text)
+    await inter.response.send_message("📝 Note saved.", ephemeral=True)
 
-@tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
-@app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
-@require_manage_messages()
-async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 1000], user: Optional[discord.User] = None):
-    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("This command can only be used in text channels.", ephemeral=True)
+@tree.command(name="notes", description="List your notes or delete one.")
+@app_commands.describe(delete_index="Optional: index to delete (starts at 1)")
+async def notes(inter: discord.Interaction, delete_index: Optional[app_commands.Range[int, 1, 10_000]] = None):
+    if delete_index is not None:
+        ok = store.delete_note(inter.user.id, delete_index - 1)
+        if ok:
+            return await inter.response.send_message(f"🗑️ Deleted note #{delete_index}.", ephemeral=True)
+        else:
+            return await inter.response.send_message("Index out of range.", ephemeral=True)
+    arr = store.list_notes(inter.user.id)
+    if not arr:
+        return await inter.response.send_message("No notes yet. Use `/note_add` to add one.", ephemeral=True)
+    lines = [f"**{i+1}.** {t}" for i, t in enumerate(arr)]
+    emb = discord.Embed(title="📝 Your Notes", description="\n".join(lines))
+    await inter.response.send_message(embed=emb, ephemeral=True)
 
-    def check(m: discord.Message):
-        return (user is None) or (m.author.id == user.id)
 
-    await inter.response.defer(ephemeral=True)
-    try:
-        deleted = await inter.channel.purge(limit=limit, check=check, bulk=True)
-        await inter.followup.send(f"🧹 Deleted **{len(deleted)}** messages.", ephemeral=True)
-    except discord.Forbidden:
-        await inter.followup.send("I need the **Manage Messages** and **Read Message History** permissions.", ephemeral=True)
-    except discord.HTTPException as e:
-        await inter.followup.send(f"Error while deleting: {e}", ephemeral=True)
-
-@tree.command(name="autodelete_set", description="Enable auto-delete for this channel after N minutes.")
-@app_commands.describe(minutes="Delete messages older than this many minutes (min 1, max 1440)")
-@require_manage_messages()
-async def autodelete_set(inter: discord.Interaction, minutes: app_commands.Range[int, 1, 1440]):
+# ----- Channel Pin -----
+@tree.command(name="pin_set", description="Set a sticky note for this channel.")
+async def pin_set(inter: discord.Interaction, text: str):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    seconds = minutes * 60
-    store.set_autodelete(inter.channel.id, seconds)
-    await inter.response.send_message(f"🗑️ Auto-delete enabled: messages older than **{minutes}** minutes will be cleaned up periodically.", ephemeral=True)
+    store.set_pin(inter.channel.id, text[:1000])
+    await inter.response.send_message("📌 Pin set for this channel.")
 
-@tree.command(name="autodelete_disable", description="Disable auto-delete for this channel.")
-@require_manage_messages()
-async def autodelete_disable(inter: discord.Interaction):
+@tree.command(name="pin_show", description="Show this channel's sticky note.")
+async def pin_show(inter: discord.Interaction):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    store.remove_autodelete(inter.channel.id)
-    await inter.response.send_message("🛑 Auto-delete disabled for this channel.", ephemeral=True)
+    txt = store.get_pin(inter.channel.id)
+    if not txt:
+        return await inter.response.send_message("No pin set. Use `/pin_set`.", ephemeral=True)
+    await inter.response.send_message(f"📌 **Channel Pin:** {txt}")
 
-@tree.command(name="autodelete_status", description="Show auto-delete settings for this channel.")
-async def autodelete_status(inter: discord.Interaction):
+@tree.command(name="pin_clear", description="Clear this channel's sticky note.")
+async def pin_clear(inter: discord.Interaction):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    conf = store.get_autodelete()
-    secs = conf.get(str(inter.channel.id))
-    if secs:
-        mins = secs // 60
-        await inter.response.send_message(f"✅ Auto-delete is **ON**: older than **{mins}** minutes.", ephemeral=True)
-    else:
-        await inter.response.send_message("❌ Auto-delete is **OFF** for this channel.", ephemeral=True)
+    store.clear_pin(inter.channel.id)
+    await inter.response.send_message("🧹 Pin cleared.")
 
 
-# ----- Leaderboard & Achievements -----
-@tree.command(name="leaderboard", description="Show the top players.")
-@app_commands.describe(category="Choose 'balance' or 'wins'")
-@app_commands.choices(category=[
-    app_commands.Choice(name="balance", value="balance"),
-    app_commands.Choice(name="wins", value="wins")
-])
-async def leaderboard(inter: discord.Interaction, category: app_commands.Choice[str]):
-    top = store.list_top(category.value, 10)
-    if not top:
-        return await inter.response.send_message("No data yet.")
-    lines = []
-    for i, (uid, val) in enumerate(top, start=1):
+# ----- Polls -----
+class PollView(discord.ui.View):
+    def __init__(self, author_id: int, options: List[str], timeout: float = 1800):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.options = options
+        self.votes: Dict[int, int] = {}  # user_id -> option index
+        for i, opt in enumerate(options):
+            self.add_item(self._make_button(i, opt))
+        self.add_item(self._make_close())
+
+    def tally(self) -> List[int]:
+        counts = [0]*len(self.options)
+        for idx in self.votes.values():
+            counts[idx] += 1
+        return counts
+
+    def _make_button(self, idx: int, label: str):
+        async def cb(interaction: discord.Interaction, idx=idx):
+            self.votes[interaction.user.id] = idx
+            await interaction.response.defer()
+            await self._refresh_message(interaction)
+        b = discord.ui.Button(label=label[:80], style=discord.ButtonStyle.secondary)
+        b.callback = cb
+        return b
+
+    def _make_close(self):
+        async def close_cb(interaction: discord.Interaction):
+            if interaction.user.id != self.author_id:
+                return await interaction.response.send_message("Only the poll creator can close it.", ephemeral=True)
+            for child in self.children:
+                if isinstance(child, discord.ui.Button):
+                    child.disabled = True
+            await self._refresh_message(interaction, closed=True)
+            self.stop()
+        btn = discord.ui.Button(label="Close", style=discord.ButtonStyle.danger)
+        btn.callback = close_cb
+        return btn
+
+    async def _refresh_message(self, interaction: discord.Interaction, closed: bool=False):
+        counts = self.tally()
+        total = sum(counts)
+        parts = []
+        for i, opt in enumerate(self.options):
+            c = counts[i]
+            bar = "▮"*min(20, int((c/total)*20)) if total else ""
+            parts.append(f"**{opt}** — {c} {bar}")
+        desc = "\n".join(parts) or "No votes yet."
+        title = "📊 Poll (closed)" if closed else "📊 Poll"
+        emb = discord.Embed(title=title, description=desc)
         try:
-            user = await bot.fetch_user(uid)
-            uname = user.display_name
+            msg = await interaction.original_response()
+            await msg.edit(embed=emb, view=(None if closed else self))
+        except discord.NotFound:
+            await interaction.followup.send(embed=emb, view=(None if closed else self))
+
+@tree.command(name="poll", description="Create a quick poll with up to 5 options (separate by ;)")
+@app_commands.describe(question="Your poll question", options="Options separated by ; (2-5 options)")
+async def poll(inter: discord.Interaction, question: str, options: str):
+    opts = [o.strip() for o in options.split(";") if o.strip()]
+    if not (2 <= len(opts) <= 5):
+        return await inter.response.send_message("Provide 2 to 5 options separated by `;`.", ephemeral=True)
+    view = PollView(author_id=inter.user.id, options=opts)
+    emb = discord.Embed(title="📊 Poll", description=question)
+    await inter.response.send_message(embed=emb, view=view)
+
+
+# ----- Helpers -----
+@tree.command(name="choose", description="Pick one of the comma-separated choices.")
+async def choose(inter: discord.Interaction, choices: str):
+    opts = [c.strip() for c in choices.split(",") if c.strip()]
+    if len(opts) < 2:
+        return await inter.response.send_message("Give me at least two choices separated by commas.", ephemeral=True)
+    pick = random.choice(opts)
+    await inter.response.send_message(f"🎯 {pick}")
+
+@tree.command(name="timer", description="Simple countdown timer that pings you when done.")
+async def timer(inter: discord.Interaction, seconds: app_commands.Range[int, 1, 86400]):
+    await inter.response.send_message(f"⏳ Timer set for {seconds} seconds.", ephemeral=True)
+    await asyncio.sleep(seconds)
+    try:
+        await inter.followup.send(f"⏰ <@{inter.user.id}> time's up!")
+    except discord.HTTPException:
+        pass
+
+
+# ----- Info -----
+@tree.command(name="serverinfo", description="Show basic server info.")
+async def serverinfo(inter: discord.Interaction):
+    if not isinstance(inter.guild, discord.Guild):
+        return await inter.response.send_message("Use this in a server.", ephemeral=True)
+    g = inter.guild
+    emb = discord.Embed(title=f"ℹ️ Server Info — {g.name}")
+    emb.add_field(name="Members", value=str(g.member_count), inline=True)
+    emb.add_field(name="Created", value=g.created_at.strftime("%Y-%m-%d"), inline=True)
+    emb.add_field(name="Roles", value=str(len(g.roles)), inline=True)
+    if g.icon:
+        emb.set_thumbnail(url=g.icon.url)
+    await inter.response.send_message(embed=emb)
+
+@tree.command(name="whois", description="Info about a user.")
+async def whois(inter: discord.Interaction, user: Optional[discord.User] = None):
+    u = user or inter.user
+    emb = discord.Embed(title=f"👤 {u.display_name}")
+    emb.add_field(name="ID", value=str(u.id), inline=True)
+    emb.add_field(name="Created", value=u.created_at.strftime("%Y-%m-%d"), inline=True)
+    if isinstance(inter.guild, discord.Guild):
+        m = inter.guild.get_member(u.id)
+        if m and m.joined_at:
+            emb.add_field(name="Joined", value=m.joined_at.strftime("%Y-%m-%d"), inline=True)
+        if m and m.roles:
+            emb.add_field(name="Roles", value=", ".join(r.name for r in m.roles if r.name != "@everyone") or "None", inline=False)
+    if u.avatar:
+        emb.set_thumbnail(url=u.avatar.url)
+    await inter.response.send_message(embed=emb)
+
+
+# ----- Reminders -----
+def _parse_offset(offset_str: str) -> Optional[timezone]:
+    """Parse strings like -05:00 or +02:30 into tzinfo with that fixed offset."""
+    try:
+        sign = 1
+        s = offset_str.strip()
+        if s[0] == "-":
+            sign = -1
+            s = s[1:]
+        elif s[0] == "+":
+            s = s[1:]
+        hh, mm = s.split(":")
+        delta = timedelta(hours=int(hh), minutes=int(mm))
+        return timezone(sign*delta)
+    except Exception:
+        return None
+
+def _tz_chicago():
+    if ZoneInfo:
+        try:
+            return ZoneInfo(DEFAULT_TZ)
         except Exception:
-            uname = f"User {uid}"
-        lines.append(f"**{i}. {uname}** — {val} {'credits' if category.value=='balance' else 'wins'}")
-    emb = discord.Embed(title=f"🏆 Leaderboard — {category.value.capitalize()}", description="\\n".join(lines))
-    await inter.response.send_message(embed=emb)
+            pass
+    # fallback: US Central fixed offset (no DST awareness)
+    return timezone(timedelta(hours=-6))
 
-@tree.command(name="achievements", description="Show your achievements (or another user's).")
-async def achievements(inter: discord.Interaction, user: Optional[discord.User] = None):
-    target = user or inter.user
-    ach = store.get_achievements(target.id)
-    emb = discord.Embed(title=f"🏆 Achievements — {target.display_name}")
-    if not ach:
-        emb.description = "None yet — go win some games!"
+@tree.command(name="remind_in", description="Remind yourself in N minutes.")
+@app_commands.describe(minutes="Minutes from now", message="What should I remind you?", dm="Send reminder via DM instead of channel")
+async def remind_in(inter: discord.Interaction, minutes: app_commands.Range[int,1,7*24*60], message: str, dm: Optional[bool] = False):
+    due = datetime.now(timezone.utc) + timedelta(minutes=int(minutes))
+    rid = store.add_reminder({
+        "user_id": inter.user.id,
+        "channel_id": inter.channel.id if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None,
+        "message": message[:1000],
+        "when_iso": due.isoformat(),
+        "dm": bool(dm),
+    })
+    await inter.response.send_message(f"⏰ Reminder #{rid} set for **{minutes}** minutes from now.")
+
+@tree.command(name="remind_at", description="Remind at an exact date & time (defaults to America/Chicago).")
+@app_commands.describe(date_str="YYYY-MM-DD", time_str="HH:MM (24h)", message="Reminder text", tz_offset="Optional offset like -05:00 or +02:00", dm="Send as DM")
+async def remind_at(inter: discord.Interaction, date_str: str, time_str: str, message: str, tz_offset: Optional[str] = None, dm: Optional[bool] = False):
+    # Determine timezone
+    tzinfo = None
+    if tz_offset:
+        tzinfo = _parse_offset(tz_offset)
+    if tzinfo is None:
+        tzinfo = _tz_chicago()
+
+    try:
+        naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        local_dt = naive.replace(tzinfo=tzinfo)
+        due_utc = local_dt.astimezone(timezone.utc)
+    except Exception:
+        return await inter.response.send_message("Couldn't parse date/time. Use `YYYY-MM-DD` and `HH:MM` (24h). Example: `2025-08-10 14:30`", ephemeral=True)
+
+    rid = store.add_reminder({
+        "user_id": inter.user.id,
+        "channel_id": inter.channel.id if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None,
+        "message": message[:1000],
+        "when_iso": due_utc.isoformat(),
+        "dm": bool(dm),
+    })
+    local_label = due_utc.astimezone(_tz_chicago()).strftime("%Y-%m-%d %H:%M")
+    await inter.response.send_message(f"⏰ Reminder #{rid} set for **{local_label} America/Chicago**.")
+
+@tree.command(name="reminders", description="List your pending reminders.")
+async def reminders(inter: discord.Interaction):
+    arr = store.list_reminders(inter.user.id)
+    if not arr:
+        return await inter.response.send_message("No pending reminders.", ephemeral=True)
+    lines = []
+    now_local = datetime.now(timezone.utc).astimezone(_tz_chicago())
+    for r in sorted(arr, key=lambda x: x.get("when_iso")):
+        when = datetime.fromisoformat(r["when_iso"]).astimezone(_tz_chicago())
+        delta = when - now_local
+        mins = int(delta.total_seconds() // 60)
+        lines.append(f"**#{r['id']}** — {when.strftime('%Y-%m-%d %H:%M')} CT  ({mins}m)")
+    emb = discord.Embed(title="⏰ Your Reminders", description="\n".join(lines))
+    await inter.response.send_message(embed=emb, ephemeral=True)
+
+@tree.command(name="remind_cancel", description="Cancel a reminder by id.")
+@app_commands.describe(reminder_id="ID from /reminders")
+async def remind_cancel(inter: discord.Interaction, reminder_id: int):
+    # Allow cancel own; mods can cancel any
+    own = any(r["id"] == reminder_id for r in store.list_reminders(inter.user.id))
+    perms_ok = False
+    if isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
+        perms_ok = inter.channel.permissions_for(inter.user).manage_messages
+    if not own and not perms_ok:
+        return await inter.response.send_message("You can only cancel your own reminders (or need Manage Messages).", ephemeral=True)
+    ok = store.remove_reminder(reminder_id)
+    if ok:
+        await inter.response.send_message(f"✅ Reminder #{reminder_id} canceled.")
     else:
-        emb.description = ", ".join(sorted(ach))
-    stats = store.get_stats(target.id)
-    emb.add_field(name="Record", value=f"{stats.get('wins',0)}W / {stats.get('losses',0)}L / {stats.get('pushes',0)}P", inline=False)
-    await inter.response.send_message(embed=emb)
+        await inter.response.send_message("Not found.", ephemeral=True)
 
 
-# ---------- Background Cleaner ----------
+# ---------- Background Cleaner & Reminder Dispatcher ----------
 @tasks.loop(minutes=2)
 async def cleanup_loop():
     conf = store.get_autodelete()
@@ -1228,8 +1487,29 @@ async def cleanup_loop():
         except discord.HTTPException:
             continue
 
+@tasks.loop(seconds=30)
+async def reminder_loop():
+    now_iso = datetime.now(timezone.utc).isoformat()
+    due = store.pop_due_reminders(now_iso)
+    for r in due:
+        try:
+            content = f"⏰ <@{r['user_id']}> Reminder: {r.get('message','')}"
+            if r.get("dm"):
+                user = await bot.fetch_user(int(r["user_id"]))
+                await user.send(content)
+            else:
+                channel = bot.get_channel(int(r.get("channel_id"))) if r.get("channel_id") else None
+                if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    await channel.send(content)
+        except Exception:
+            continue
+
 @cleanup_loop.before_loop
 async def before_cleanup():
+    await bot.wait_until_ready()
+
+@reminder_loop.before_loop
+async def before_reminders():
     await bot.wait_until_ready()
 
 
@@ -1245,6 +1525,8 @@ async def on_ready():
 
     if not cleanup_loop.is_running():
         cleanup_loop.start()
+    if not reminder_loop.is_running():
+        reminder_loop.start()
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
 

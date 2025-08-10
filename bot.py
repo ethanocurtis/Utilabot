@@ -130,6 +130,15 @@ def _ensure_shape(data: dict) -> dict:
     ensure_dict("streaks")
     ensure_dict("trivia")
 
+    # Weather subscriptions
+    ensure_dict("weather")
+    if not isinstance(data["weather"].get("subs"), dict):
+        data["weather"]["subs"] = {}
+    if not isinstance(data["weather"].get("zips"), dict):
+        data["weather"]["zips"] = {}
+    if not isinstance(data["weather"].get("seq"), int):
+        data["weather"]["seq"] = 0
+
     ensure_dict("notes")
     ensure_dict("pins")
 
@@ -313,6 +322,56 @@ class Store:
         return data["trivia"].get("token")
 
     def set_trivia_token(self, token: Optional[str]):
+
+    # Weather defaults & subscriptions
+    def set_user_zip(self, user_id: int, zip_code: str):
+        data = self.read()
+        data["weather"]["zips"][str(user_id)] = str(zip_code)
+        self.write(data)
+
+    def get_user_zip(self, user_id: int) -> Optional[str]:
+        data = self.read()
+        return data["weather"]["zips"].get(str(user_id))
+
+    def add_weather_sub(self, sub: dict) -> int:
+        data = self.read()
+        sid = int(data["weather"].get("seq", 0)) + 1
+        data["weather"]["seq"] = sid
+        data["weather"]["subs"][str(sid)] = sub
+        self.write(data)
+        return sid
+
+    def list_weather_subs(self, user_id: Optional[int] = None) -> list:
+        data = self.read()
+        items = []
+        for sid, s in data["weather"]["subs"].items():
+            s2 = dict(s); s2["id"] = int(sid)
+            if user_id is None or int(s2.get("user_id", 0)) == int(user_id):
+                items.append(s2)
+        items.sort(key=lambda x: x.get("next_run_utc", ""))
+        return items
+
+    def remove_weather_sub(self, sid: int, requester_id: int) -> bool:
+        data = self.read()
+        s = data["weather"]["subs"].get(str(sid))
+        if not s:
+            return False
+        if int(s.get("user_id", 0)) != int(requester_id):
+            return False
+        data["weather"]["subs"].pop(str(sid), None)
+        self.write(data)
+        return True
+
+    def update_weather_sub(self, sid: int, **updates):
+        data = self.read()
+        key = str(sid)
+        if key not in data["weather"]["subs"]:
+            return False
+        s = data["weather"]["subs"][key]
+        s.update(updates)
+        data["weather"]["subs"][key] = s
+        self.write(data)
+        return True
         data = self.read()
         if token is None:
             data["trivia"].pop("token", None)
@@ -673,6 +732,186 @@ async def weather_cmd(inter: discord.Interaction, zip: app_commands.Range[str, 5
         await inter.followup.send(embed=emb)
     except Exception as e:
         await inter.followup.send(f"⚠️ Weather error: {e}", ephemeral=True)
+
+
+# ---------- Weather Subscriptions (Daily/Weekly via DM, Chicago time) ----------
+def _next_local_run(now_local: datetime, hh: int, mi: int, cadence: str) -> datetime:
+    target = now_local.replace(hour=hh, minute=mi, second=0, microsecond=0)
+    if target <= now_local:
+        target += timedelta(days=1 if cadence == "daily" else 7)
+    return target
+
+async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str):
+    async with session.get(f"https://api.zippopotam.us/us/{zip_code}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+        if r.status != 200:
+            raise RuntimeError("Invalid ZIP or lookup failed.")
+        zp = await r.json()
+    place = zp["places"][0]
+    city = place["place name"]; state = place["state abbreviation"]
+    lat = float(place["latitude"]); lon = float(place["longitude"])
+    return city, state, lat, lon
+
+async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float, days: int, tz_name: str = DEFAULT_TZ_NAME):
+    params = {
+        "latitude": lat, "longitude": lon,
+        "timezone": tz_name,
+        "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
+        "precipitation_unit": "inch",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max",
+    }
+    async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200:
+            raise RuntimeError("Weather API unavailable.")
+        data = await r.json()
+    daily = data.get("daily") or {}
+    out = []
+    dates = daily.get("time", [])[:days]
+    tmax = (daily.get("temperature_2m_max") or [])[:days]
+    tmin = (daily.get("temperature_2m_min") or [])[:days]
+    prec = (daily.get("precipitation_sum") or [])[:days]
+    wmax = (daily.get("wind_speed_10m_max") or [])[:days]
+    for i, d in enumerate(dates):
+        hi = tmax[i] if i < len(tmax) else None
+        lo = tmin[i] if i < len(tmin) else None
+        pr = prec[i] if i < len(prec) else 0.0
+        wm = wmax[i] if i < len(wmax) else None
+        pieces = []
+        if hi is not None and lo is not None:
+            pieces.append(f"**{round(hi)}°F / {round(lo)}°F**")
+        if wm is not None:
+            pieces.append(f"wind {round(wm)} mph")
+        pieces.append(f"precip {pr:.2f} in")
+        out.append((d, " • ".join(pieces)))
+    return out
+
+def _fmt_local(dt_utc: datetime):
+    return dt_utc.astimezone(_chicago_tz_for(datetime.now())).strftime("%m-%d-%Y %H:%M %Z")
+
+CADENCE_CHOICES = [
+    app_commands.Choice(name="daily", value="daily"),
+    app_commands.Choice(name="weekly (send on this weekday)", value="weekly"),
+]
+
+@tree.command(name="weather_set_zip", description="Set your default ZIP code for weather features.")
+async def weather_set_zip(inter: discord.Interaction, zip: app_commands.Range[str, 5, 10]):
+    z = re.sub(r"[^0-9]", "", zip)
+    if len(z) != 5:
+        return await inter.response.send_message("Please provide a valid 5‑digit US ZIP.", ephemeral=True)
+    store.set_user_zip(inter.user.id, z)
+    await inter.response.send_message(f"✅ Saved default ZIP: **{z}**", ephemeral=True)
+
+@tree.command(name="weather_subscribe", description="Subscribe to a daily or weekly weather DM at a Chicago-time hour.")
+@app_commands.describe(
+    time="HH:MM (24h), HHMM, or h:mma/pm in Chicago time",
+    cadence="daily or weekly",
+    zip="Optional ZIP; uses your saved ZIP if omitted",
+    weekly_days="For weekly: number of days to include (3, 7, or 10)"
+)
+@app_commands.choices(cadence=CADENCE_CHOICES)
+async def weather_subscribe(
+    inter: discord.Interaction,
+    time: str,
+    cadence: app_commands.Choice[str],
+    zip: Optional[app_commands.Range[str, 5, 10]] = None,
+    weekly_days: Optional[app_commands.Range[int, 3, 10]] = 7
+):
+    await inter.response.defer(ephemeral=True)
+    try:
+        hh, mi = _parse_time(time)
+        z = re.sub(r"[^0-9]", "", zip) if zip else (store.get_user_zip(inter.user.id) or "")
+        if len(z) != 5:
+            return await inter.followup.send("Set a ZIP with `/weather_set_zip` or provide it here.", ephemeral=True)
+        now_local = datetime.now(_chicago_tz_for(datetime.now()))
+        first_local = _next_local_run(now_local, hh, mi, cadence.value)
+        next_run_utc = first_local.astimezone(timezone.utc)
+        sub = {
+            "user_id": inter.user.id,
+            "zip": z,
+            "cadence": cadence.value,
+            "hh": int(hh),
+            "mi": int(mi),
+            "weekly_days": int(weekly_days or 7),
+            "next_run_utc": next_run_utc.isoformat(),
+        }
+        sid = store.add_weather_sub(sub)
+        await inter.followup.send(
+            f"🌤️ Subscribed **#{sid}** — {cadence.value} at **{first_local.strftime('%I:%M %p %Z')}** for ZIP **{z}**.\n"
+            + ("Weekly outlook length: **{} days**.".format(sub['weekly_days']) if cadence.value == "weekly" else "Daily: Today & Tomorrow."),
+            ephemeral=True
+        )
+    except Exception as e:
+        await inter.followup.send(f"⚠️ {type(e).__name__}: {e}", ephemeral=True)
+
+@tree.command(name="weather_subscriptions", description="List your weather subscriptions and next send time.")
+async def weather_subscriptions(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    items = store.list_weather_subs(inter.user.id)
+    if not items:
+        return await inter.followup.send("You have no weather subscriptions.", ephemeral=True)
+    lines = []
+    for s in items:
+        next_run = datetime.fromisoformat(s["next_run_utc"]).replace(tzinfo=timezone.utc)
+        lines.append(f"**#{s['id']}** — {s['cadence']} at {s['hh']:02d}:{s['mi']:02d} CT • ZIP {s['zip']} • next: {_fmt_local(next_run)}")
+    await inter.followup.send("\n".join(lines), ephemeral=True)
+
+@tree.command(name="weather_unsubscribe", description="Unsubscribe from weather DMs by ID.")
+async def weather_unsubscribe(inter: discord.Interaction, sub_id: int):
+    await inter.response.defer(ephemeral=True)
+    ok = store.remove_weather_sub(sub_id, requester_id=inter.user.id)
+    await inter.followup.send("Removed." if ok else "Couldn't remove that ID.", ephemeral=True)
+
+@tasks.loop(seconds=60)
+async def weather_scheduler():
+    try:
+        now_utc = datetime.now(timezone.utc)
+        subs = store.list_weather_subs(None)
+        if not subs:
+            return
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            for s in subs:
+                due = datetime.fromisoformat(s["next_run_utc"]).replace(tzinfo=timezone.utc)
+                if due <= now_utc:
+                    try:
+                        user = await bot.fetch_user(int(s["user_id"]))
+                        city, state, lat, lon = await _zip_to_place_and_coords(session, s["zip"])
+                        if s["cadence"] == "daily":
+                            outlook = await _fetch_outlook(session, lat, lon, days=2, tz_name=DEFAULT_TZ_NAME)
+                            emb = discord.Embed(title=f"🌤️ Daily Outlook — {city}, {state} {s['zip']}")
+                            for d, line in outlook:
+                                emb.add_field(name=d, value=line, inline=False)
+                            emb.set_footer(text="Chicago time schedule")
+                            await user.send(embed=emb)
+                            next_local = datetime.now(_chicago_tz_for(datetime.now()))
+                            next_local = next_local.replace(hour=s["hh"], minute=s["mi"], second=0, microsecond=0)
+                            if next_local <= datetime.now(_chicago_tz_for(datetime.now())):
+                                next_local += timedelta(days=1)
+                            store.update_weather_sub(s["id"], next_run_utc=next_local.astimezone(timezone.utc).isoformat())
+                        else:
+                            days = int(s.get("weekly_days", 7))
+                            days = 10 if days > 10 else (3 if days < 3 else days)
+                            outlook = await _fetch_outlook(session, lat, lon, days=days, tz_name=DEFAULT_TZ_NAME)
+                            emb = discord.Embed(title=f"🗓️ Weekly Outlook ({days} days) — {city}, {state} {s['zip']}")
+                            for d, line in outlook:
+                                emb.add_field(name=d, value=line, inline=False)
+                            emb.set_footer(text="Chicago time schedule")
+                            await user.send(embed=emb)
+                            next_local = datetime.now(_chicago_tz_for(datetime.now()))
+                            next_local = next_local.replace(hour=s["hh"], minute=s["mi"], second=0, microsecond=0)
+                            if next_local <= datetime.now(_chicago_tz_for(datetime.now())):
+                                next_local += timedelta(days=7)
+                            else:
+                                next_local += timedelta(days=7)
+                            store.update_weather_sub(s["id"], next_run_utc=next_local.astimezone(timezone.utc).isoformat())
+                    except Exception:
+                        fallback = now_utc + timedelta(minutes=5)
+                        store.update_weather_sub(s["id"], next_run_utc=fallback.isoformat())
+    except Exception:
+        pass
+
+@weather_scheduler.before_loop
+async def before_weather():
+    await bot.wait_until_ready()
 
 # ---------- NEW: Shop / Inventory / Fishing ----------
 def _find_catalog_item(name: str) -> Optional[str]:
@@ -1720,6 +1959,8 @@ async def on_ready():
         cleanup_loop.start()
     if not reminders_scheduler.is_running():
         reminders_scheduler.start()
+    if not weather_scheduler.is_running():
+        weather_scheduler.start()
 
     # Re-register persistent poll views
     for mid, p in store.list_open_polls():

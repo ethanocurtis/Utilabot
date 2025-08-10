@@ -995,14 +995,19 @@ async def weather_scheduler():
                                 colour=wx_color_from_temp_f(first_hi if first_hi is not None else 70)
                             )
                             for (d, line, sunrise, sunset, uv, _hi) in outlook:
-                                # Include sunrise/sunset + UV for "daily" cadence
-                                extras = []
-                                if sunrise: extras.append(f"🌅 {fmt_sun(sunrise)}")
-                                if sunset: extras.append(f"🌇 {fmt_sun(sunset)}")
-                                if uv is not None: extras.append(f"🔆 UV {round(uv,1)}")
-                                value = line + ("
-" + " - ".join(extras) if extras else "")
-                                emb.add_field(name=d, value=value, inline=False)
+        details = []
+        details.append(line)
+        extra_bits = []
+        if sunrise:
+            extra_bits.append(f"🌅 {fmt_sun(sunrise)}")
+        if sunset:
+            extra_bits.append(f"🌇 {fmt_sun(sunset)}")
+        if uv is not None:
+            extra_bits.append(f"🔆 UV {round(uv, 1)}")
+        if extra_bits:
+            details.append(" - ".join(extra_bits))
+        value = "\n".join(details)
+        emb.add_field(name=d, value=value, inline=False)
                             emb.set_footer(text="Chicago time schedule")
                             await user.send(embed=emb)
                             # schedule next

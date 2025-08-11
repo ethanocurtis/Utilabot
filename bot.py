@@ -167,7 +167,7 @@ def _strip_scripts_and_styles(html_text: str) -> str:
 
 def _extract_jsonld_prices(raw: str) -> list[float]:
     vals = []
-    for m in re.finditer(r'<script[^>]+type=["\\']application/ld\+json["\\'][^>]*>([\s\S]*?)</script>', raw, flags=re.IGNORECASE):
+    for m in re.finditer(r'<script[^>]+type=[\"\']application/ld\+json[\"\'][^>]*>([\s\S]*?)</script>', raw, flags=re.IGNORECASE):
         block = m.group(1).strip()
         try:
             data = json.loads(block)
@@ -202,10 +202,10 @@ def _extract_jsonld_prices(raw: str) -> list[float]:
 
 def _extract_meta_prices(raw: str) -> list[float]:
     vals = []
-    for m in re.finditer(r'<meta[^>]+itemprop=["\\']price["\\'][^>]+content=["\\']([^"\\']+)["\\']', raw, flags=re.IGNORECASE):
+    for m in re.finditer(r'<meta[^>]+itemprop=[\"\']price[\"\'][^>]+content=[\"\']([^"\\']+)[\"\']', raw, flags=re.IGNORECASE):
         try: vals.append(float(m.group(1).replace(",", "")))
         except: pass
-    for m in re.finditer(r'<meta[^>]+property=["\\']product:price:amount["\\'][^>]+content=["\\']([^"\\']+)["\\']', raw, flags=re.IGNORECASE):
+    for m in re.finditer(r'<meta[^>]+property=[\"\']product:price:amount[\"\'][^>]+content=[\"\']([^"\\']+)[\"\']', raw, flags=re.IGNORECASE):
         try: vals.append(float(m.group(1).replace(",", "")))
         except: pass
     out, seen = [], set()
@@ -219,7 +219,7 @@ def _extract_prices_with_scores(raw: str):
     vals.extend(_extract_meta_prices(raw))
 
     visible = _strip_scripts_and_styles(raw).lower()
-    cur_pat = r'(?:(?:' + "|".join(map(re.escape, CURRENCY_SIGNS)) + r')\s*)(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)'
+    cur_pat = r'(?:(?:' + \"|\".join(map(re.escape, CURRENCY_SIGNS)) + r')\s*)(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)'
     scored = []
     for m in re.finditer(cur_pat, visible):
         num = m.group(1).replace(",", "")

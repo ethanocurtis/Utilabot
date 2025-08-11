@@ -147,10 +147,12 @@ def _extract_price_candidates(text: str) -> list[float]:
     return []
 
 def _extract_title(text: str) -> str | None:
-    m = re.search(r\'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']\', text, flags=re.IGNORECASE)
-    if m: return html.unescape(m.group(1)).strip()
-    m = re.search(r\'<title>([^<]{1,200})</title>\', text, flags=re.IGNORECASE)
-    if m: return html.unescape(m.group(1)).strip()
+    m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', text, flags=re.IGNORECASE)
+    if m:
+        return html.unescape(m.group(1)).strip()
+    m = re.search(r'<title>([^<]{1,200})</title>', text, flags=re.IGNORECASE)
+    if m:
+        return html.unescape(m.group(1)).strip()
     return None
 
 def _strip_scripts_and_styles(html_text: str) -> str:

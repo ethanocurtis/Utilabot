@@ -1,6 +1,7 @@
 # Discord Utility & Games Bot
 
-A multi-purpose Discord bot with economy, games, reminders, notes, polls, and moderation tools — now with an **admin allowlist** so you can give extra users access to admin commands.
+A multi-purpose Discord bot with economy, games, reminders, notes, polls, moderation tools, price tracking, and a fully interactive reaction-based shop.  
+Now includes an **admin allowlist** so you can give extra users access to admin commands.
 
 ---
 
@@ -8,15 +9,18 @@ A multi-purpose Discord bot with economy, games, reminders, notes, polls, and mo
 1. [Features](#features)
    - [Economy](#economy)
    - [Games](#games)
+   - [Shop](#shop)
    - [Reminders](#reminders)
    - [Notes](#notes)
    - [Polls](#polls)
+   - [Price Tracker](#price-tracker)
    - [Moderation Tools](#moderation-tools)
    - [Admin Allowlist](#admin-allowlist)
 2. [Installation](#installation)
-3. [Usage](#usage)
-4. [Permissions](#permissions)
-5. [Known Limitations](#known-limitations)
+3. [Update Guide](#update-guide)
+4. [Usage](#usage)
+5. [Permissions](#permissions)
+6. [Known Limitations](#known-limitations)
 
 ---
 
@@ -36,8 +40,33 @@ A multi-purpose Discord bot with economy, games, reminders, notes, polls, and mo
 - `/blackjack bet:<int> [opponent:@user]` — play vs Dealer or another player (interactive hit/stand)  
 - `/highlow bet:<int>` — guess if the next number is higher or lower  
 - `/diceduel bet:<int> [opponent:@user]` — dice battle against a player or bot  
-- `/slots bet:<int>` — spin the slot machine with animation  
+- `/slots bet:<int>` — animated slot machine  
 - `/trivia` — answer random trivia questions for rewards  
+
+### Shop
+- `/shop` — **Interactive reaction-based shop**:
+  - Displays your current balance at the top  
+  - 1️⃣–9️⃣ — Select item  
+  - ◀️ ▶️ — Switch pages  
+  - 🛒 — Switch to Buy mode  
+  - 💵 — Switch to Sell mode  
+  - ➕ / ➖ — Adjust quantity  
+  - ✅ — Confirm purchase/sale  
+  - ❌ — Close shop  
+- Items have buy/sell prices and descriptions  
+- Supports buying multiple quantities and selling owned items  
+
+#### Shop Demo (GIF/Screenshot Previews)
+![Shop Demo Page](media/shop_demo_page.gif)  
+*Example: Navigating pages, selecting items, and adjusting quantity.*
+
+![Shop Buy Example](media/shop_buy.gif)  
+*Example: Buying an item and confirming purchase.*
+
+![Shop Sell Example](media/shop_sell.gif)  
+*Example: Switching to sell mode and selling owned items.*
+
+> You can capture your own GIFs with tools like **ShareX** or **OBS Studio** and replace these placeholders.
 
 ### Reminders
 - `/remind_in duration:<1m/h/d> text:<str>` — set a timer reminder  
@@ -51,8 +80,14 @@ A multi-purpose Discord bot with economy, games, reminders, notes, polls, and mo
 
 ### Polls
 - `/poll_create question:<str> options:<str,str,...>` — create a multiple-choice poll  
+- Interactive voting buttons (fixed button bug from previous version)  
 - `/poll_vote id:<int> option:<str>` — vote on a poll  
 - `/poll_status id:<int>` — view poll results  
+
+### Price Tracker
+- `/price_add <item|link>` — add item with auto-fetched or mock price  
+- `/price_list` — list tracked items with clickable links  
+- `/price_remove <item>` — remove from tracker  
 
 ### Moderation Tools
 (Admins or allowlisted users only)
@@ -67,8 +102,6 @@ A multi-purpose Discord bot with economy, games, reminders, notes, polls, and mo
 - `/admin_allow @user` — give a user access to admin commands without making them a Discord admin  
 - `/admin_revoke @user` — remove a user from the allowlist  
 - `/admin_list` — list all allowlisted users  
-
-The allowlist is stored in the bot’s JSON data file and persists through restarts.
 
 ---
 
@@ -97,7 +130,24 @@ Generate an invite link with:
   - **Manage Messages**  
   - **Read Message History**  
   - **Send Messages**  
-  - **Embed Links**
+  - **Embed Links**  
+  - **Add Reactions**
+
+---
+
+## Update Guide
+
+### Pull Latest Changes
+```bash
+cd yourbotrepo
+git pull
+```
+
+### Rebuild and Restart
+```bash
+docker compose down
+docker compose up -d --build
+```
 
 ---
 
@@ -108,7 +158,7 @@ Only admins or allowlisted users can use moderation commands.
 ---
 
 ## Permissions
-- **Public**: Economy, games, reminders, notes, polls, `/autodelete_status`  
+- **Public**: Economy, games, shop, reminders, notes, polls, price tracker, `/autodelete_status`  
 - **Admin/Allowlist**: `/purge`, `/autodelete_set`, `/autodelete_disable`, admin management commands
 
 ---
@@ -116,3 +166,4 @@ Only admins or allowlisted users can use moderation commands.
 ## Known Limitations
 - Discord’s bulk delete won’t remove messages older than 14 days  
 - Auto-delete works only for messages sent after it’s enabled  
+- Shop reaction menu expires after 2 minutes of inactivity

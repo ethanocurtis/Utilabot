@@ -143,56 +143,112 @@ def fmt_sun(dt_str: str, tz_name: str = DEFAULT_TZ_NAME):
 CURRENCY_SIGNS = ["$", "£", "€", "₹", "¥", "A$", "C$", "฿"]
 
 def _extract_price_candidates(text: str) -> list[float]:
+    # Placeholder to keep compatibility if anything references this by name.
+    return []
+
+def _extract_title(text: str) -> str | None:
+    m = re.search(r'<meta[^>]+property=["\\']og:title["\\'][^>]+content=["\\']([^"\\']+)["\\']', text, flags=re.IGNORECASE)
+    if m: return html.unescape(m.group(1)).strip()
+    m = re.search(r'<title>([^<]{1,200})</title>', text, flags=re.IGNORECASE)
+    if m: return html.unescape(m.group(1)).strip()
+    return None
+
+def _strip_scripts_and_styles(html_text: str) -> str:
+    # remove script/style blocks
+    html_text = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.IGNORECASE)
+    html_text = re.sub(r"<style[\s\S]*?</style>", " ", html_text, flags=re.IGNORECASE)
+    # remove tags but keep text
+    html_text = re.sub(r"<[^>]+>", " ", html_text)
+    # collapse whitespace
+    html_text = re.sub(r"\s+", " ", html_text)
+    return html_text
+
+def _extract_jsonld_prices(raw: str) -> list[float]:
     vals = []
-    json_keys = [
-        r'"price"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
-        r'"priceAmount"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
-        r'"current_price"\s*:\s*(?P<num>\d{1,6}(?:[.,]\d{2})?)',
-        r'"lowPrice"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
-        r'"highPrice"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
-        r'"offers"\s*:\s*{[^}]*"price"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
-    ]
-    for pat in json_keys:
-        for m in re.finditer(pat, text, flags=re.IGNORECASE | re.DOTALL):
-            raw = m.group("num").replace(",", "")
-            try:
-                vals.append(float(raw))
-            except Exception:
-                pass
-
-    cur_pat = r'(?:(?:' + "|".join(map(re.escape, CURRENCY_SIGNS)) + r')\s*)(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)'
-    for m in re.finditer(cur_pat, text):
-        raw = m.group(1).replace(",", "")
+    for m in re.finditer(r'<script[^>]+type=["\\']application/ld\+json["\\'][^>]*>([\s\S]*?)</script>', raw, flags=re.IGNORECASE):
+        block = m.group(1).strip()
         try:
-            vals.append(float(raw))
+            data = json.loads(block)
         except Exception:
-            pass
-
+            nums = re.findall(r'"price"\s*:\s*"?(\d{1,6}(?:[.,]\d{2})?)"?', block)
+            for n in nums:
+                try: vals.append(float(n.replace(",", "")))
+                except: pass
+            continue
+        def walk(obj):
+            if isinstance(obj, dict):
+                for k in ("price", "priceAmount", "lowPrice", "highPrice", "amount"):
+                    if k in obj:
+                        try: vals.append(float(str(obj[k]).replace(",", "")))
+                        except: pass
+                off = obj.get("offers")
+                if off is not None: walk(off)
+                ps = obj.get("priceSpecification")
+                if ps is not None: walk(ps)
+                agg = obj.get("aggregateOffer") or obj.get("aggregateOffers") or obj.get("aggregateRating")
+                if agg is not None: walk(agg)
+                for v in obj.values():
+                    walk(v)
+            elif isinstance(obj, list):
+                for v in obj: walk(v)
+        walk(data)
     out, seen = [], set()
     for v in vals:
         if v not in seen:
             out.append(v); seen.add(v)
     return out
 
-def _extract_title(text: str) -> str | None:
-    m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', text, flags=re.IGNORECASE)
-    if m: return html.unescape(m.group(1)).strip()
-    m = re.search(r'<title>([^<]{1,200})</title>', text, flags=re.IGNORECASE)
-    if m: return html.unescape(m.group(1)).strip()
-    return None
+def _extract_meta_prices(raw: str) -> list[float]:
+    vals = []
+    for m in re.finditer(r'<meta[^>]+itemprop=["\\']price["\\'][^>]+content=["\\']([^"\\']+)["\\']', raw, flags=re.IGNORECASE):
+        try: vals.append(float(m.group(1).replace(",", "")))
+        except: pass
+    for m in re.finditer(r'<meta[^>]+property=["\\']product:price:amount["\\'][^>]+content=["\\']([^"\\']+)["\\']', raw, flags=re.IGNORECASE):
+        try: vals.append(float(m.group(1).replace(",", "")))
+        except: pass
+    out, seen = [], set()
+    for v in vals:
+        if v not in seen: out.append(v); seen.add(v)
+    return out
+
+def _extract_prices_with_scores(raw: str):
+    vals = []
+    vals.extend(_extract_jsonld_prices(raw))
+    vals.extend(_extract_meta_prices(raw))
+
+    visible = _strip_scripts_and_styles(raw).lower()
+    cur_pat = r'(?:(?:' + "|".join(map(re.escape, CURRENCY_SIGNS)) + r')\s*)(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)'
+    scored = []
+    for m in re.finditer(cur_pat, visible):
+        num = m.group(1).replace(",", "")
+        try:
+            price = float(num)
+        except:
+            continue
+        start = max(0, m.start() - 40)
+        end   = min(len(visible), m.end() + 40)
+        ctx = visible[start:end]
+        score = 0
+        for w in ["price","now","sale","deal","buy","add to cart","subtotal","current"]:
+            if w in ctx: score += 2
+        for w in ["msrp","was","list","compare at","strike","from","up to","coupon"]:
+            if w in ctx: score -= 2
+        scored.append((price, score, ctx.strip()))
+    scored.sort(key=lambda x: (x[1], -x[0]), reverse=True)
+    return vals, scored
 
 async def fetch_price_snapshot(session, url: str):
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), headers={"User-Agent": HTTP_HEADERS["User-Agent"], "Accept": "*/*"}) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=25), headers={"User-Agent": HTTP_HEADERS.get("User-Agent", "UtilaBot/1.0"), "Accept": "*/*"}) as r:
             if r.status != 200:
-                return None, None
-            text = await r.text(errors="ignore")
+                return None, None, []
+            raw = await r.text(errors="ignore")
     except Exception:
-        return None, None
-    title = _extract_title(text)
-    cands = _extract_price_candidates(text)
-    price = cands[0] if cands else None
-    return price, title
+        return None, None, []
+    title = _extract_title(raw)
+    json_meta_vals, scored = _extract_prices_with_scores(raw)
+    price = (json_meta_vals[0] if json_meta_vals else (scored[0][0] if scored else None))
+    return price, title, scored[:8]
 
 # ---------- NEW: Shop & Inventory Config ----------
 # name -> dict(price, sell, desc)
@@ -276,15 +332,14 @@ def _ensure_shape(data: dict) -> dict:
     # NEW: Inventory map
     ensure_dict("inventory")
 
-
+    
     # Price trackers
     ensure_dict("price")
     if not isinstance(data["price"].get("trackers"), dict):
         data["price"]["trackers"] = {}
     if not isinstance(data["price"].get("seq"), int):
         data["price"]["seq"] = 0
-
-    return data
+return data
 
 
 class Store:
@@ -2405,7 +2460,7 @@ async def price_track(inter: discord.Interaction, url: str, recheck_minutes: app
     await inter.response.defer(ephemeral=True)
     try:
         async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
-            price, title = await fetch_price_snapshot(session, url)
+            price, title, _rows = await fetch_price_snapshot(session, url)
         if price is None:
             return await inter.followup.send("I couldn't find a price on that page right now. You can still add the tracker—use `/price_track_force`.", ephemeral=True)
         now = datetime.now(timezone.utc)
@@ -2457,8 +2512,12 @@ async def price_list(inter: discord.Interaction):
             due_dt = None
         when = due_dt.astimezone(_chicago_tz_for(datetime.now())).strftime("%m-%d-%Y %H:%M %Z") if due_dt else "soon"
         lp = f"${t['last_price']:.2f}" if isinstance(t.get("last_price"), (int, float)) else "—"
-        lines.append(f"**#{t['id']}** — {t.get('title','(no title)')}\n{t['url']}\nLast: {lp} • Every {t.get('interval_min', PRICE_DEFAULT_INTERVAL_MIN)}m • Next: {when} • Dir: {t.get('direction','any')}")
-    await inter.followup.send("\n\n".join(lines), ephemeral=True)
+        lines.append(f"**#{t['id']}** — {t.get('title','(no title)')}
+{t['url']}
+Last: {lp} • Every {t.get('interval_min', PRICE_DEFAULT_INTERVAL_MIN)}m • Next: {when} • Dir: {t.get('direction','any')}")
+    await inter.followup.send("
+
+".join(lines), ephemeral=True)
 
 @tree.command(name="price_untrack", description="Stop tracking by ID.")
 async def price_untrack(inter: discord.Interaction, tracker_id: int):
@@ -2470,10 +2529,33 @@ async def price_untrack(inter: discord.Interaction, tracker_id: int):
 async def price_check(inter: discord.Interaction, url: str):
     await inter.response.defer(ephemeral=True)
     async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
-        price, title = await fetch_price_snapshot(session, url)
+        price, title, _rows = await fetch_price_snapshot(session, url)
     if price is None:
         return await inter.followup.send("I couldn’t detect a price right now.", ephemeral=True)
     await inter.followup.send(f"**{title or url}** — **${price:.2f}**", ephemeral=True)
+
+@tree.command(name="price_debug", description="Debug price detection for a URL (ephemeral).")
+async def price_debug(inter: discord.Interaction, url: str):
+    await inter.response.defer(ephemeral=True)
+    async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+        price, title, rows = await fetch_price_snapshot(session, url)
+    if price is None and not rows:
+        return await inter.followup.send("No price-like values found.", ephemeral=True)
+    desc = []
+    if title:
+        desc.append(f"**Title:** {title}")
+    if price is not None:
+        desc.append(f"**Chosen price:** ${price:.2f}")
+    if rows:
+        lines = []
+        for i, (p, s, ctx) in enumerate(rows, 1):
+            ctx = (ctx[:120] + "…") if len(ctx) > 120 else ctx
+            lines.append(f"{i}. ${p:.2f}  — score {s} — “…{ctx}…”")
+        desc.append("**Top candidates:**
+" + "
+".join(lines))
+    await inter.followup.send("
+".join(desc), ephemeral=True)
 
 # ---------- Price Scheduler ----------
 @tasks.loop(minutes=PRICE_CHECK_EVERY_MIN)
@@ -2492,7 +2574,7 @@ async def price_scheduler():
                 if due > now_utc:
                     continue
 
-                price, title = await fetch_price_snapshot(session, t["url"])
+                price, title, _rows = await fetch_price_snapshot(session, t["url"])
                 next_due = now_utc + timedelta(minutes=int(t.get("interval_min", PRICE_DEFAULT_INTERVAL_MIN)))
                 updates = {"next_check_utc": next_due.isoformat()}
                 if title and title != t.get("title"):
@@ -2523,8 +2605,8 @@ async def price_scheduler():
                                 if isinstance(old, (int, float)):
                                     emb.add_field(name="Was", value=f"${old:.2f}", inline=True)
                                 emb.add_field(name="Now", value=f"${float(price):.2f}", inline=True)
-                                sign = "⬇️" if delta < 0 else "⬆️"
-                                emb.add_field(name="Change", value=f"{sign} {delta:+.2f}", inline=True)
+                                sign = "⬇️" if (float(price) - float(old)) < 0 else "⬆️"
+                                emb.add_field(name="Change", value=f"{sign} {float(price) - float(old):+0.2f}", inline=True)
                                 await user.send(embed=emb)
                             except Exception:
                                 pass
@@ -2536,6 +2618,7 @@ async def price_scheduler():
 @price_scheduler.before_loop
 async def before_price():
     await bot.wait_until_ready()
+
 
 # ---------- Startup ----------
 @bot.event

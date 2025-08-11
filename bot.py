@@ -138,13 +138,8 @@ def fmt_sun(dt_str: str, tz_name: str = DEFAULT_TZ_NAME):
     except Exception:
         return dt_str
 
-
 # ---------- Price parsing helpers ----------
 CURRENCY_SIGNS = ["$", "£", "€", "₹", "¥", "A$", "C$", "฿"]
-
-def _extract_price_candidates(text: str) -> list[float]:
-    # Placeholder to keep compatibility if anything references this by name.
-    return []
 
 def _extract_title(text: str) -> str | None:
     m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', text, flags=re.IGNORECASE)
@@ -156,33 +151,34 @@ def _extract_title(text: str) -> str | None:
     return None
 
 def _strip_scripts_and_styles(html_text: str) -> str:
-    # remove script/style blocks
-    html_text = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.IGNORECASE)
-    html_text = re.sub(r"<style[\s\S]*?</style>", " ", html_text, flags=re.IGNORECASE)
-    # remove tags but keep text
-    html_text = re.sub(r"<[^>]+>", " ", html_text)
-    # collapse whitespace
-    html_text = re.sub(r"\s+", " ", html_text)
+    html_text = re.sub(r'<script[\s\S]*?</script>', ' ', html_text, flags=re.IGNORECASE)
+    html_text = re.sub(r'<style[\s\S]*?</style>', ' ', html_text, flags=re.IGNORECASE)
+    html_text = re.sub(r'<[^>]+>', ' ', html_text)
+    html_text = re.sub(r'\s+', ' ', html_text)
     return html_text
 
 def _extract_jsonld_prices(raw: str) -> list[float]:
     vals = []
-    for m in re.finditer(r'<script[^>]+type=[\"\']application/ld\+json[\"\'][^>]*>([\s\S]*?)</script>', raw, flags=re.IGNORECASE):
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', raw, flags=re.IGNORECASE):
         block = m.group(1).strip()
         try:
             data = json.loads(block)
         except Exception:
-            nums = re.findall(r'"price"\s*:\s*"?(\d{1,6}(?:[.,]\d{2})?)"?', block)
+            nums = re.findall(r'"price"\s*:\s*"?(\\d{1,6}(?:[.,]\\d{2})?)"?', block)
             for n in nums:
-                try: vals.append(float(n.replace(",", "")))
-                except: pass
+                try:
+                    vals.append(float(n.replace(",", "")))
+                except Exception:
+                    pass
             continue
         def walk(obj):
             if isinstance(obj, dict):
                 for k in ("price", "priceAmount", "lowPrice", "highPrice", "amount"):
                     if k in obj:
-                        try: vals.append(float(str(obj[k]).replace(",", "")))
-                        except: pass
+                        try:
+                            vals.append(float(str(obj[k]).replace(",", "")))
+                        except Exception:
+                            pass
                 off = obj.get("offers")
                 if off is not None: walk(off)
                 ps = obj.get("priceSpecification")
@@ -192,7 +188,8 @@ def _extract_jsonld_prices(raw: str) -> list[float]:
                 for v in obj.values():
                     walk(v)
             elif isinstance(obj, list):
-                for v in obj: walk(v)
+                for v in obj:
+                    walk(v)
         walk(data)
     out, seen = [], set()
     for v in vals:
@@ -202,15 +199,20 @@ def _extract_jsonld_prices(raw: str) -> list[float]:
 
 def _extract_meta_prices(raw: str) -> list[float]:
     vals = []
-    for m in re.finditer(r'<meta[^>]+itemprop=[\"\']price[\"\'][^>]+content=[\"\']([^"\\']+)[\"\']', raw, flags=re.IGNORECASE):
-        try: vals.append(float(m.group(1).replace(",", "")))
-        except: pass
-    for m in re.finditer(r'<meta[^>]+property=[\"\']product:price:amount[\"\'][^>]+content=[\"\']([^"\\']+)[\"\']', raw, flags=re.IGNORECASE):
-        try: vals.append(float(m.group(1).replace(",", "")))
-        except: pass
+    for m in re.finditer(r'<meta[^>]+itemprop=["\']price["\'][^>]+content=["\']([^"\']+)["\']', raw, flags=re.IGNORECASE):
+        try:
+            vals.append(float(m.group(1).replace(",", "")))
+        except Exception:
+            pass
+    for m in re.finditer(r'<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)["\']', raw, flags=re.IGNORECASE):
+        try:
+            vals.append(float(m.group(1).replace(",", "")))
+        except Exception:
+            pass
     out, seen = [], set()
     for v in vals:
-        if v not in seen: out.append(v); seen.add(v)
+        if v not in seen:
+            out.append(v); seen.add(v)
     return out
 
 def _extract_prices_with_scores(raw: str):
@@ -219,13 +221,13 @@ def _extract_prices_with_scores(raw: str):
     vals.extend(_extract_meta_prices(raw))
 
     visible = _strip_scripts_and_styles(raw).lower()
-    cur_pat = r'(?:(?:' + \"|\".join(map(re.escape, CURRENCY_SIGNS)) + r')\s*)(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)'
+    cur_pat = r'(?:(?:' + "|".join(map(re.escape, CURRENCY_SIGNS)) + r')\s*)(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)'
     scored = []
     for m in re.finditer(cur_pat, visible):
         num = m.group(1).replace(",", "")
         try:
             price = float(num)
-        except:
+        except Exception:
             continue
         start = max(0, m.start() - 40)
         end   = min(len(visible), m.end() + 40)
@@ -251,6 +253,7 @@ async def fetch_price_snapshot(session, url: str):
     json_meta_vals, scored = _extract_prices_with_scores(raw)
     price = (json_meta_vals[0] if json_meta_vals else (scored[0][0] if scored else None))
     return price, title, scored[:8]
+
 
 # ---------- NEW: Shop & Inventory Config ----------
 # name -> dict(price, sell, desc)
@@ -735,7 +738,6 @@ class Store:
         data["price"]["trackers"].pop(str(tid), None)
         self.write(data)
         return True
-
 
 store = Store(DATA_PATH)
 
@@ -2514,12 +2516,8 @@ async def price_list(inter: discord.Interaction):
             due_dt = None
         when = due_dt.astimezone(_chicago_tz_for(datetime.now())).strftime("%m-%d-%Y %H:%M %Z") if due_dt else "soon"
         lp = f"${t['last_price']:.2f}" if isinstance(t.get("last_price"), (int, float)) else "—"
-        lines.append(f"**#{t['id']}** — {t.get('title','(no title)')}
-{t['url']}
-Last: {lp} • Every {t.get('interval_min', PRICE_DEFAULT_INTERVAL_MIN)}m • Next: {when} • Dir: {t.get('direction','any')}")
-    await inter.followup.send("
-
-".join(lines), ephemeral=True)
+        lines.append(f"**#{t['id']}** — {t.get('title','(no title)')}\n{t['url']}\nLast: {lp} • Every {t.get('interval_min', PRICE_DEFAULT_INTERVAL_MIN)}m • Next: {when} • Dir: {t.get('direction','any')}")
+    await inter.followup.send("\n\n".join(lines), ephemeral=True)
 
 @tree.command(name="price_untrack", description="Stop tracking by ID.")
 async def price_untrack(inter: discord.Interaction, tracker_id: int):
@@ -2553,11 +2551,8 @@ async def price_debug(inter: discord.Interaction, url: str):
         for i, (p, s, ctx) in enumerate(rows, 1):
             ctx = (ctx[:120] + "…") if len(ctx) > 120 else ctx
             lines.append(f"{i}. ${p:.2f}  — score {s} — “…{ctx}…”")
-        desc.append("**Top candidates:**
-" + "
-".join(lines))
-    await inter.followup.send("
-".join(desc), ephemeral=True)
+        desc.append("**Top candidates:**\n" + "\n".join(lines))
+    await inter.followup.send("\n".join(desc), ephemeral=True)
 
 # ---------- Price Scheduler ----------
 @tasks.loop(minutes=PRICE_CHECK_EVERY_MIN)
@@ -2621,7 +2616,6 @@ async def price_scheduler():
 async def before_price():
     await bot.wait_until_ready()
 
-
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
@@ -2639,11 +2633,10 @@ async def on_ready():
         reminders_scheduler.start()
     if not weather_scheduler.is_running():
         weather_scheduler.start()
-
-    
     if not price_scheduler.is_running():
         price_scheduler.start()
-# Re-register persistent poll views
+
+    # Re-register persistent poll views
     for mid, p in store.list_open_polls():
         try:
             view = PollView(message_id=mid, options=[o["label"] for o in p["options"]], creator_id=p.get("creator_id", 0), timeout=None)

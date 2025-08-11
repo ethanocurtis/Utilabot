@@ -46,6 +46,12 @@ HTTP_HEADERS = {
     "Accept": "application/json",
 }
 
+
+
+# Price tracker config
+PRICE_CHECK_EVERY_MIN = 30          # how often the scheduler wakes up
+PRICE_DEFAULT_INTERVAL_MIN = 180    # per-tracker recheck cadence
+
 # Local offline fallback so trivia always works even if external APIs are down
 OFFLINE_TRIVIA = [
     {"q": "What is the capital of France?", "choices": ["Berlin", "Madrid", "Paris", "Rome"], "answer_idx": 2},
@@ -132,6 +138,62 @@ def fmt_sun(dt_str: str, tz_name: str = DEFAULT_TZ_NAME):
     except Exception:
         return dt_str
 
+
+# ---------- Price parsing helpers ----------
+CURRENCY_SIGNS = ["$", "£", "€", "₹", "¥", "A$", "C$", "฿"]
+
+def _extract_price_candidates(text: str) -> list[float]:
+    vals = []
+    json_keys = [
+        r'"price"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
+        r'"priceAmount"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
+        r'"current_price"\s*:\s*(?P<num>\d{1,6}(?:[.,]\d{2})?)',
+        r'"lowPrice"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
+        r'"highPrice"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
+        r'"offers"\s*:\s*{[^}]*"price"\s*:\s*"?(?P<num>\d{1,6}(?:[.,]\d{2})?)"?',
+    ]
+    for pat in json_keys:
+        for m in re.finditer(pat, text, flags=re.IGNORECASE | re.DOTALL):
+            raw = m.group("num").replace(",", "")
+            try:
+                vals.append(float(raw))
+            except Exception:
+                pass
+
+    cur_pat = r'(?:(?:' + "|".join(map(re.escape, CURRENCY_SIGNS)) + r')\s*)(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)'
+    for m in re.finditer(cur_pat, text):
+        raw = m.group(1).replace(",", "")
+        try:
+            vals.append(float(raw))
+        except Exception:
+            pass
+
+    out, seen = [], set()
+    for v in vals:
+        if v not in seen:
+            out.append(v); seen.add(v)
+    return out
+
+def _extract_title(text: str) -> str | None:
+    m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', text, flags=re.IGNORECASE)
+    if m: return html.unescape(m.group(1)).strip()
+    m = re.search(r'<title>([^<]{1,200})</title>', text, flags=re.IGNORECASE)
+    if m: return html.unescape(m.group(1)).strip()
+    return None
+
+async def fetch_price_snapshot(session, url: str):
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), headers={"User-Agent": HTTP_HEADERS["User-Agent"], "Accept": "*/*"}) as r:
+            if r.status != 200:
+                return None, None
+            text = await r.text(errors="ignore")
+    except Exception:
+        return None, None
+    title = _extract_title(text)
+    cands = _extract_price_candidates(text)
+    price = cands[0] if cands else None
+    return price, title
+
 # ---------- NEW: Shop & Inventory Config ----------
 # name -> dict(price, sell, desc)
 SHOP_CATALOG: Dict[str, Dict[str, Any]] = {
@@ -213,6 +275,14 @@ def _ensure_shape(data: dict) -> dict:
 
     # NEW: Inventory map
     ensure_dict("inventory")
+
+
+    # Price trackers
+    ensure_dict("price")
+    if not isinstance(data["price"].get("trackers"), dict):
+        data["price"]["trackers"] = {}
+    if not isinstance(data["price"].get("seq"), int):
+        data["price"]["seq"] = 0
 
     return data
 
@@ -560,6 +630,54 @@ class Store:
     def list_allowlisted(self) -> List[int]:
         data = self.read()
         return list(map(int, data["admin_allowlist"]))
+
+
+    # ---------- Price Trackers ----------
+    def add_price_tracker(self, tr: dict) -> int:
+        data = self.read()
+        tid = int(data["price"].get("seq", 0)) + 1
+        data["price"]["seq"] = tid
+        tr["id"] = tid
+        data["price"]["trackers"][str(tid)] = tr
+        self.write(data)
+        return tid
+
+    def list_price_trackers(self, user_id: int | None = None) -> list[dict]:
+        data = self.read()
+        out = []
+        for tid, t in data["price"]["trackers"].items():
+            item = dict(t)
+            item["id"] = int(tid)
+            if (user_id is None) or int(item.get("user_id", 0)) == int(user_id):
+                out.append(item)
+        out.sort(key=lambda x: x.get("next_check_utc", ""))
+        return out
+
+    def get_price_tracker(self, tid: int) -> dict | None:
+        data = self.read()
+        return data["price"]["trackers"].get(str(tid))
+
+    def update_price_tracker(self, tid: int, **updates) -> bool:
+        data = self.read()
+        key = str(tid)
+        if key not in data["price"]["trackers"]:
+            return False
+        rec = data["price"]["trackers"][key]
+        rec.update(updates)
+        data["price"]["trackers"][key] = rec
+        self.write(data)
+        return True
+
+    def remove_price_tracker(self, tid: int, requester_id: int) -> bool:
+        data = self.read()
+        rec = data["price"]["trackers"].get(str(tid))
+        if not rec:
+            return False
+        if int(rec.get("user_id", 0)) != int(requester_id):
+            return False
+        data["price"]["trackers"].pop(str(tid), None)
+        self.write(data)
+        return True
 
 
 store = Store(DATA_PATH)
@@ -2267,6 +2385,158 @@ async def admin_list(inter: discord.Interaction):
             lines.append(f"- <@{uid}> (User {uid})")
     await inter.response.send_message("**Admin allowlist:**\n" + "\n".join(lines), ephemeral=True)
 
+
+# ---------- Price Tracking Commands ----------
+PRICE_DIR_CHOICES = [
+    app_commands.Choice(name="any change", value="any"),
+    app_commands.Choice(name="price drops only", value="down"),
+    app_commands.Choice(name="price increases only", value="up"),
+]
+
+@tree.command(name="price_track", description="Track a product URL and DM you when the price changes.")
+@app_commands.describe(
+    url="Product page URL",
+    recheck_minutes=f"How often to check (default {PRICE_DEFAULT_INTERVAL_MIN} min)",
+    direction="Notify on any change, only drops, or only increases"
+)
+@app_commands.choices(direction=PRICE_DIR_CHOICES)
+async def price_track(inter: discord.Interaction, url: str, recheck_minutes: app_commands.Range[int, 15, 1440] = PRICE_DEFAULT_INTERVAL_MIN,
+                      direction: app_commands.Choice[str] | None = None):
+    await inter.response.defer(ephemeral=True)
+    try:
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            price, title = await fetch_price_snapshot(session, url)
+        if price is None:
+            return await inter.followup.send("I couldn't find a price on that page right now. You can still add the tracker—use `/price_track_force`.", ephemeral=True)
+        now = datetime.now(timezone.utc)
+        tr = {
+            "user_id": inter.user.id,
+            "url": url.strip(),
+            "title": title or url.strip(),
+            "last_price": float(price),
+            "direction": (direction.value if direction else "any"),
+            "interval_min": int(recheck_minutes),
+            "created_utc": now.isoformat(),
+            "next_check_utc": (now + timedelta(minutes=int(recheck_minutes))).isoformat(),
+        }
+        tid = store.add_price_tracker(tr)
+        await inter.followup.send(f"✅ Tracking **#{tid}** — **{tr['title']}** at **${tr['last_price']:.2f}**. I’ll check every **{tr['interval_min']}m** and DM you on price {tr['direction']}.", ephemeral=True)
+    except Exception as e:
+        await inter.followup.send(f"⚠️ {type(e).__name__}: {e}", ephemeral=True)
+
+@tree.command(name="price_track_force", description="Add a tracker even if a price couldn't be detected yet.")
+@app_commands.describe(url="Product page URL", recheck_minutes=f"How often to check (default {PRICE_DEFAULT_INTERVAL_MIN} min)")
+async def price_track_force(inter: discord.Interaction, url: str, recheck_minutes: app_commands.Range[int, 15, 1440] = PRICE_DEFAULT_INTERVAL_MIN):
+    await inter.response.defer(ephemeral=True)
+    now = datetime.now(timezone.utc)
+    tr = {
+        "user_id": inter.user.id,
+        "url": url.strip(),
+        "title": url.strip(),
+        "last_price": None,
+        "direction": "any",
+        "interval_min": int(recheck_minutes),
+        "created_utc": now.isoformat(),
+        "next_check_utc": (now + timedelta(minutes=int(recheck_minutes))).isoformat(),
+    }
+    tid = store.add_price_tracker(tr)
+    await inter.followup.send(f"✅ Tracking **#{tid}** — **{tr['title']}** (price pending). I’ll check every **{tr['interval_min']}m**.", ephemeral=True)
+
+@tree.command(name="price_list", description="List your tracked products.")
+async def price_list(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    items = store.list_price_trackers(inter.user.id)
+    if not items:
+        return await inter.followup.send("You have no price trackers.", ephemeral=True)
+    lines = []
+    for t in items:
+        due = t.get("next_check_utc")
+        try:
+            due_dt = datetime.fromisoformat(due).replace(tzinfo=timezone.utc) if due else None
+        except Exception:
+            due_dt = None
+        when = due_dt.astimezone(_chicago_tz_for(datetime.now())).strftime("%m-%d-%Y %H:%M %Z") if due_dt else "soon"
+        lp = f"${t['last_price']:.2f}" if isinstance(t.get("last_price"), (int, float)) else "—"
+        lines.append(f"**#{t['id']}** — {t.get('title','(no title)')}\n{t['url']}\nLast: {lp} • Every {t.get('interval_min', PRICE_DEFAULT_INTERVAL_MIN)}m • Next: {when} • Dir: {t.get('direction','any')}")
+    await inter.followup.send("\n\n".join(lines), ephemeral=True)
+
+@tree.command(name="price_untrack", description="Stop tracking by ID.")
+async def price_untrack(inter: discord.Interaction, tracker_id: int):
+    await inter.response.defer(ephemeral=True)
+    ok = store.remove_price_tracker(tracker_id, requester_id=inter.user.id)
+    await inter.followup.send("Removed." if ok else "Couldn't remove that ID.", ephemeral=True)
+
+@tree.command(name="price_check", description="Fetch the current price of a URL (one-off).")
+async def price_check(inter: discord.Interaction, url: str):
+    await inter.response.defer(ephemeral=True)
+    async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+        price, title = await fetch_price_snapshot(session, url)
+    if price is None:
+        return await inter.followup.send("I couldn’t detect a price right now.", ephemeral=True)
+    await inter.followup.send(f"**{title or url}** — **${price:.2f}**", ephemeral=True)
+
+# ---------- Price Scheduler ----------
+@tasks.loop(minutes=PRICE_CHECK_EVERY_MIN)
+async def price_scheduler():
+    try:
+        now_utc = datetime.now(timezone.utc)
+        trackers = store.list_price_trackers(None)
+        if not trackers:
+            return
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            for t in trackers:
+                try:
+                    due = datetime.fromisoformat(t.get("next_check_utc", "")).replace(tzinfo=timezone.utc)
+                except Exception:
+                    due = now_utc
+                if due > now_utc:
+                    continue
+
+                price, title = await fetch_price_snapshot(session, t["url"])
+                next_due = now_utc + timedelta(minutes=int(t.get("interval_min", PRICE_DEFAULT_INTERVAL_MIN)))
+                updates = {"next_check_utc": next_due.isoformat()}
+                if title and title != t.get("title"):
+                    updates["title"] = title
+
+                if price is not None:
+                    old = t.get("last_price")
+                    should_notify = False
+                    direction = str(t.get("direction", "any"))
+                    if old is None:
+                        updates["last_price"] = float(price)
+                    else:
+                        delta = float(price) - float(old)
+                        if direction == "any" and abs(delta) >= 0.01:
+                            should_notify = True
+                        elif direction == "down" and delta < -0.009:
+                            should_notify = True
+                        elif direction == "up" and delta > 0.009:
+                            should_notify = True
+                        if should_notify:
+                            updates["last_price"] = float(price)
+                            try:
+                                user = await bot.fetch_user(int(t["user_id"]))
+                                emb = discord.Embed(
+                                    title=f"📉 Price change — {updates.get('title', t.get('title','Item'))}",
+                                    description=t["url"]
+                                )
+                                if isinstance(old, (int, float)):
+                                    emb.add_field(name="Was", value=f"${old:.2f}", inline=True)
+                                emb.add_field(name="Now", value=f"${float(price):.2f}", inline=True)
+                                sign = "⬇️" if delta < 0 else "⬆️"
+                                emb.add_field(name="Change", value=f"{sign} {delta:+.2f}", inline=True)
+                                await user.send(embed=emb)
+                            except Exception:
+                                pass
+
+                store.update_price_tracker(t["id"], **updates)
+    except Exception:
+        pass
+
+@price_scheduler.before_loop
+async def before_price():
+    await bot.wait_until_ready()
+
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
@@ -2285,7 +2555,10 @@ async def on_ready():
     if not weather_scheduler.is_running():
         weather_scheduler.start()
 
-    # Re-register persistent poll views
+    
+    if not price_scheduler.is_running():
+        price_scheduler.start()
+# Re-register persistent poll views
     for mid, p in store.list_open_polls():
         try:
             view = PollView(message_id=mid, options=[o["label"] for o in p["options"]], creator_id=p.get("creator_id", 0), timeout=None)

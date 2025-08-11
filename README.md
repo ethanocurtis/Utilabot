@@ -60,14 +60,6 @@ Now includes an **admin allowlist** so you can give extra users access to admin 
 ![Shop Demo Page](media/shop_demo_page.gif)  
 *Example: Navigating pages, selecting items, and adjusting quantity.*
 
-![Shop Buy Example](media/shop_buy.gif)  
-*Example: Buying an item and confirming purchase.*
-
-![Shop Sell Example](media/shop_sell.gif)  
-*Example: Switching to sell mode and selling owned items.*
-
-> You can capture your own GIFs with tools like **ShareX** or **OBS Studio** and replace these placeholders.
-
 ### Reminders
 - `/remind_in duration:<1m/h/d> text:<str>` — set a timer reminder  
 - `/remind_at date:<MM-DD-YYYY> time:<HH:MM> text:<str>` — set a reminder for a specific date/time  

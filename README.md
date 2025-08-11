@@ -54,11 +54,7 @@ Now includes an **admin allowlist** so you can give extra users access to admin 
   - ✅ — Confirm purchase/sale  
   - ❌ — Close shop  
 - Items have buy/sell prices and descriptions  
-- Supports buying multiple quantities and selling owned items  
-
-#### Shop Demo (GIF/Screenshot Previews)
-![Shop Demo Page](media/shop_demo_page.gif)  
-*Example: Navigating pages, selecting items, and adjusting quantity.*
+- Supports buying multiple quantities and selling owned items 
 
 ### Reminders
 - `/remind_in duration:<1m/h/d> text:<str>` — set a timer reminder  

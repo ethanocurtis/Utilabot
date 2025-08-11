@@ -215,6 +215,25 @@ def _extract_meta_prices(raw: str) -> list[float]:
             out.append(v); seen.add(v)
     return out
 
+
+
+def _extract_amazon_price(raw: str) -> float | None:
+    # Focus on Amazon's core price blocks first
+    pats = [
+        r'id="priceblock_ourprice"[^>]*>\s*\$?([\d,]+\.\d{2})',
+        r'id="priceblock_dealprice"[^>]*>\s*\$?([\d,]+\.\d{2})',
+        r'id="apex_desktop"[\s\S]*?class="a-offscreen">\s*\$?([\d,]+\.\d{2})',
+        r'id="corePriceDisplay_desktop_feature_div"[\s\S]*?class="a-offscreen">\s*\$?([\d,]+\.\d{2})',
+        r'priceToPay[\s\S]*?class="a-offscreen">\s*\$?([\d,]+\.\d{2})',
+    ]
+    for pat in pats:
+        m = re.search(pat, raw, flags=re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except Exception:
+                continue
+    return None
 def _extract_prices_with_scores(raw: str):
     vals = []
     vals.extend(_extract_jsonld_prices(raw))
@@ -232,6 +251,13 @@ def _extract_prices_with_scores(raw: str):
         start = max(0, m.start() - 40)
         end   = min(len(visible), m.end() + 40)
         ctx = visible[start:end]
+        # skip promotional ranges like 'under $10', 'over $50', etc.
+        skip_phrases = [
+            'under $', 'over $', 'less than', 'more than', 'save $', 'save up to',
+            'coupon', 'clip coupon', 'subscribe & save', 'under $10', 'under $25'
+        ]
+        if any(sp in ctx for sp in skip_phrases):
+            continue
         score = 0
         for w in ["price","now","sale","deal","buy","add to cart","subtotal","current"]:
             if w in ctx: score += 2
@@ -251,7 +277,11 @@ async def fetch_price_snapshot(session, url: str):
         return None, None, []
     title = _extract_title(raw)
     json_meta_vals, scored = _extract_prices_with_scores(raw)
-    price = (json_meta_vals[0] if json_meta_vals else (scored[0][0] if scored else None))
+    price = None
+    if 'amazon.' in (url or '').lower():
+        price = _extract_amazon_price(raw)
+    if price is None:
+        price = (json_meta_vals[0] if json_meta_vals else (scored[0][0] if scored else None))
     return price, title, scored[:8]
 
 

@@ -215,6 +215,38 @@ def _extract_meta_prices(raw: str) -> list[float]:
             out.append(v); seen.add(v)
     return out
 
+def _extract_amazon_price(raw: str) -> float | None:
+    # Try core price display container first
+    m = re.search(r'id=["\']corePriceDisplay_desktop_feature_div["\'][\s\S]{0,800}?class=["\']a-offscreen["\']\s*>\s*\$?(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)<', raw, flags=re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except Exception:
+            pass
+    # priceToPay block
+    m = re.search(r'id=["\']priceToPay["\'][\s\S]{0,400}?class=["\']a-offscreen["\']\s*>\s*\$?(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)<', raw, flags=re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except Exception:
+            pass
+    # legacy priceblock ids
+    for pid in ("priceblock_ourprice","priceblock_dealprice","priceblock_saleprice"):
+        m = re.search(r'id=["\']%s["\'][\s\S]{0,120}?\$?(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)<' % pid, raw, flags=re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except Exception:
+                pass
+    # generic: any a-offscreen within a price feature div
+    m = re.search(r'(?:id=["\']corePrice|price_feature_div|apex_desktop)["\'][\s\S]{0,800}?class=["\']a-offscreen["\']\s*>\s*\$?(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)<', raw, flags=re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except Exception:
+            pass
+    return None
+
 
 
 def _extract_amazon_price(raw: str) -> float | None:
@@ -251,6 +283,11 @@ def _extract_prices_with_scores(raw: str):
         start = max(0, m.start() - 40)
         end   = min(len(visible), m.end() + 40)
         ctx = visible[start:end]
+
+        # Skip promotional/min-spend phrases
+        bad_phrases = ["under $", "over $", "less than", "more than", "save ", "save up to", "when you buy", "spend $", "orders over", "available at", "coupon", "subscribe & save"]
+        if any(bp in ctx for bp in bad_phrases):
+            continue
         # skip promotional ranges like 'under $10', 'over $50', etc.
         skip_phrases = [
             'under $', 'over $', 'less than', 'more than', 'save $', 'save up to',
@@ -277,11 +314,19 @@ async def fetch_price_snapshot(session, url: str):
         return None, None, []
     title = _extract_title(raw)
     json_meta_vals, scored = _extract_prices_with_scores(raw)
+
+    # Amazon-specific price extraction first
+    chosen = None
+    try:
+        if "amazon." in url:
+            chosen = _extract_amazon_price(raw)
+    except Exception:
+        chosen = None
     price = None
     if 'amazon.' in (url or '').lower():
         price = _extract_amazon_price(raw)
     if price is None:
-        price = (json_meta_vals[0] if json_meta_vals else (scored[0][0] if scored else None))
+            price = chosen if (chosen is not None) else (json_meta_vals[0] if json_meta_vals else (scored[0][0] if scored else None))
     return price, title, scored[:8]
 
 

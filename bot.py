@@ -1089,17 +1089,175 @@ def _find_catalog_item(name: str) -> Optional[str]:
     matches = [k for k in SHOP_CATALOG if name_norm in k.lower()]
     return matches[0] if len(matches) == 1 else None
 
-@tree.command(name="shop", description="Browse items available for purchase.")
-async def shop_cmd(inter: discord.Interaction):
-    lines = []
-    for name, meta in SHOP_CATALOG.items():
-        price = meta["price"]
-        price_str = f"{price} cr" if isinstance(price, int) else "–"
-        lines.append(f"**{name}** — Buy: {price_str} - Sell: {meta['sell'] if meta['sell'] is not None else 0} - _{meta['desc']}_")
-    emb = discord.Embed(title="🛒 Shop")
-    emb.description = "\n".join(lines)
-    await inter.response.send_message(embed=emb)
+# ========= Reaction Shop UI =========
+NUMS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣"]
+CTRL_PREV = "◀️"
+CTRL_NEXT = "▶️"
+CTRL_BUY  = "🛒"
+CTRL_SELL = "💵"
+CTRL_PLUS = "➕"
+CTRL_MINUS= "➖"
+CTRL_OK   = "✅"
+CTRL_CANCEL="❌"
 
+def _shop_pages():
+    items = list(SHOP_CATALOG.items())
+    page, pages = [], []
+    for i, pair in enumerate(items, 1):
+        page.append(pair)
+        if len(page) == 9 or i == len(items):
+            pages.append(page)
+            page = []
+    return pages
+
+def _shop_embed(user: discord.User, page_idx: int, mode: str, sel_idx: int, qty: int) -> discord.Embed:
+    pages = _shop_pages()
+    page = pages[page_idx]
+    bal = store.get_balance(user.id)
+
+    title = f"🛒 Shop — Balance: **{bal}** cr"
+    mode_txt = "Buy" if mode == "buy" else "Sell"
+    emb = discord.Embed(title=title, description=f"Mode: **{mode_txt}**   •   Qty: **{qty}**")
+    lines = []
+    for i, (name, meta) in enumerate(page, 1):
+        buy_str = f"{meta['price']} cr" if meta.get("price") is not None else "—"
+        sell_str = f"{meta.get('sell',0)} cr" if meta.get("sell") is not None else "—"
+        pointer = "👉 " if (sel_idx == i-1) else ""
+        desc = meta.get('desc','')
+        lines.append(f"{pointer}{NUMS[i-1]} **{name}** — Buy: {buy_str} • Sell: {sell_str}\n_{desc}_")
+    emb.add_field(name=f"Page {page_idx+1}/{len(pages)}", value="\n".join(lines), inline=False)
+
+    try:
+        name, meta = page[sel_idx]
+        price = meta.get("price")
+        sell = meta.get("sell")
+        total_buy = (price or 0) * qty
+        total_sell = (sell or 0) * qty
+        if mode == "buy":
+            emb.add_field(name="Selected (Buy)", value=f"**{name}** × {qty}  →  **{total_buy}** cr", inline=False)
+        else:
+            have = store.get_inventory(user.id).get(name, 0)
+            emb.add_field(name="Selected (Sell)", value=f"**{name}** × {qty} (you have {have})  →  **{total_sell}** cr", inline=False)
+    except Exception:
+        pass
+
+    emb.set_footer(text="1️⃣–9️⃣ select • ◀️▶️ page • 🛒 buy • 💵 sell • ➕➖ qty • ✅ confirm • ❌ close")
+    return emb
+
+@tree.command(name="shop", description="Interactive shop: show balance and buy/sell with reactions.")
+async def shop_cmd(inter: discord.Interaction):
+    await inter.response.defer()
+    user = inter.user
+    pages = _shop_pages()
+    page_idx = 0
+    sel_idx = 0
+    qty = 1
+    mode = "buy"  # 'buy' or 'sell'
+
+    msg = await inter.followup.send(embed=_shop_embed(user, page_idx, mode, sel_idx, qty))
+
+    # Add reactions
+    for em in NUMS[:len(pages[page_idx])]:
+        try: await msg.add_reaction(em)
+        except discord.HTTPException: pass
+    for em in [CTRL_PREV, CTRL_NEXT, CTRL_BUY, CTRL_SELL, CTRL_MINUS, CTRL_PLUS, CTRL_OK, CTRL_CANCEL]:
+        try: await msg.add_reaction(em)
+        except discord.HTTPException: pass
+
+    def check(reaction: discord.Reaction, reactor: discord.User):
+        return (
+            reactor.id == user.id and
+            reaction.message.id == msg.id and
+            str(reaction.emoji) in NUMS + [CTRL_PREV, CTRL_NEXT, CTRL_BUY, CTRL_SELL, CTRL_MINUS, CTRL_PLUS, CTRL_OK, CTRL_CANCEL]
+        )
+
+    try:
+        while True:
+            try:
+                reaction, reactor = await bot.wait_for("reaction_add", timeout=120.0, check=check)
+            except asyncio.TimeoutError:
+                break
+
+            emoji = str(reaction.emoji)
+
+            # Clear user's reaction (tidy UI)
+            try:
+                await msg.remove_reaction(emoji, user)
+            except Exception:
+                pass
+
+            if emoji in NUMS:
+                idx = NUMS.index(emoji)
+                if idx < len(pages[page_idx]):
+                    sel_idx = idx
+
+            elif emoji == CTRL_PREV:
+                if page_idx > 0:
+                    page_idx -= 1
+                    sel_idx = 0
+            elif emoji == CTRL_NEXT:
+                if page_idx < len(pages)-1:
+                    page_idx += 1
+                    sel_idx = 0
+
+            elif emoji == CTRL_BUY:
+                mode = "buy"
+            elif emoji == CTRL_SELL:
+                mode = "sell"
+
+            elif emoji == CTRL_PLUS:
+                qty = min(qty + 1, 1000)
+            elif emoji == CTRL_MINUS:
+                qty = max(qty - 1, 1)
+
+            elif emoji == CTRL_CANCEL:
+                await msg.edit(content="🛑 Shop closed.", embed=None)
+                return
+
+            elif emoji == CTRL_OK:
+                name, meta = pages[page_idx][sel_idx]
+                if mode == "buy":
+                    price = meta.get("price")
+                    if price is None:
+                        await inter.followup.send("That item cannot be purchased.", ephemeral=True)
+                    else:
+                        total = price * qty
+                        bal = store.get_balance(user.id)
+                        if bal < total:
+                            await inter.followup.send(f"Not enough credits. Need **{total}**.", ephemeral=True)
+                        else:
+                            store.add_balance(user.id, -total)
+                            store.add_item(user.id, name, qty)
+                            await inter.followup.send(f"✅ Bought **{qty}× {name}** for **{total}** credits.", ephemeral=True)
+                else:  # sell
+                    sell_val = meta.get("sell")
+                    if sell_val is None:
+                        await inter.followup.send("That item cannot be sold.", ephemeral=True)
+                    else:
+                        inv = store.get_inventory(user.id)
+                        have = inv.get(name, 0)
+                        if have < qty:
+                            await inter.followup.send(f"You only have **{have}× {name}**.", ephemeral=True)
+                        else:
+                            store.remove_item(user.id, name, qty)
+                            total = sell_val * qty
+                            store.add_balance(user.id, total)
+                            await inter.followup.send(f"💸 Sold **{qty}× {name}** for **{total}** credits.", ephemeral=True)
+
+            try:
+                await msg.edit(embed=_shop_embed(user, page_idx, mode, sel_idx, qty))
+            except discord.HTTPException:
+                pass
+
+    finally:
+        try:
+            await msg.clear_reactions()
+        except Exception:
+            pass
+        try:
+            await msg.edit(content="⌛ Session expired.", embed=None)
+        except Exception:
+            pass
 @tree.command(name="buy", description="Buy an item from the shop.")
 @app_commands.describe(item="Exact item name (e.g., 'Fishing Pole')", quantity="Defaults to 1")
 async def buy_cmd(inter: discord.Interaction, item: str, quantity: app_commands.Range[int, 1, 100] = 1):

@@ -344,7 +344,7 @@ def _ensure_shape(data: dict) -> dict:
         data["price"]["trackers"] = {}
     if not isinstance(data["price"].get("seq"), int):
         data["price"]["seq"] = 0
-return data
+    return data
 
 
 class Store:

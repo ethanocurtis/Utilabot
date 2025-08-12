@@ -1904,6 +1904,266 @@ async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Opti
     emb.add_field(name="Outcome", value=outcome, inline=False)
     await inter.followup.send(embed=emb)
 
+
+# ---------- Connect 4 (AI or PvP, wagerable) ----------
+C4_ROWS, C4_COLS = 6, 7
+C4_EMPTY, C4_P1, C4_P2 = 0, 1, 2
+C4_EMOJI = {C4_EMPTY: "⚪", C4_P1: "🔴", C4_P2: "🟡"}
+
+def c4_new_board():
+    return [[C4_EMPTY for _ in range(C4_COLS)] for __ in range(C4_ROWS)]
+
+def c4_legal_moves(board):
+    return [c for c in range(C4_COLS) if board[-1][c] == C4_EMPTY]
+
+def c4_drop(board, col, piece):
+    for r in range(C4_ROWS):
+        if board[r][col] == C4_EMPTY:
+            board[r][col] = piece
+            return r, col
+    return None  # column full
+
+def c4_check_winner(board, piece):
+    # Horizontal
+    for r in range(C4_ROWS):
+        for c in range(C4_COLS-3):
+            if all(board[r][c+i] == piece for i in range(4)): return True
+    # Vertical
+    for c in range(C4_COLS):
+        for r in range(C4_ROWS-3):
+            if all(board[r+i][c] == piece for i in range(4)): return True
+    # Diagonal up-right
+    for r in range(C4_ROWS-3):
+        for c in range(C4_COLS-3):
+            if all(board[r+i][c+i] == piece for i in range(4)): return True
+    # Diagonal down-right
+    for r in range(3, C4_ROWS):
+        for c in range(C4_COLS-3):
+            if all(board[r-i][c+i] == piece for i in range(4)): return True
+    return False
+
+def c4_full(board):
+    return all(board[C4_ROWS-1][c] != C4_EMPTY for c in range(C4_COLS))
+
+def c4_render(board):
+    # Show top row first (reverse rows for display)
+    lines = []
+    for r in range(C4_ROWS-1, -1, -1):
+        lines.append("".join(C4_EMOJI[board[r][c]] for c in range(C4_COLS)))
+    footer = "1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣"
+    return "\n".join(lines) + "\n" + footer
+
+def c4_winning_move(board, piece):
+    for c in c4_legal_moves(board):
+        # simulate
+        temp = [row[:] for row in board]
+        c4_drop(temp, c, piece)
+        if c4_check_winner(temp, piece):
+            return c
+    return None
+
+def c4_ai_move(board):
+    # 1) If AI can win now, do it
+    move = c4_winning_move(board, C4_P2)
+    if move is not None:
+        return move
+    # 2) Block player's immediate win
+    move = c4_winning_move(board, C4_P1)
+    if move is not None:
+        return move
+    # 3) Prefer center, then adjacent columns
+    order = [3,2,4,1,5,0,6]
+    legal = c4_legal_moves(board)
+    for c in order:
+        if c in legal:
+            return c
+    # 4) Fallback random
+    return random.choice(legal) if legal else None
+
+class Connect4View(discord.ui.View):
+    def __init__(self, mode: str, bet: int, starter_id: int, opponent_id: Optional[int] = None, timeout: float = 180):
+        super().__init__(timeout=timeout)
+        self.mode = mode  # 'ai' or 'pvp'
+        self.bet = int(bet)
+        self.starter_id = int(starter_id)
+        self.opponent_id = int(opponent_id) if opponent_id else None
+        self.board = c4_new_board()
+        self.turn = C4_P1  # Player 1 (starter) uses 🔴
+        self.current_player_id = self.starter_id
+        # Build 7 column buttons + resign
+        for idx in range(7):
+            self.add_item(self._make_col_button(idx))
+        self.add_item(self._make_resign_button())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.mode == "ai":
+            allowed = interaction.user.id == self.starter_id
+        else:
+            allowed = interaction.user.id in {self.starter_id, self.opponent_id} and interaction.user.id == self.current_player_id
+        if not allowed:
+            await interaction.response.send_message("It's not your turn.", ephemeral=True)
+            return False
+        return True
+
+    def _make_col_button(self, col_idx: int):
+        custom_id = f"c4_col:{col_idx}"
+        btn = discord.ui.Button(label=str(col_idx+1), style=discord.ButtonStyle.primary, custom_id=custom_id, row=col_idx//4)
+        async def cb(inter: discord.Interaction, col=col_idx):
+            await self._handle_move(inter, col)
+        btn.callback = cb
+        return btn
+
+    def _make_resign_button(self):
+        btn = discord.ui.Button(label="Resign", style=discord.ButtonStyle.danger, emoji="🏳️")
+        async def cb(inter: discord.Interaction):
+            # current player resigns
+            if self.mode == "ai":
+                # player resigns -> loses bet
+                store.add_balance(self.starter_id, -self.bet)
+                await self._end(inter, f"🏳️ **You resigned.** You lose **{self.bet}** credits.", disable=True)
+            else:
+                loser = self.current_player_id
+                winner = self.starter_id if loser == self.opponent_id else self.opponent_id
+                store.add_balance(loser, -self.bet)
+                store.add_balance(winner, self.bet)
+                try:
+                    if loser == self.starter_id:
+                        store.add_result(self.starter_id, "loss"); store.add_result(self.opponent_id, "win")
+                    else:
+                        store.add_result(self.opponent_id, "loss"); store.add_result(self.starter_id, "win")
+                except Exception:
+                    pass
+                await self._end(inter, f"🏳️ <@{loser}> resigned. **<@{winner}>** wins **{self.bet}** credits.", disable=True)
+        btn.callback = cb
+        return btn
+
+    async def _handle_move(self, inter: discord.Interaction, col: int):
+        # drop for current human
+        if self.board[-1][col] != C4_EMPTY:
+            await inter.response.send_message("That column is full.", ephemeral=True)
+            return
+        c4_drop(self.board, col, self.turn)
+
+        # Check human win
+        if c4_check_winner(self.board, self.turn):
+            if self.mode == "ai":
+                store.add_balance(self.starter_id, self.bet)
+                store.add_result(self.starter_id, "win")
+                await self._end(inter, f"✅ **You win!** +{self.bet} credits.", disable=True)
+            else:
+                # current player wins PvP
+                winner = self.current_player_id
+                loser = self.starter_id if winner == self.opponent_id else self.opponent_id
+                store.add_balance(winner, self.bet); store.add_balance(loser, -self.bet)
+                store.add_result(winner, "win"); store.add_result(loser, "loss")
+                await self._end(inter, f"✅ **<@{winner}> wins!** Takes **{self.bet}** from <@{loser}>.", disable=True)
+            return
+
+        if c4_full(self.board):
+            await self._end(inter, "🤝 Draw! No credits exchanged.", disable=True)
+            try:
+                if self.mode == "ai":
+                    store.add_result(self.starter_id, "push")
+                else:
+                    store.add_result(self.starter_id, "push"); store.add_result(self.opponent_id, "push")
+            except Exception:
+                pass
+            return
+
+        # Switch turn or do AI move
+        if self.mode == "ai":
+            # AI move (🟡)
+            self.turn = C4_P2
+            board_text = c4_render(self.board)
+            await inter.response.edit_message(embed=self._embed("Your move…"), view=self)
+            # small pause for UX
+            await asyncio.sleep(0.6)
+            ai_col = c4_ai_move(self.board)
+            if ai_col is None:
+                await self._end(inter, "🤝 Draw! No credits exchanged.", disable=True)
+                return
+            c4_drop(self.board, ai_col, C4_P2)
+            if c4_check_winner(self.board, C4_P2):
+                store.add_balance(self.starter_id, -self.bet)
+                store.add_result(self.starter_id, "loss")
+                await self._end(inter, f"❌ **AI wins.** You lose **{self.bet}** credits.", disable=True)
+                return
+            if c4_full(self.board):
+                await self._end(inter, "🤝 Draw! No credits exchanged.", disable=True)
+                store.add_result(self.starter_id, "push")
+                return
+            # back to human
+            self.turn = C4_P1
+            await inter.edit_original_response(embed=self._embed("Your turn"), view=self)
+        else:
+            # PvP: swap player
+            self.turn = C4_P2 if self.turn == C4_P1 else C4_P1
+            self.current_player_id = self.starter_id if self.current_player_id == self.opponent_id else self.opponent_id
+            await inter.response.edit_message(embed=self._embed(f"Turn: <@{self.current_player_id}>"), view=self)
+
+    def _embed(self, subtitle: str):
+        title = "🟨 Connect 4" if self.mode == "ai" else "🟨 Connect 4 — PvP"
+        emb = discord.Embed(title=title, description=c4_render(self.board))
+        if self.mode == "ai":
+            emb.add_field(name="Bet", value=str(self.bet), inline=True)
+            emb.add_field(name="You", value="🔴 (goes first)", inline=True)
+            emb.add_field(name="AI", value="🟡", inline=True)
+        else:
+            emb.add_field(name="Bet (each)", value=str(self.bet), inline=True)
+            emb.add_field(name="Red", value=f"<@{self.starter_id}>", inline=True)
+            emb.add_field(name="Yellow", value=f"<@{self.opponent_id}>", inline=True)
+            emb.set_footer(text=f"Turn: {('🔴 ' if self.turn==C4_P1 else '🟡 ')}<@{self.current_player_id}>")
+        return emb
+
+    async def _end(self, inter: discord.Interaction, result_text: str, disable: bool = True):
+        if disable:
+            for child in self.children:
+                if isinstance(child, discord.ui.Button):
+                    child.disabled = True
+        emb = self._embed("Game Over")
+        emb.add_field(name="Result", value=result_text, inline=False)
+        try:
+            if inter.response.is_done():
+                await inter.edit_original_response(embed=emb, view=self if not disable else None)
+            else:
+                await inter.response.edit_message(embed=emb, view=self if not disable else None)
+        except Exception:
+            pass
+        self.stop()
+
+@tree.command(name="connect4", description="Play Connect 4 vs AI or another user (wager your balance).")
+@app_commands.describe(bet="Amount to wager", opponent="Omit to play AI; mention a user to play PvP")
+async def connect4_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], opponent: Optional[discord.User] = None):
+    # Validate balances
+    if opponent is None:
+        # AI mode
+        if store.get_balance(inter.user.id) < bet:
+            return await inter.response.send_message("❌ You don't have enough credits for that bet.", ephemeral=True)
+        view = Connect4View(mode="ai", bet=int(bet), starter_id=inter.user.id, opponent_id=None)
+        await inter.response.send_message(embed=view._embed("Your turn"), view=view)
+        return
+
+    # PvP mode validations
+    if opponent.bot or opponent.id == inter.user.id:
+        return await inter.response.send_message("Pick a real opponent.", ephemeral=True)
+    if store.get_balance(inter.user.id) < bet:
+        return await inter.response.send_message("❌ You don't have enough credits for that bet.", ephemeral=True)
+    if store.get_balance(opponent.id) < bet:
+        return await inter.response.send_message(f"❌ {opponent.mention} doesn't have enough credits for that bet.", ephemeral=True)
+
+    # Challenge flow
+    challenge = PvPChallengeView(challenger_id=inter.user.id, challenged_id=opponent.id, timeout=PVP_TIMEOUT)
+    await inter.response.send_message(f"🟨 {opponent.mention}, **{inter.user.display_name}** challenges you to **Connect 4** for **{bet}** credits each. Accept?", view=challenge)
+    await challenge.wait()
+    if challenge.accepted is None:
+        return await inter.followup.send("⌛ Challenge expired.")
+    if not challenge.accepted:
+        return await inter.followup.send("🚫 Challenge declined.")
+
+    # Start PvP game
+    view = Connect4View(mode="pvp", bet=int(bet), starter_id=inter.user.id, opponent_id=opponent.id)
+    await inter.followup.send(embed=view._embed(f"Turn: <@{view.current_player_id}>"), view=view)
+
 # ---------- Slots (animated) ----------
 SLOT_SYMBOLS_BASE = ["🍒", "🍋", "🔔", "⭐", "🍀", "7️⃣"]
 WILD = "🃏"

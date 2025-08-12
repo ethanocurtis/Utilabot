@@ -2742,3 +2742,357 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ========================= NEW GAMES: Roulette & Texas Hold'em =========================
+
+# ---------- Roulette ----------
+ROULETTE_RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+ROULETTE_BLACK = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
+
+def _roulette_spin_sequence(final_number: int):
+    # Generate a simple animation sequence that "spins" towards final_number
+    import itertools
+    wheel = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
+    # Find index of final_number and build a path that ends there
+    try:
+        idx = wheel.index(final_number)
+    except ValueError:
+        idx = 0
+    seq = []
+    # Spin a couple of full rotations then slow down to the final slot
+    path = list(itertools.islice(itertools.cycle(wheel), idx, idx + len(wheel)*2 + 12))
+    # ensure it ends exactly on final_number
+    path.append(final_number)
+    return path
+
+def _roulette_color(n: int) -> str:
+    if n == 0:
+        return "🟢 Green"
+    if n in ROULETTE_RED:
+        return "🔴 Red"
+    if n in ROULETTE_BLACK:
+        return "⚫ Black"
+    return "Unknown"
+
+def _roulette_win_multiplier(choice: str, result: int) -> int:
+    c = choice.strip().lower()
+    if c.isdigit():
+        return 36 if int(c) == result else 0  # 35:1 net -> 36x return vs bet accounting like slots; we'll credit net later
+    if c in {"red","r"}:
+        return 2 if (result in ROULETTE_RED) else 0
+    if c in {"black","b"}:
+        return 2 if (result in ROULETTE_BLACK) else 0
+    if c in {"odd","o"}:
+        return 2 if (result != 0 and (result % 2 == 1)) else 0
+    if c in {"even","e"}:
+        return 2 if (result != 0 and (result % 2 == 0)) else 0
+    return -1  # invalid
+
+@tree.command(name="roulette", description="Spin the roulette wheel (red/black/odd/even or a single number 0-36).")
+@app_commands.describe(bet="Amount to wager", choice="red/black/odd/even or 0-36")
+async def roulette_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], choice: str):
+    choice_norm = choice.strip().lower()
+    if choice_norm.isdigit():
+        if not (0 <= int(choice_norm) <= 36):
+            return await inter.response.send_message("Number must be between 0 and 36.", ephemeral=True)
+    elif choice_norm not in {"red","r","black","b","odd","o","even","e"}:
+        return await inter.response.send_message("Choice must be red/black/odd/even or a number 0-36.", ephemeral=True)
+
+    if store.get_balance(inter.user.id) < bet:
+        return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
+
+    # Determine the result first for consistency
+    result = random.randint(0, 36)
+    path = _roulette_spin_sequence(result)
+
+    emb = discord.Embed(title="🎡 Roulette", description="Spinning the wheel...", colour=discord.Colour.dark_teal())
+    emb.add_field(name="Bet", value=str(bet), inline=True)
+    emb.add_field(name="Your Pick", value=choice_norm.upper(), inline=True)
+    emb.add_field(name="Result", value="—", inline=False)
+    await inter.response.send_message(embed=emb)
+    msg = await inter.original_response()
+
+    # Animate the spin
+    for i, n in enumerate(path):
+        try:
+            anim = discord.Embed(title="🎡 Roulette", description=("Spinning..." if i < len(path)-1 else "Result"), colour=discord.Colour.dark_teal())
+            anim.add_field(name="Bet", value=str(bet), inline=True)
+            anim.add_field(name="Your Pick", value=choice_norm.upper(), inline=True)
+            anim.add_field(name="Wheel", value=f"➡️ **{n}** ({_roulette_color(n)})", inline=False)
+            await msg.edit(embed=anim)
+        except discord.HTTPException:
+            pass
+        await asyncio.sleep(0.12 if i < len(path)-10 else 0.22)
+
+    mult = _roulette_win_multiplier(choice_norm, result)
+    if mult == -1:
+        return await inter.followup.send("Invalid bet choice.", ephemeral=True)
+
+    if mult == 0:
+        store.add_balance(inter.user.id, -bet)
+        net = -bet
+        text = "❌ You lose."
+    else:
+        # mult represents total return factor; net win = bet * (mult - 1)
+        net = bet * (mult - 1)
+        store.add_balance(inter.user.id, net)
+        text = f"✅ You win! Payout x{mult}"
+        store.add_result(inter.user.id, "win")
+
+    final = discord.Embed(title="🎡 Roulette — Final", colour=discord.Colour.green() if net>0 else discord.Colour.red())
+    final.add_field(name="Result", value=f"**{result}** ({_roulette_color(result)})", inline=True)
+    final.add_field(name="Net", value=(f"+{net}" if net >= 0 else str(net)), inline=True)
+    await msg.edit(embed=final)
+
+# ---------- Texas Hold'em (Heads-up, fixed-stake, animated reveal) ----------
+
+POKER_RANK_ORDER = {"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13,"A":14}
+
+def _poker_rank_value(r: str) -> int:
+    return POKER_RANK_ORDER.get(r, 0)
+
+def _is_straight(vals: list) -> int:
+    """Return high card of straight or 0 if none. vals should be sorted unique ascending"""
+    if not vals: return 0
+    # wheel A-2-3-4-5
+    if set([14,5,4,3,2]).issubset(set(vals)):
+        return 5
+    streak = 1; best = 0
+    for i in range(1, len(vals)):
+        if vals[i] == vals[i-1] + 1:
+            streak += 1
+            if streak >= 5:
+                best = vals[i]
+        elif vals[i] != vals[i-1]:
+            streak = 1
+    return best
+
+def _evaluate_best_5(cards: list) -> tuple:
+    """
+    cards: list of (rank, suit). Returns comparable tuple:
+    (category, tiebreaker list...) higher better.
+    Categories: 8=Straight Flush,7=Four,6=Full House,5=Flush,4=Straight,3=Trips,2=TwoPair,1=Pair,0=High
+    """
+    ranks = [r for r,s in cards]
+    suits = [s for r,s in cards]
+    vals = sorted([_poker_rank_value(r) for r in ranks], reverse=True)
+
+    # counts
+    from collections import Counter
+    rc = Counter(ranks)
+    sc = Counter(suits)
+
+    # Flush?
+    flush_suit = None
+    for s, c in sc.items():
+        if c >= 5:
+            flush_suit = s
+            break
+
+    # Straight & Straight Flush
+    unique_vals = sorted(set(vals))
+    straight_high = _is_straight(unique_vals)
+    if flush_suit:
+        flush_vals = sorted([_poker_rank_value(r) for r,s in cards if s == flush_suit])
+        flush_unique = sorted(set(flush_vals))
+        sf_high = _is_straight(flush_unique)
+        if sf_high:
+            return (8, sf_high)
+
+    # Four of a kind
+    fours = [r for r,c in rc.items() if c == 4]
+    if fours:
+        fourv = max(_poker_rank_value(r) for r in fours)
+        kickers = sorted([_poker_rank_value(r) for r,c in rc.items() if r not in fours], reverse=True)
+        return (7, fourv, kickers[0])
+
+    # Full house
+    trips = sorted([_poker_rank_value(r) for r,c in rc.items() if c == 3], reverse=True)
+    pairs = sorted([_poker_rank_value(r) for r,c in rc.items() if c == 2], reverse=True)
+    if trips and (pairs or len(trips) >= 2):
+        t = trips[0]
+        p = pairs[0] if pairs else trips[1]
+        return (6, t, p)
+
+    # Flush
+    if flush_suit:
+        top5 = sorted([_poker_rank_value(r) for r,s in cards if s == flush_suit], reverse=True)[:5]
+        return (5, *top5)
+
+    # Straight
+    if straight_high:
+        return (4, straight_high)
+
+    # Trips
+    if trips:
+        t = trips[0]
+        kickers = sorted([_poker_rank_value(r) for r,c in rc.items() if c == 1], reverse=True)[:2]
+        return (3, t, *kickers)
+
+    # Two Pair
+    if len(pairs) >= 2:
+        p1, p2 = pairs[:2]
+        kicker = max([_poker_rank_value(r) for r,c in rc.items() if c == 1])
+        return (2, p1, p2, kicker)
+
+    # One Pair
+    if len(pairs) == 1:
+        p = pairs[0]
+        kickers = sorted([_poker_rank_value(r) for r,c in rc.items() if c == 1], reverse=True)[:3]
+        return (1, p, *kickers)
+
+    # High card
+    top5 = sorted([_poker_rank_value(r) for r in ranks], reverse=True)[:5]
+    return (0, *top5)
+
+def _best_of_seven(hole: list, board: list) -> tuple:
+    allcards = hole + board
+    return _evaluate_best_5(allcards)
+
+def _fmt_cards(cards: list) -> str:
+    return " ".join(f"{r}{s}" for r,s in cards)
+
+def _hand_name(cat: int) -> str:
+    return ["High Card","Pair","Two Pair","Three of a Kind","Straight","Flush","Full House","Four of a Kind","Straight Flush"][cat]
+
+class HoldemGame:
+    def __init__(self, bet: int, p1_id: int, p2_id: Optional[int] = None):
+        self.bet = int(bet)
+        self.p1_id = int(p1_id)
+        self.p2_id = int(p2_id) if p2_id else None
+        # Build and shuffle deck
+        self.deck = deal_deck()
+        # Hole cards
+        self.p1 = [self.deck.pop(), self.deck.pop()]
+        self.p2 = [self.deck.pop(), self.deck.pop()] if self.p2_id else [self.deck.pop(), self.deck.pop()]
+        # Board
+        self.flop = []; self.turn = []; self.river = []
+
+    def reveal_flop(self):
+        # burn one (pop) then flop 3
+        _ = self.deck.pop()
+        self.flop = [self.deck.pop(), self.deck.pop(), self.deck.pop()]
+
+    def reveal_turn(self):
+        _ = self.deck.pop()
+        self.turn = [self.deck.pop()]
+
+    def reveal_river(self):
+        _ = self.deck.pop()
+        self.river = [self.deck.pop()]
+
+    @property
+    def board(self):
+        return self.flop + self.turn + self.river
+
+    def result(self):
+        p1_eval = _best_of_seven(self.p1, self.board)
+        p2_eval = _best_of_seven(self.p2, self.board)
+        if p1_eval > p2_eval: return 1, p1_eval, p2_eval
+        if p2_eval > p1_eval: return 2, p1_eval, p2_eval
+        return 0, p1_eval, p2_eval
+
+def _holdem_embed(title: str, game: HoldemGame, reveal_hands: bool = False):
+    emb = discord.Embed(title=title)
+    # Show cards
+    if reveal_hands:
+        emb.add_field(name="Player 1", value=_fmt_cards(game.p1), inline=False)
+        emb.add_field(name=("Player 2" if game.p2_id else "AI"), value=_fmt_cards(game.p2), inline=False)
+    else:
+        emb.add_field(name="Hands", value="🂠 🂠    vs    🂠 🂠", inline=False)
+    # Board
+    btxt = _fmt_cards(game.flop) if game.flop else "—"
+    if game.turn: btxt += "  " + _fmt_cards(game.turn)
+    if game.river: btxt += "  " + _fmt_cards(game.river)
+    emb.add_field(name="Board", value=btxt, inline=False)
+    emb.set_footer(text=f"Bet: {game.bet} per player")
+    return emb
+
+@tree.command(name="holdem", description="Heads-up Texas Hold'em vs AI or another user (fixed-stake, animated).")
+@app_commands.describe(bet="Stake per player", opponent="Omit to face AI; mention a user for PvP")
+async def holdem_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], opponent: Optional[discord.User] = None):
+    # Balance checks
+    if opponent:
+        if opponent.bot or opponent.id == inter.user.id:
+            return await inter.response.send_message("Pick a real opponent.", ephemeral=True)
+        if store.get_balance(inter.user.id) < bet:
+            return await inter.response.send_message("❌ You don't have enough credits for that bet.", ephemeral=True)
+        if store.get_balance(opponent.id) < bet:
+            return await inter.response.send_message(f"❌ {opponent.mention} doesn't have enough credits.", ephemeral=True)
+        # Challenge flow
+        challenge = PvPChallengeView(challenger_id=inter.user.id, challenged_id=opponent.id, timeout=PVP_TIMEOUT)
+        await inter.response.send_message(f"♠️ {opponent.mention}, **{inter.user.display_name}** challenges you to **Texas Hold'em** for **{bet}** credits each. Accept?", view=challenge)
+        await challenge.wait()
+        if challenge.accepted is None:
+            return await inter.followup.send("⌛ Challenge expired.")
+        if not challenge.accepted:
+            return await inter.followup.send("🚫 Challenge declined.")
+        game = HoldemGame(bet=bet, p1_id=inter.user.id, p2_id=opponent.id)
+        msg = await inter.followup.send(embed=_holdem_embed("Texas Hold'em — Dealing...", game, reveal_hands=False))
+    else:
+        if store.get_balance(inter.user.id) < bet:
+            return await inter.response.send_message("❌ Not enough credits for that bet.", ephemeral=True)
+        await inter.response.send_message(embed=discord.Embed(title="Texas Hold'em — Dealing..."))
+        msg = await inter.original_response()
+        game = HoldemGame(bet=bet, p1_id=inter.user.id, p2_id=None)
+
+    # Animate reveal: preflop (hidden), flop, turn, river
+    try:
+        await asyncio.sleep(0.7)
+        game.reveal_flop()
+        await msg.edit(embed=_holdem_embed("Texas Hold'em — Flop", game, reveal_hands=False))
+        await asyncio.sleep(0.9)
+        game.reveal_turn()
+        await msg.edit(embed=_holdem_embed("Texas Hold'em — Turn", game, reveal_hands=False))
+        await asyncio.sleep(0.9)
+        game.reveal_river()
+        await msg.edit(embed=_holdem_embed("Texas Hold'em — River", game, reveal_hands=False))
+        await asyncio.sleep(0.9)
+    except discord.HTTPException:
+        pass
+
+    # Showdown
+    winner, p1_eval, p2_eval = game.result()
+    p1_name = inter.user.display_name
+    p2_name = (opponent.display_name if opponent else "AI")
+    title = "Texas Hold'em — Showdown"
+    showdown = _holdem_embed(title, game, reveal_hands=True)
+
+    # Human-readable hand names
+    p1_cat, p2_cat = p1_eval[0], p2_eval[0]
+    showdown.add_field(name=f"{p1_name} Hand", value=_hand_name(p1_cat), inline=True)
+    showdown.add_field(name=f"{p2_name} Hand", value=_hand_name(p2_cat), inline=True)
+
+    # Payouts
+    if winner == 1:
+        # player 1 wins the opponent's bet
+        if opponent:
+            store.add_balance(inter.user.id, bet)
+            store.add_balance(opponent.id, -bet)
+            store.add_result(inter.user.id, "win"); store.add_result(opponent.id, "loss")
+            outcome = f"✅ **{p1_name}** wins **{bet}** credits from **{p2_name}**."
+        else:
+            store.add_balance(inter.user.id, bet)
+            store.add_result(inter.user.id, "win")
+            outcome = f"✅ **{p1_name}** beats the AI! +{bet} credits."
+    elif winner == 2:
+        if opponent:
+            store.add_balance(inter.user.id, -bet)
+            store.add_balance(opponent.id, bet)
+            store.add_result(opponent.id, "win"); store.add_result(inter.user.id, "loss")
+            outcome = f"✅ **{p2_name}** wins **{bet}** credits from **{p1_name}**."
+        else:
+            store.add_balance(inter.user.id, -bet)
+            store.add_result(inter.user.id, "loss")
+            outcome = f"❌ AI wins. **-{bet}** credits."
+    else:
+        # Push
+        store.add_result(inter.user.id, "push")
+        if opponent:
+            store.add_result(opponent.id, "push")
+        outcome = "🤝 It's a tie. Push."
+
+    showdown.add_field(name="Outcome", value=outcome, inline=False)
+    try:
+        await msg.edit(embed=showdown)
+    except discord.HTTPException:
+        await inter.followup.send(embed=showdown)

@@ -2091,6 +2091,78 @@ async def autodelete_status(inter: discord.Interaction):
     else:
         await inter.response.send_message("❌ Auto-delete is **OFF** for this channel.", ephemeral=True)
 
+@tree.command(name="autodelete_list", description="List all channels with auto-delete enabled (clean view).")
+@require_admin_or_allowlisted()
+async def autodelete_list(inter: discord.Interaction):
+    conf = store.get_autodelete()
+    if not conf:
+        return await inter.response.send_message("No auto-delete rules are set.", ephemeral=True)
+
+    # Normalize into list of (channel_object_or_none, channel_id_str, seconds)
+    rows = []
+    for chan_id, secs in conf.items():
+        try:
+            secs = int(secs)
+        except Exception:
+            secs = int(float(secs))
+        try:
+            channel = await bot.fetch_channel(int(chan_id))
+        except Exception:
+            channel = None
+        rows.append((channel, str(chan_id), int(secs)))
+
+    # Human formatter
+    def _fmt_secs(secs: int) -> str:
+        if secs < 60:
+            return f"{secs} seconds"
+        if secs % 3600 == 0:
+            return f"{secs // 3600} hours"
+        if secs % 60 == 0:
+            return f"{secs // 60} minutes"
+        return f"{secs // 60} minutes {secs % 60} seconds"
+
+    instant = [r for r in rows if r[2] < 60]
+    scheduled = [r for r in rows if r[2] >= 60]
+
+    # Sort by channel name then ID
+    def _key(row):
+        ch, cid, _ = row
+        name = getattr(ch, "name", None)
+        return (name or cid).lower()
+
+    instant.sort(key=_key)
+    scheduled.sort(key=_key)
+
+    emb = discord.Embed(title="🗑️ Auto-Delete Rules")
+    emb.set_footer(text="Only visible to you")
+
+    if instant:
+        lines = []
+        for ch, cid, secs in instant:
+            label = f"#{ch.name}" if getattr(ch, "name", None) else f"<#{cid}>"
+            lines.append(f"{label} — {_fmt_secs(secs)}")
+        emb.add_field(name="Instant (< 60s)", value="\n".join(lines)[:1024], inline=False)
+
+    if scheduled:
+        lines = []
+        for ch, cid, secs in scheduled:
+            label = f"#{ch.name}" if getattr(ch, "name", None) else f"<#{cid}>"
+            lines.append(f"{label} — {_fmt_secs(secs)}")
+        # Discord field limit handling (split if long)
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 1024:
+                emb.add_field(name="Scheduled (≥ 60s)", value=chunk.rstrip(), inline=False)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            emb.add_field(name="Scheduled (≥ 60s)", value=chunk.rstrip(), inline=False)
+
+    total = len(rows)
+    emb.description = f"**{total}** channel{'s' if total != 1 else ''} with auto-delete enabled."
+
+    await inter.response.send_message(embed=emb, ephemeral=True)
+
 # ---------- Leaderboard & Achievements ----------
 @tree.command(name="leaderboard", description="Show the top players.")
 @app_commands.describe(category="Choose 'balance' or 'wins'")

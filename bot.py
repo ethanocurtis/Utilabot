@@ -2018,14 +2018,49 @@ async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 10
     except discord.HTTPException as e:
         await inter.followup.send(f"Error while deleting: {e}", ephemeral=True)
 
-@tree.command(name="autodelete_set", description="Enable auto-delete for this channel after N minutes.")
-@app_commands.describe(minutes="Delete messages older than this many minutes (min 1, max 1440)")
+@tree.command(name="autodelete_set", description="Enable auto-delete for this channel after N seconds or minutes.")
+@app_commands.describe(duration="Delete after this many seconds (e.g., 10s) or minutes (e.g., 2m or just 2)")
 @require_admin_or_allowlisted()
-async def autodelete_set(inter: discord.Interaction, minutes: app_commands.Range[int, 1, 1440]):
+async def autodelete_set(inter: discord.Interaction, duration: str):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    seconds = minutes * 60; store.set_autodelete(inter.channel.id, seconds)
-    await inter.response.send_message(f"🗑️ Auto-delete enabled: older than **{minutes}** minutes.", ephemeral=True)
+
+    s = duration.strip().lower()
+
+    # Parse duration -> seconds
+    if s.endswith("s"):
+        try:
+            seconds = int(s[:-1])
+        except ValueError:
+            return await inter.response.send_message("Invalid seconds format. Try like **10s**.", ephemeral=True)
+    elif s.endswith("m"):
+        try:
+            seconds = int(s[:-1]) * 60
+        except ValueError:
+            return await inter.response.send_message("Invalid minutes format. Try like **2m**.", ephemeral=True)
+    else:
+        try:
+            seconds = int(s) * 60  # default to minutes
+        except ValueError:
+            return await inter.response.send_message("Invalid format. Use **10s**, **2m**, or a number for minutes.", ephemeral=True)
+
+    # Validate range
+    if seconds < 5 or seconds > 86400:
+        return await inter.response.send_message("Range must be **5 seconds** to **24 hours**.", ephemeral=True)
+
+    store.set_autodelete(inter.channel.id, int(seconds))
+
+    # Nice confirmation
+    if seconds < 60:
+        time_str = f"{seconds} seconds"
+    elif seconds % 3600 == 0:
+        time_str = f"{seconds // 3600} hours"
+    elif seconds % 60 == 0:
+        time_str = f"{seconds // 60} minutes"
+    else:
+        time_str = f"{seconds // 60} minutes {seconds % 60} seconds"
+
+    await inter.response.send_message(f"🗑️ Auto-delete enabled: older than **{time_str}**.", ephemeral=True)
 
 @tree.command(name="autodelete_disable", description="Disable auto-delete for this channel.")
 @require_admin_or_allowlisted()
@@ -2040,7 +2075,19 @@ async def autodelete_status(inter: discord.Interaction):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
     conf = store.get_autodelete(); secs = conf.get(str(inter.channel.id))
     if secs:
-        mins = secs // 60; await inter.response.send_message(f"✅ Auto-delete is **ON**: older than **{mins}** minutes.", ephemeral=True)
+        try:
+            secs = int(secs)
+        except Exception:
+            secs = int(float(secs))
+        if secs < 60:
+            time_str = f"{secs} seconds"
+        elif secs % 3600 == 0:
+            time_str = f"{secs // 3600} hours"
+        elif secs % 60 == 0:
+            time_str = f"{secs // 60} minutes"
+        else:
+            time_str = f"{secs // 60} minutes {secs % 60} seconds"
+        await inter.response.send_message(f"✅ Auto-delete is **ON**: older than **{time_str}**.", ephemeral=True)
     else:
         await inter.response.send_message("❌ Auto-delete is **OFF** for this channel.", ephemeral=True)
 

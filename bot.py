@@ -1303,29 +1303,68 @@ async def inventory_cmd(inter: discord.Interaction, user: Optional[discord.User]
 
 @tree.command(name="fish", description="Go fishing! Requires a Fishing Pole and 1 bait (Basic or Premium).")
 async def fish_cmd(inter: discord.Interaction):
+    """Fishing with a 'Fish again' button. Consumes bait each time."""
     uid = inter.user.id
-    # Checks
-    if not store.has_item(uid, "Fishing Pole", 1):
-        return await inter.response.send_message("You need a **Fishing Pole**. Buy one with `/buy Fishing Pole`.", ephemeral=True)
-    bait_type = None
-    if store.has_item(uid, "Premium Bait", 1):
-        bait_type = "Premium Bait"
-        table = FISH_TABLE_PREMIUM
-    elif store.has_item(uid, "Basic Bait", 1):
-        bait_type = "Basic Bait"
-        table = FISH_TABLE_BASIC
-    else:
-        return await inter.response.send_message("You need **Basic Bait** or **Premium Bait**.", ephemeral=True)
-    # Consume bait
-    store.remove_item(uid, bait_type, 1)
-    catch = weighted_choice(table)
-    store.add_item(uid, catch, 1)
-    sell_val = SHOP_CATALOG.get(catch, {}).get("sell", 0) or 0
-    flair = "🎣"
-    if "Rare" in catch: flair = "💎"
-    if "Epic" in catch: flair = "🌟"
-    await inter.response.send_message(f"{flair} You cast your line using **{bait_type}** and caught **{catch}**! (Sell value: **{sell_val}** cr)")
 
+    def _fish_once(uid: int):
+        # Checks
+        if not store.has_item(uid, "Fishing Pole", 1):
+            return None, None, None, None, "You need a **Fishing Pole**. Buy one with `/buy Fishing Pole`."
+        bait_type = None
+        if store.has_item(uid, "Premium Bait", 1):
+            bait_type = "Premium Bait"
+            table = FISH_TABLE_PREMIUM
+        elif store.has_item(uid, "Basic Bait", 1):
+            bait_type = "Basic Bait"
+            table = FISH_TABLE_BASIC
+        else:
+            return None, None, None, None, "You need **Basic Bait** or **Premium Bait**."
+        # Consume bait
+        store.remove_item(uid, bait_type, 1)
+        catch = weighted_choice(table)
+        store.add_item(uid, catch, 1)
+        sell_val = SHOP_CATALOG.get(catch, {}).get("sell", 0) or 0
+        flair = "🎣"
+        if "Rare" in catch: flair = "💎"
+        if "Epic" in catch: flair = "🌟"
+        return bait_type, catch, sell_val, flair, None
+
+    class FishAgainView(discord.ui.View):
+        def __init__(self, uid: int, timeout: float = 180):
+            super().__init__(timeout=timeout)
+            self.uid = uid
+
+        async def interaction_check(self, interaction: discord.Interaction) -> bool:
+            if interaction.user.id != self.uid:
+                await interaction.response.send_message("This isn’t your fishing session.", ephemeral=True)
+                return False
+            return True
+
+        @discord.ui.button(label="🎣 Fish again", style=discord.ButtonStyle.primary)
+        async def fish_again(self, interaction: discord.Interaction, button: discord.ui.Button):
+            bait_type, catch, sell_val, flair, err = _fish_once(self.uid)
+            if err:
+                # Disable button if they can't fish anymore
+                button.disabled = True
+                await interaction.response.edit_message(content=err, view=self)
+                return
+            emb = discord.Embed(
+                title="Gone Fishin'",
+                description=f"{flair} You cast your line using **{bait_type}** and caught **{catch}**! (Sell value: **{sell_val}** cr)"
+            )
+            await interaction.response.edit_message(embed=emb, view=self)
+
+    # Run the first cast and send initial message with the view
+    bait_type, catch, sell_val, flair, err = _fish_once(uid)
+    view = FishAgainView(uid=uid)
+    if err:
+        await inter.response.send_message(err, ephemeral=True)
+        return
+    emb = discord.Embed(
+        title="Gone Fishin'",
+        description=f"{flair} You cast your line using **{bait_type}** and caught **{catch}**! (Sell value: **{sell_val}** cr)"
+    )
+    await inter.response.send_message(embed=emb, view=view)
 # ---------- Notes ----------
 @tree.command(name="note_add", description="Save a personal note.")
 async def note_add(inter: discord.Interaction, text: str):

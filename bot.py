@@ -1072,12 +1072,6 @@ async def weather_scheduler():
 @weather_scheduler.before_loop
 async def before_weather():
     await bot.wait_until_ready()
-
-
-@weather_scheduler.before_loop
-async def before_weather():
-    await bot.wait_until_ready()
-
 async def before_weather():
     await bot.wait_until_ready()
 
@@ -2739,9 +2733,6 @@ def main():
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set")
     bot.run(token)
-
-if __name__ == "__main__":
-    main()
 # ========================= NEW GAMES: Roulette & Texas Hold'em =========================
 
 # ---------- Roulette ----------
@@ -3096,3 +3087,6 @@ async def holdem_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 1,
         await msg.edit(embed=showdown)
     except discord.HTTPException:
         await inter.followup.send(embed=showdown)
+
+if __name__ == "__main__":
+    main()

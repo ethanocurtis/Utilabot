@@ -13,7 +13,6 @@ Now includes an **admin allowlist** so you can give extra users access to admin 
    - [Reminders](#reminders)
    - [Notes](#notes)
    - [Polls](#polls)
-   - [Price Tracker](#price-tracker)
    - [Moderation Tools](#moderation-tools)
    - [Admin Allowlist](#admin-allowlist)
 2. [Installation](#installation)
@@ -71,11 +70,6 @@ Now includes an **admin allowlist** so you can give extra users access to admin 
 - Interactive voting buttons (fixed button bug from previous version)  
 - `/poll_vote id:<int> option:<str>` — vote on a poll  
 - `/poll_status id:<int>` — view poll results  
-
-### Price Tracker
-- `/price_add <item|link>` — add item with auto-fetched or mock price  
-- `/price_list` — list tracked items with clickable links  
-- `/price_remove <item>` — remove from tracker  
 
 ### Moderation Tools
 (Admins or allowlisted users only)  

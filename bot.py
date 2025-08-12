@@ -122,15 +122,18 @@ def wx_color_from_temp_f(temp_f: float):
     if t <= 95:   return discord.Colour.from_rgb(255, 120, 80)
     return discord.Colour.from_rgb(230, 60, 60)
 
-def fmt_sun(dt_str: str, tz_name: str = DEFAULT_TZ_NAME):
+def fmt_sun(dt_str: str):
     try:
-        # dt_str like "2025-08-10T06:05"
-        y, m, d = map(int, dt_str[:10].split("-"))
-        hh, mm = map(int, dt_str[11:16].split(":"))
-        tz = _chicago_tz_for(datetime(y, m, d))
-        return datetime(y, m, d, hh, mm, tzinfo=timezone.utc).astimezone(tz).strftime("%I:%M %p")
+        # Open-Meteo returns local times when 'timezone=auto' is used, potentially without an offset.
+        # We display the time as-is in that local timezone (or obey the embedded offset if present).
+        dt = datetime.fromisoformat(dt_str)
+        return dt.strftime("%I:%M %p")
     except Exception:
-        return dt_str
+        # Fallback: slice HH:MM
+        try:
+            return f"{dt_str[11:13]}:{dt_str[14:16]}"  # naive HH:MM
+        except Exception:
+            return dt_str
 
 # ---------- NEW: Shop & Inventory Config ----------
 # name -> dict(price, sell, desc)
@@ -845,7 +848,7 @@ async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str
     return city, state, lat, lon
 
 
-async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float, days: int, tz_name: str = DEFAULT_TZ_NAME):
+async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float, days: int, tz_name: str = "auto"):
     params = {
         "latitude": lat, "longitude": lon,
         "timezone": tz_name,
@@ -1015,7 +1018,7 @@ async def weather_scheduler():
                         user = await bot.fetch_user(int(s["user_id"]))
                         city, state, lat, lon = await _zip_to_place_and_coords(session, s["zip"])
                         if s["cadence"] == "daily":
-                            outlook = await _fetch_outlook(session, lat, lon, days=2, tz_name=DEFAULT_TZ_NAME)
+                            outlook = await _fetch_outlook(session, lat, lon, days=2)
                             # Outlook is list of tuples: (date, line, sunrise, sunset, uv, hi)
                             title_icon = wx_icon_desc(0)[0]
                             first_hi = outlook[0][5] if outlook and outlook[0][5] is not None else None
@@ -1042,7 +1045,7 @@ async def weather_scheduler():
                         else:
                             days = int(s.get("weekly_days", 7))
                             days = 10 if days > 10 else (3 if days < 3 else days)
-                            outlook = await _fetch_outlook(session, lat, lon, days=days, tz_name=DEFAULT_TZ_NAME)
+                            outlook = await _fetch_outlook(session, lat, lon, days=days)
                             first_hi = outlook[0][5] if outlook and outlook[0][5] is not None else None
                             emb = discord.Embed(
                                 title=f"🗓️ Weekly Outlook ({days} days) — {city}, {state} {s['zip']}",

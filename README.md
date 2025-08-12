@@ -78,13 +78,18 @@ Now includes an **admin allowlist** so you can give extra users access to admin 
 - `/price_remove <item>` — remove from tracker  
 
 ### Moderation Tools
-(Admins or allowlisted users only)
-- `/purge limit:<1-1000> [user:@user]` — bulk delete recent messages  
-- `/autodelete_set minutes:<1-1440>` — auto-delete messages in a channel after X minutes  
+(Admins or allowlisted users only)  
+- `/purge limit:<1-1000> [user:@user]` — bulk delete recent messages (pinned messages are now **always skipped**)  
+- `/autodelete_set duration:<value>` — set auto-delete time in **seconds** (`10s`) or **minutes** (`2m` or `2`)  
+  - If set to **under 60 seconds**, messages are deleted almost instantly on a per-message basis  
+  - If **60 seconds or more**, deletion is handled by the periodic cleanup loop (~2 min check)  
+  - Pinned messages are **never deleted** by auto-delete  
 - `/autodelete_disable` — disable auto-delete in the channel  
-- `/autodelete_status` — check current auto-delete settings  
+- `/autodelete_status` — check current auto-delete settings with formatted time display  
 
-> Discord bulk delete cannot remove messages older than 14 days.
+> Discord bulk delete cannot remove messages older than 14 days.  
+> Pinned messages are never removed by purge or auto-delete.
+
 
 ### Admin Allowlist
 - `/admin_allow @user` — give a user access to admin commands without making them a Discord admin  

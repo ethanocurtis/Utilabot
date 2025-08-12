@@ -2008,6 +2008,8 @@ async def purge(inter: discord.Interaction, limit: app_commands.Range[int, 1, 10
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("This command can only be used in text channels.", ephemeral=True)
     def check(m: discord.Message):
+        if getattr(m, 'pinned', False):
+            return False
         return (user is None) or (m.author.id == user.id)
     await inter.response.defer(ephemeral=True)
     try:
@@ -2026,7 +2028,6 @@ async def autodelete_set(inter: discord.Interaction, duration: str):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
 
     s = duration.strip().lower()
-
     # Parse duration -> seconds
     if s.endswith("s"):
         try:
@@ -2040,7 +2041,7 @@ async def autodelete_set(inter: discord.Interaction, duration: str):
             return await inter.response.send_message("Invalid minutes format. Try like **2m**.", ephemeral=True)
     else:
         try:
-            seconds = int(s) * 60  # default to minutes
+            seconds = int(s) * 60  # default to minutes if no unit
         except ValueError:
             return await inter.response.send_message("Invalid format. Use **10s**, **2m**, or a number for minutes.", ephemeral=True)
 
@@ -2050,7 +2051,7 @@ async def autodelete_set(inter: discord.Interaction, duration: str):
 
     store.set_autodelete(inter.channel.id, int(seconds))
 
-    # Nice confirmation
+    # Nice confirmation text
     if seconds < 60:
         time_str = f"{seconds} seconds"
     elif seconds % 3600 == 0:
@@ -2061,7 +2062,6 @@ async def autodelete_set(inter: discord.Interaction, duration: str):
         time_str = f"{seconds // 60} minutes {seconds % 60} seconds"
 
     await inter.response.send_message(f"🗑️ Auto-delete enabled: older than **{time_str}**.", ephemeral=True)
-
 @tree.command(name="autodelete_disable", description="Disable auto-delete for this channel.")
 @require_admin_or_allowlisted()
 async def autodelete_disable(inter: discord.Interaction):
@@ -2128,9 +2128,20 @@ async def cleanup_loop():
         channel = bot.get_channel(int(chan_id))
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             continue
+        try:
+            secs = int(secs)
+        except Exception:
+            secs = int(float(secs))
+        # Skip short TTLs (<60s); those are handled by per-message deletes.
+        if secs < 60:
+            continue
         cutoff = now - timedelta(seconds=int(secs))
         try:
-            await channel.purge(limit=1000, check=lambda m: m.created_at < cutoff, bulk=True)
+            await channel.purge(
+                limit=1000,
+                check=lambda m: (not getattr(m, "pinned", False)) and (m.created_at < cutoff),
+                bulk=True,
+            )
         except (discord.Forbidden, discord.HTTPException):
             continue
 
@@ -2274,6 +2285,51 @@ async def reminders_scheduler():
                 except Exception:
                     pass
                 store.cancel_reminder(int(r.get("id", 0)), requester_id=0, is_mod=True)
+    except Exception:
+        pass
+
+# ---------- Per-message auto-delete for short TTL channels (<60s) ----------
+async def _schedule_autodelete(message: discord.Message, seconds: int):
+    try:
+        await asyncio.sleep(max(1, int(seconds)))
+        # Re-fetch before delete to ensure we respect pin status or late edits
+        try:
+            msg = await message.channel.fetch_message(message.id)
+        except Exception:
+            return
+        if getattr(msg, "pinned", False):
+            return  # never delete pins
+        await msg.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        # Lack of perms or already deleted — ignore
+        pass
+    except Exception:
+        pass
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Skip system messages and if we can't determine a channel
+    if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+        return
+    # Don't act if the bot lacks perms here
+    try:
+        perms = message.channel.permissions_for(message.guild.me) if message.guild else None
+        if not perms or not perms.manage_messages:
+            return
+    except Exception:
+        pass
+    try:
+        conf = store.get_autodelete()
+        secs = conf.get(str(message.channel.id))
+        if not secs:
+            return
+        try:
+            secs = int(secs)
+        except Exception:
+            secs = int(float(secs))
+        if secs < 60:
+            # Schedule a per-message delete; we will re-check pin before deletion
+            asyncio.create_task(_schedule_autodelete(message, secs))
     except Exception:
         pass
 

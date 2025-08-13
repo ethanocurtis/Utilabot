@@ -3060,3 +3060,53 @@ async def holdem_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 1,
         await inter.followup.send(embed=showdown)
 if __name__ == '__main__':
     main()
+
+
+# ===== Auto sync slash commands (no cogs) =====
+import os, traceback, discord
+from discord import app_commands
+from typing import Literal
+
+GUILD_IDS = [int(x) for x in os.getenv("GUILD_IDS", "").replace(" ", "").split(",") if x.isdigit()]
+
+@bot.event
+async def setup_hook():
+    try:
+        if GUILD_IDS:
+            for gid in GUILD_IDS:
+                cmds = await tree.sync(guild=discord.Object(id=gid))
+                print(f"[sync] {len(cmds)} commands -> guild {gid}")
+        else:
+            cmds = await tree.sync()
+            print(f"[sync] global {len(cmds)} commands")
+    except Exception:
+        print("[sync] FAILED\n" + traceback.format_exc())
+
+@tree.command(name="ping", description="Ping (quick test)")
+async def _ping_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong!", ephemeral=True)
+
+@tree.command(name="resync", description="Resync slash commands")
+@app_commands.describe(scope="Where to sync: guild or global")
+async def _resync_cmd(interaction: discord.Interaction, scope: Literal["guild","global"]="guild"):
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("❌ Need Manage Server.", ephemeral=True)
+    try:
+        if scope == "guild" and interaction.guild:
+            cmds = await tree.sync(guild=interaction.guild)
+            await interaction.response.send_message(f"🔁 Synced **{len(cmds)}** to this guild.", ephemeral=True)
+        else:
+            cmds = await tree.sync()
+            await interaction.response.send_message(f"🌐 Globally synced **{len(cmds)}**.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"⚠️ Sync failed: `{e}`", ephemeral=True)
+
+@tree.command(name="debug_commands", description="List registered slash commands")
+async def _debug_commands(interaction: discord.Interaction):
+    here = [c.name for c in tree.get_commands(guild=interaction.guild)]
+    global_cmds = [c.name for c in tree.get_commands(guild=None)]
+    await interaction.response.send_message(
+        f"Here: {', '.join(here) or '—'}\nGlobal: {', '.join(global_cmds) or '—'}",
+        ephemeral=True,
+    )
+# =============================================

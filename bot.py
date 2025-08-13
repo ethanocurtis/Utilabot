@@ -14,6 +14,7 @@ from discord import app_commands
 import aiohttp
 import html
 import urllib.parse
+import sqlite3  # NEW
 
 try:
     from zoneinfo import ZoneInfo
@@ -22,6 +23,7 @@ except Exception:
 
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
+DB_PATH = os.environ.get("DB_PATH", "/app/data/bot.db")
 GUILD_IDS: List[int] = []  # e.g., [123456789012345678] for faster guild sync
 
 STARTING_DAILY = 250
@@ -174,396 +176,484 @@ def weighted_choice(pairs: List[Tuple[str, float]]) -> str:
             return name
     return pairs[-1][0]
 
-# ---------- Simple JSON Store ----------
-def _ensure_shape(data: dict) -> dict:
-    # Base structures
-    def ensure_dict(key):
-        if not isinstance(data.get(key), dict):
-            data[key] = {}
-    def ensure_list(key):
-        if not isinstance(data.get(key), list):
-            data[key] = []
-
-    ensure_dict("wallets")
-    ensure_dict("daily")
-    ensure_dict("autodelete")
-    ensure_dict("stats")
-    ensure_dict("achievements")
-    ensure_dict("work")
-    ensure_dict("streaks")
-    ensure_dict("trivia")
-
-    # Weather subscriptions
-    ensure_dict("weather")
-    if not isinstance(data["weather"].get("subs"), dict):
-        data["weather"]["subs"] = {}
-    if not isinstance(data["weather"].get("zips"), dict):
-        data["weather"]["zips"] = {}
-    if not isinstance(data["weather"].get("seq"), int):
-        data["weather"]["seq"] = 0
-
-    ensure_dict("notes")
-    ensure_dict("pins")
-
-    ensure_dict("polls")
-
-    ensure_dict("reminders")
-    if not isinstance(data.get("reminder_seq"), int):
-        data["reminder_seq"] = 0
-
-    # Admin allowlist (new)
-    ensure_list("admin_allowlist")
-
-    # NEW: Inventory map
-    ensure_dict("inventory")
-
-    return data
-
-
+# ---------- SQLite Store (drop-in replacement for JSON) ----------
 class Store:
-    def __init__(self, path: str):
-        self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(_ensure_shape({}), f)
+    def __init__(self, json_path: str):
+        self.json_path = json_path
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        self.db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=WAL;")
+        self.db.execute("PRAGMA foreign_keys=ON;")
+        self._init_db()
+        # Migrate data from JSON if present (first-ever run)
+        self._maybe_migrate_from_json()
+        # Ensure schema matches per-user ID model (id per user, not global)
+        self._migrate_schema_if_needed()
 
-    def read(self) -> dict:
+    # ---------- schema ----------
+    def _init_db(self):
+        c = self.db.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS wallets (user_id INTEGER PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS inventory (user_id INTEGER NOT NULL, item TEXT NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY(user_id,item))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily (user_id INTEGER PRIMARY KEY, last_iso TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS work (user_id INTEGER PRIMARY KEY, last_iso TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS streaks (user_id INTEGER PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, last_date TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS stats (user_id INTEGER PRIMARY KEY, wins INTEGER NOT NULL DEFAULT 0, losses INTEGER NOT NULL DEFAULT 0, pushes INTEGER NOT NULL DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS achievements (user_id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY(user_id, name))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS autodelete (channel_id INTEGER PRIMARY KEY, seconds INTEGER NOT NULL)""")
+        # Notes: per-user IDs; keep text
+        c.execute("""CREATE TABLE IF NOT EXISTS notes (user_id INTEGER NOT NULL, id INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY(user_id, id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS pins (channel_id INTEGER PRIMARY KEY, text TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS polls (message_id INTEGER PRIMARY KEY, json TEXT NOT NULL, is_open INTEGER NOT NULL DEFAULT 1)""")
+        # Reminders: per-user IDs
+        c.execute("""CREATE TABLE IF NOT EXISTS reminders (user_id INTEGER NOT NULL, id INTEGER NOT NULL, channel_id INTEGER, dm INTEGER NOT NULL, text TEXT NOT NULL, due_utc TEXT NOT NULL, PRIMARY KEY(user_id, id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS admin_allowlist (user_id INTEGER PRIMARY KEY)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS weather_zips (user_id INTEGER PRIMARY KEY, zip TEXT NOT NULL)""")
+        # Weather subs: per-user IDs
+        c.execute("""CREATE TABLE IF NOT EXISTS weather_subs (user_id INTEGER NOT NULL, id INTEGER NOT NULL, zip TEXT NOT NULL, cadence TEXT NOT NULL, hh INTEGER NOT NULL, mi INTEGER NOT NULL, weekly_days INTEGER NOT NULL DEFAULT 7, next_run_utc TEXT, PRIMARY KEY(user_id, id))""")
+
+    # ---------- shape helper for JSON migration ----------
+    def _ensure_shape(self, data: dict) -> dict:
+        def gd(k): 
+            if k not in data or not isinstance(data[k], dict): data[k] = {}
+        def gl(k): 
+            if k not in data or not isinstance(data[k], list): data[k] = []
+        gd("wallets"); gd("daily"); gd("autodelete"); gd("stats"); gd("achievements"); gd("work"); gd("streaks"); gd("trivia")
+        gd("weather"); gd("notes"); gd("pins"); gd("polls"); gd("reminders"); gl("admin_allowlist"); gd("inventory")
+        if "subs" not in data["weather"] or not isinstance(data["weather"]["subs"], dict): data["weather"]["subs"] = {}
+        if "zips" not in data["weather"] or not isinstance(data["weather"]["zips"], dict): data["weather"]["zips"] = {}
+        if "seq" not in data["weather"] or not isinstance(data["weather"]["seq"], int): data["weather"]["seq"] = 0
+        if "reminder_seq" not in data or not isinstance(data["reminder_seq"], int): data["reminder_seq"] = 0
+        return data
+
+    # ---------- JSON -> SQLite (one-time) ----------
+    def _maybe_migrate_from_json(self):
+        if not os.path.exists(self.json_path):
+            return
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
+            with open(self.json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
-            data = {}
-        return _ensure_shape(data)
+            return
+        # Heuristic: if wallets already populated, assume migrated
+        if self.db.execute("SELECT COUNT(*) FROM wallets").fetchone()[0] > 0:
+            return
+        data = self._ensure_shape(data)
 
-    def write(self, data: dict):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_ensure_shape(data), f, indent=2)
-        os.replace(tmp, self.path)
+        # wallets
+        for uid, bal in data["wallets"].items():
+            self.db.execute("INSERT INTO wallets(user_id, balance) VALUES(?,?)", (int(uid), int(bal)))
+        # inventory
+        for uid, inv in data.get("inventory", {}).items():
+            for item, qty in inv.items():
+                self.db.execute("INSERT INTO inventory(user_id,item,qty) VALUES(?,?,?)", (int(uid), item, int(qty)))
+        # cooldowns/streaks
+        for uid, ts in data["daily"].items():
+            self.db.execute("INSERT INTO daily(user_id,last_iso) VALUES(?,?)", (int(uid), ts))
+        for uid, ts in data["work"].items():
+            self.db.execute("INSERT INTO work(user_id,last_iso) VALUES(?,?)", (int(uid), ts))
+        for uid, st in data["streaks"].items():
+            self.db.execute("INSERT INTO streaks(user_id,count,last_date) VALUES(?,?,?)",
+                            (int(uid), int(st.get("count", 0)), st.get("last_date")))
+        # stats & achievements
+        for uid, s in data["stats"].items():
+            self.db.execute("INSERT INTO stats(user_id,wins,losses,pushes) VALUES(?,?,?,?)",
+                            (int(uid), int(s.get("wins",0)), int(s.get("losses",0)), int(s.get("pushes",0))))
+        for uid, arr in data["achievements"].items():
+            for name in arr:
+                self.db.execute("INSERT OR IGNORE INTO achievements(user_id,name) VALUES(?,?)", (int(uid), name))
+        # autodelete
+        for cid, secs in data["autodelete"].items():
+            try: secs = int(secs)
+            except Exception: secs = int(float(secs))
+            self.db.execute("INSERT INTO autodelete(channel_id,seconds) VALUES(?,?)", (int(cid), secs))
+        # notes -> assign per-user sequential IDs starting at 1
+        for uid, arr in data["notes"].items():
+            note_id = 1
+            for text in arr:
+                self.db.execute("INSERT INTO notes(user_id,id,text) VALUES(?,?,?)", (int(uid), note_id, text))
+                note_id += 1
+        # pins
+        for cid, txt in data["pins"].items():
+            self.db.execute("INSERT INTO pins(channel_id,text) VALUES(?,?)", (int(cid), txt))
+        # polls
+        for mid, p in data["polls"].items():
+            self.db.execute("INSERT INTO polls(message_id,json,is_open) VALUES(?,?,?)",
+                            (int(mid), json.dumps(p), 1 if p.get("open", True) else 0))
+        # reminders -> per-user IDs, compact
+        by_user = {}
+        for rid, r in data["reminders"].items():
+            uid = int(r.get("user_id",0))
+            by_user.setdefault(uid, []).append(r)
+        for uid, items in by_user.items():
+            # preserve order by due_utc then text
+            items.sort(key=lambda x: (str(x.get("due_utc")), str(x.get("text",""))))
+            next_id = 1
+            for r in items:
+                self.db.execute("""INSERT INTO reminders(user_id,id,channel_id,dm,text,due_utc)
+                                   VALUES(?,?,?,?,?,?)""",
+                                (uid,
+                                 next_id,
+                                 (None if not r.get("channel_id") else int(r.get("channel_id"))),
+                                 1 if r.get("dm") else 0,
+                                 str(r.get("text","")),
+                                 str(r.get("due_utc"))))
+                next_id += 1
+        # admin allowlist
+        for uid in data["admin_allowlist"]:
+            self.db.execute("INSERT OR IGNORE INTO admin_allowlist(user_id) VALUES(?)", (int(uid),))
+        # weather defaults + subs
+        for uid, z in data["weather"]["zips"].items():
+            self.db.execute("INSERT INTO weather_zips(user_id,zip) VALUES(?,?)", (int(uid), str(z)))
+        subs_by_user = {}
+        for sid, s in data["weather"]["subs"].items():
+            uid = int(s.get("user_id"))
+            subs_by_user.setdefault(uid, []).append(s)
+        for uid, items in subs_by_user.items():
+            items.sort(key=lambda x: (str(x.get("zip","")), int(x.get("hh",8)), int(x.get("mi",0))))
+            next_id = 1
+            for s in items:
+                self.db.execute("""INSERT INTO weather_subs(user_id,id,zip,cadence,hh,mi,weekly_days,next_run_utc)
+                                   VALUES(?,?,?,?,?,?,?,?)""",
+                                (uid, next_id, str(s.get("zip","")), str(s.get("cadence","daily")),
+                                 int(s.get("hh",8)), int(s.get("mi",0)), int(s.get("weekly_days",7)), s.get("next_run_utc")))
+                next_id += 1
+        # trivia token
+        tok = data.get("trivia", {}).get("token")
+        if tok:
+            self.db.execute("INSERT OR REPLACE INTO kv(key,value) VALUES('trivia_token',?)", (tok,))
+        try:
+            os.replace(self.json_path, self.json_path + ".migrated.bak")
+        except Exception:
+            pass
 
-    # Wallet helpers
+    # ---------- schema migrations (SQLite -> SQLite) ----------
+    def _migrate_schema_if_needed(self):
+        # notes: ensure (user_id,id,text) primary key (user_id,id)
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(notes)").fetchall()]
+        if cols == ["user_id","text"]:  # old schema from first SQLite version
+            self.db.execute("""CREATE TABLE IF NOT EXISTS notes_new (user_id INTEGER NOT NULL, id INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY(user_id,id))""")
+            # assign per-user sequential ids by rowid order
+            rows = self.db.execute("SELECT rowid, user_id, text FROM notes ORDER BY user_id, rowid").fetchall()
+            current_uid = None
+            next_id = 1
+            for _, uid, text in rows:
+                uid = int(uid)
+                if uid != current_uid:
+                    current_uid = uid
+                    next_id = 1
+                self.db.execute("INSERT INTO notes_new(user_id,id,text) VALUES(?,?,?)", (uid, next_id, text))
+                next_id += 1
+            self.db.execute("DROP TABLE notes")
+            self.db.execute("ALTER TABLE notes_new RENAME TO notes")
+
+        # reminders: move to composite PK (user_id,id) if needed
+        cols_r = [r[1] for r in self.db.execute("PRAGMA table_info(reminders)").fetchall()]
+        if cols_r == ["id","user_id","channel_id","dm","text","due_utc"]:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS reminders_new (user_id INTEGER NOT NULL, id INTEGER NOT NULL, channel_id INTEGER, dm INTEGER NOT NULL, text TEXT NOT NULL, due_utc TEXT NOT NULL, PRIMARY KEY(user_id,id))""")
+            rows = self.db.execute("SELECT id,user_id,channel_id,dm,text,due_utc FROM reminders ORDER BY user_id, id").fetchall()
+            for rid, uid, cid, dm, text, due in rows:
+                self.db.execute("""INSERT INTO reminders_new(user_id,id,channel_id,dm,text,due_utc) VALUES(?,?,?,?,?,?)""",
+                                (int(uid), int(rid), cid, dm, text, due))
+            self.db.execute("DROP TABLE reminders")
+            self.db.execute("ALTER TABLE reminders_new RENAME TO reminders")
+
+        # weather_subs: move to composite PK (user_id,id) if needed
+        cols_w = [r[1] for r in self.db.execute("PRAGMA table_info(weather_subs)").fetchall()]
+        if cols_w == ["id","user_id","zip","cadence","hh","mi","weekly_days","next_run_utc"]:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS weather_subs_new (user_id INTEGER NOT NULL, id INTEGER NOT NULL, zip TEXT NOT NULL, cadence TEXT NOT NULL, hh INTEGER NOT NULL, mi INTEGER NOT NULL, weekly_days INTEGER NOT NULL DEFAULT 7, next_run_utc TEXT, PRIMARY KEY(user_id,id))""")
+            rows = self.db.execute("SELECT id,user_id,zip,cadence,hh,mi,weekly_days,next_run_utc FROM weather_subs ORDER BY user_id, id").fetchall()
+            for sid, uid, z, cad, hh, mi, wdays, next_run in rows:
+                self.db.execute("""INSERT INTO weather_subs_new(user_id,id,zip,cadence,hh,mi,weekly_days,next_run_utc) VALUES(?,?,?,?,?,?,?,?)""",
+                                (int(uid), int(sid), z, cad, hh, mi, wdays, next_run))
+            self.db.execute("DROP TABLE weather_subs")
+            self.db.execute("ALTER TABLE weather_subs_new RENAME TO weather_subs")
+
+    # ---------- ID allocation helpers ----------
+    def _lowest_free_id_for_user(self, table: str, user_id: int) -> int:
+        cur = self.db.execute(f"SELECT id FROM {table} WHERE user_id=? ORDER BY id", (int(user_id),))
+        used = [row[0] for row in cur.fetchall()]
+        i = 1
+        for u in used:
+            if u == i:
+                i += 1
+            elif u > i:
+                break
+        return i
+
+    # ---------- Debug / Health ----------
+    def get_backend_stats(self) -> dict:
+        tables = ["wallets","inventory","daily","work","streaks","stats","achievements","autodelete","notes","pins","polls","reminders","admin_allowlist","weather_zips","weather_subs"]
+        counts = {}
+        for t in tables:
+            try:
+                counts[t] = int(self.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])
+            except Exception:
+                counts[t] = 0
+        return {"backend":"sqlite","db_path":DB_PATH, "counts":counts}
+
+    # ---------- wallets ----------
     def get_balance(self, user_id: int) -> int:
-        data = self.read()
-        return int(data["wallets"].get(str(user_id), 0))
+        row = self.db.execute("SELECT balance FROM wallets WHERE user_id=?", (int(user_id),)).fetchone()
+        return int(row[0]) if row else 0
 
     def add_balance(self, user_id: int, amount: int):
-        data = self.read()
-        key = str(user_id)
-        data["wallets"][key] = int(data["wallets"].get(key, 0)) + int(amount)
-        self.write(data)
+        self.db.execute("""INSERT INTO wallets(user_id,balance) VALUES(?,?)
+                           ON CONFLICT(user_id) DO UPDATE SET balance=wallets.balance+excluded.balance""",
+                        (int(user_id), int(amount)))
 
     def set_balance(self, user_id: int, amount: int):
-        data = self.read()
-        data["wallets"][str(user_id)] = int(amount)
-        self.write(data)
+        self.db.execute("""INSERT INTO wallets(user_id,balance) VALUES(?,?)
+                           ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance""", (int(user_id), int(amount)))
 
-    # NEW: Inventory helpers
-    def get_inventory(self, user_id: int) -> Dict[str, int]:
-        data = self.read()
-        return {k: int(v) for k, v in data["inventory"].get(str(user_id), {}).items()}
+    # ---------- inventory ----------
+    def get_inventory(self, user_id: int) -> dict:
+        rows = self.db.execute("SELECT item, qty FROM inventory WHERE user_id=?", (int(user_id),)).fetchall()
+        return {item: int(qty) for item, qty in rows}
 
     def add_item(self, user_id: int, item_name: str, qty: int = 1):
-        if qty == 0:
-            return
-        data = self.read()
-        inv = data["inventory"].get(str(user_id), {})
-        inv[item_name] = int(inv.get(item_name, 0)) + int(qty)
-        if inv[item_name] <= 0:
-            inv.pop(item_name, None)
-        data["inventory"][str(user_id)] = inv
-        self.write(data)
+        if int(qty) == 0: return
+        self.db.execute("""INSERT INTO inventory(user_id,item,qty) VALUES(?,?,?)
+                           ON CONFLICT(user_id,item) DO UPDATE SET qty=inventory.qty+excluded.qty""",
+                        (int(user_id), item_name, int(qty)))
+        self.db.execute("DELETE FROM inventory WHERE user_id=? AND item=? AND qty<=0", (int(user_id), item_name))
 
     def remove_item(self, user_id: int, item_name: str, qty: int = 1) -> bool:
-        data = self.read()
-        inv = data["inventory"].get(str(user_id), {})
+        inv = self.get_inventory(user_id)
         have = int(inv.get(item_name, 0))
-        if have < qty:
-            return False
-        inv[item_name] = have - qty
-        if inv[item_name] <= 0:
-            inv.pop(item_name, None)
-        data["inventory"][str(user_id)] = inv
-        self.write(data)
+        if have < int(qty): return False
+        self.add_item(user_id, item_name, -int(qty))
         return True
 
     def has_item(self, user_id: int, item_name: str, qty: int = 1) -> bool:
-        inv = self.get_inventory(user_id)
-        return inv.get(item_name, 0) >= qty
+        return self.get_inventory(user_id).get(item_name, 0) >= int(qty)
 
-    # Daily helpers
-    def get_last_daily(self, user_id: int) -> Optional[str]:
-        data = self.read()
-        return data["daily"].get(str(user_id))
+    # ---------- daily/work/streaks ----------
+    def get_last_daily(self, user_id: int):
+        row = self.db.execute("SELECT last_iso FROM daily WHERE user_id=?", (int(user_id),)).fetchone()
+        return row[0] if row else None
 
     def set_last_daily(self, user_id: int, iso_ts: str):
-        data = self.read()
-        data["daily"][str(user_id)] = iso_ts
-        self.write(data)
+        self.db.execute("""INSERT INTO daily(user_id,last_iso) VALUES(?,?)
+                           ON CONFLICT(user_id) DO UPDATE SET last_iso=excluded.last_iso""", (int(user_id), iso_ts))
 
-    # Streak helpers
-    def get_streak(self, user_id: int) -> Dict[str, Any]:
-        data = self.read()
-        return data["streaks"].get(str(user_id), {"count": 0, "last_date": None})
-
-    def set_streak(self, user_id: int, count: int, last_date: Optional[str]):
-        data = self.read()
-        data["streaks"][str(user_id)] = {"count": int(count), "last_date": last_date}
-        self.write(data)
-
-    # Work cooldown
-    def get_last_work(self, user_id: int) -> Optional[str]:
-        data = self.read()
-        return data["work"].get(str(user_id))
+    def get_last_work(self, user_id: int):
+        row = self.db.execute("SELECT last_iso FROM work WHERE user_id=?", (int(user_id),)).fetchone()
+        return row[0] if row else None
 
     def set_last_work(self, user_id: int, iso_ts: str):
-        data = self.read()
-        data["work"][str(user_id)] = iso_ts
-        self.write(data)
+        self.db.execute("""INSERT INTO work(user_id,last_iso) VALUES(?,?)
+                           ON CONFLICT(user_id) DO UPDATE SET last_iso=excluded.last_iso""", (int(user_id), iso_ts))
 
-    # Auto-delete config
-    def get_autodelete(self) -> dict:
-        return self.read()["autodelete"]
+    def get_streak(self, user_id: int) -> dict:
+        row = self.db.execute("SELECT count,last_date FROM streaks WHERE user_id=?", (int(user_id),)).fetchone()
+        return {"count": int(row[0]), "last_date": row[1]} if row else {"count": 0, "last_date": None}
 
-    def set_autodelete(self, channel_id: int, seconds: int):
-        data = self.read()
-        data["autodelete"][str(channel_id)] = int(seconds)
-        self.write(data)
+    def set_streak(self, user_id: int, count: int, last_date: str | None):
+        self.db.execute("""INSERT INTO streaks(user_id,count,last_date) VALUES(?,?,?)
+                           ON CONFLICT(user_id) DO UPDATE SET count=excluded.count,last_date=excluded.last_date""",
+                        (int(user_id), int(count), last_date))
 
-    def remove_autodelete(self, channel_id: int):
-        data = self.read()
-        data["autodelete"].pop(str(channel_id), None)
-        self.write(data)
-
-    # Stats & achievements
+    # ---------- stats & achievements ----------
     def add_result(self, user_id: int, result: str):
-        data = self.read()
-        s = data["stats"].get(str(user_id), {"wins": 0, "losses": 0, "pushes": 0})
-        if result == "win":
-            s["wins"] += 1
-        elif result == "loss":
-            s["losses"] += 1
-        else:
-            s["pushes"] += 1
-        data["stats"][str(user_id)] = s
-        self.write(data)
+        col = "wins" if result=="win" else ("losses" if result=="loss" else "pushes")
+        self.db.execute("""INSERT INTO stats(user_id,wins,losses,pushes) VALUES(?,0,0,0)
+                           ON CONFLICT(user_id) DO NOTHING""", (int(user_id),))
+        self.db.execute(f"UPDATE stats SET {col}={col}+1 WHERE user_id=?", (int(user_id),))
 
     def get_stats(self, user_id: int) -> dict:
-        data = self.read()
-        return data["stats"].get(str(user_id), {"wins": 0, "losses": 0, "pushes": 0})
+        row = self.db.execute("SELECT wins,losses,pushes FROM stats WHERE user_id=?", (int(user_id),)).fetchone()
+        if not row: return {"wins":0,"losses":0,"pushes":0}
+        return {"wins": int(row[0]), "losses": int(row[1]), "pushes": int(row[2])}
 
     def list_top(self, key: str, limit: int = 10):
-        data = self.read()
         if key == "balance":
-            items = [(int(uid), int(bal)) for uid, bal in data["wallets"].items()]
-            items.sort(key=lambda x: x[1], reverse=True)
-            return items[:limit]
-        elif key == "wins":
-            stats = data["stats"]
-            items = [(int(uid), s.get("wins", 0)) for uid, s in stats.items()]
-            items.sort(key=lambda x: x[1], reverse=True)
-            return items[:limit]
+            rows = self.db.execute("SELECT user_id, balance FROM wallets ORDER BY balance DESC LIMIT ?", (int(limit),)).fetchall()
+            return [(int(uid), int(bal)) for uid, bal in rows]
+        if key == "wins":
+            rows = self.db.execute("SELECT user_id, wins FROM stats ORDER BY wins DESC LIMIT ?", (int(limit),)).fetchall()
+            return [(int(uid), int(w)) for uid, w in rows]
         return []
 
-    def get_achievements(self, user_id: int) -> List[str]:
-        data = self.read()
-        return data["achievements"].get(str(user_id), [])
+    def get_achievements(self, user_id: int) -> list[str]:
+        rows = self.db.execute("SELECT name FROM achievements WHERE user_id=?", (int(user_id),)).fetchall()
+        return [r[0] for r in rows]
 
     def award_achievement(self, user_id: int, name: str) -> bool:
-        data = self.read()
-        arr = data["achievements"].get(str(user_id), [])
-        if name not in arr:
-            arr.append(name)
-            data["achievements"][str(user_id)] = arr
-            self.write(data)
+        try:
+            self.db.execute("INSERT INTO achievements(user_id,name) VALUES(?,?)", (int(user_id), name))
             return True
-        return False
+        except sqlite3.IntegrityError:
+            return False
 
-    # Trivia token helpers
-    def get_trivia_token(self) -> Optional[str]:
-        data = self.read()
-        return data["trivia"].get("token")
+    # ---------- trivia token ----------
+    def get_trivia_token(self):
+        row = self.db.execute("SELECT value FROM kv WHERE key='trivia_token'").fetchone()
+        return row[0] if row else None
 
-    def set_trivia_token(self, token: Optional[str]):
-        data = self.read()
-        data['trivia']['token'] = token
-        self.write(data)
-    # Weather defaults & subscriptions
+    def set_trivia_token(self, token):
+        if token is None:
+            self.db.execute("DELETE FROM kv WHERE key='trivia_token'")
+        else:
+            self.db.execute("INSERT OR REPLACE INTO kv(key,value) VALUES('trivia_token',?)", (token,))
+
+    # ---------- weather defaults & subscriptions ----------
     def set_user_zip(self, user_id: int, zip_code: str):
-        data = self.read()
-        data["weather"]["zips"][str(user_id)] = str(zip_code)
-        self.write(data)
+        self.db.execute("""INSERT INTO weather_zips(user_id,zip) VALUES(?,?)
+                           ON CONFLICT(user_id) DO UPDATE SET zip=excluded.zip""", (int(user_id), str(zip_code)))
 
-    def get_user_zip(self, user_id: int) -> Optional[str]:
-        data = self.read()
-        return data["weather"]["zips"].get(str(user_id))
+    def get_user_zip(self, user_id: int):
+        row = self.db.execute("SELECT zip FROM weather_zips WHERE user_id=?", (int(user_id),)).fetchone()
+        return row[0] if row else None
 
     def add_weather_sub(self, sub: dict) -> int:
-        data = self.read()
-        sid = int(data["weather"].get("seq", 0)) + 1
-        data["weather"]["seq"] = sid
-        data["weather"]["subs"][str(sid)] = sub
-        self.write(data)
+        uid = int(sub["user_id"])
+        sid = self._lowest_free_id_for_user("weather_subs", uid)
+        self.db.execute("""INSERT INTO weather_subs(user_id,id,zip,cadence,hh,mi,weekly_days,next_run_utc)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (uid, sid, str(sub["zip"]), str(sub["cadence"]),
+                         int(sub["hh"]), int(sub["mi"]), int(sub.get("weekly_days",7)), sub.get("next_run_utc")))
         return sid
 
-    def list_weather_subs(self, user_id: Optional[int] = None) -> list:
-        data = self.read()
-        items = []
-        for sid, s in data["weather"]["subs"].items():
-            s2 = dict(s); s2["id"] = int(sid)
-            if user_id is None or int(s2.get("user_id", 0)) == int(user_id):
-                items.append(s2)
-        items.sort(key=lambda x: x.get("next_run_utc", ""))
-        return items
-
-    def remove_weather_sub(self, sid: int, requester_id: int) -> bool:
-        data = self.read()
-        s = data["weather"]["subs"].get(str(sid))
-        if not s:
-            return False
-        if int(s.get("user_id", 0)) != int(requester_id):
-            return False
-        data["weather"]["subs"].pop(str(sid), None)
-        self.write(data)
-        return True
-
-    def update_weather_sub(self, sid: int, **updates):
-        data = self.read()
-        key = str(sid)
-        if key not in data["weather"]["subs"]:
-            return False
-        s = data["weather"]["subs"][key]
-        s.update(updates)
-        data["weather"]["subs"][key] = s
-        self.write(data)
-        return True
-        data = self.read()
-        if token is None:
-            data["trivia"].pop("token", None)
+    def list_weather_subs(self, user_id: int | None = None) -> list:
+        if user_id is None:
+            q = "SELECT user_id,id,zip,cadence,hh,mi,weekly_days,next_run_utc FROM weather_subs ORDER BY user_id, id"
+            rows = self.db.execute(q).fetchall()
         else:
-            data["trivia"]["token"] = token
-        self.write(data)
-
-    # Notes
-    def add_note(self, user_id: int, text: str):
-        data = self.read()
-        arr = data["notes"].get(str(user_id), [])
-        arr.append(text)
-        data["notes"][str(user_id)] = arr
-        self.write(data)
-
-    def list_notes(self, user_id: int) -> List[str]:
-        data = self.read()
-        return data["notes"].get(str(user_id), [])
-
-    def delete_note(self, user_id: int, idx: int) -> bool:
-        data = self.read()
-        arr = data["notes"].get(str(user_id), [])
-        if 0 <= idx < len(arr):
-            arr.pop(idx)
-            data["notes"][str(user_id)] = arr
-            self.write(data)
-            return True
-        return False
-
-    # Pins
-    def set_pin(self, channel_id: int, text: str):
-        data = self.read()
-        data["pins"][str(channel_id)] = text
-        self.write(data)
-
-    def get_pin(self, channel_id: int) -> Optional[str]:
-        data = self.read()
-        return data["pins"].get(str(channel_id))
-
-    def clear_pin(self, channel_id: int):
-        data = self.read()
-        data["pins"].pop(str(channel_id), None)
-        self.write(data)
-
-    # Polls
-    def save_poll(self, message_id: int, poll: dict):
-        data = self.read()
-        data["polls"][str(message_id)] = poll
-        self.write(data)
-
-    def get_poll(self, message_id: int) -> Optional[dict]:
-        data = self.read()
-        return data["polls"].get(str(message_id))
-
-    def delete_poll(self, message_id: int):
-        data = self.read()
-        data["polls"].pop(str(message_id), None)
-        self.write(data)
-
-    def list_open_polls(self) -> List[Tuple[int, dict]]:
-        data = self.read()
+            q = "SELECT user_id,id,zip,cadence,hh,mi,weekly_days,next_run_utc FROM weather_subs WHERE user_id=? ORDER BY id"
+            rows = self.db.execute(q, (int(user_id),)).fetchall()
         out = []
-        for mid, p in data["polls"].items():
-            if p.get("open", True):
-                out.append((int(mid), p))
+        for uid, sid, z, cad, hh, mi, wdays, next_run in rows:
+            out.append({"user_id": int(uid), "id": int(sid), "zip": z, "cadence": cad,
+                        "hh": int(hh), "mi": int(mi), "weekly_days": int(wdays), "next_run_utc": next_run})
         return out
 
-    # Reminders
+    def remove_weather_sub(self, sid: int, requester_id: int) -> bool:
+        cur = self.db.execute("DELETE FROM weather_subs WHERE user_id=? AND id=?", (int(requester_id), int(sid)))
+        return cur.rowcount > 0
+
+    def update_weather_sub(self, sid: int, **updates):
+        uid = int(updates.pop("user_id", 0)) or None
+        if uid is None:
+            return False
+        allowed = {"zip","cadence","hh","mi","weekly_days","next_run_utc"}
+        cols, vals = [], []
+        for k, v in updates.items():
+            if k in allowed:
+                cols.append(f"{k}=?"); vals.append(v)
+        if not cols: return False
+        vals.extend([uid, int(sid)])
+        self.db.execute(f"UPDATE weather_subs SET {', '.join(cols)} WHERE user_id=? AND id=?", vals)
+        return True
+
+    # ---------- notes ----------
+    def add_note(self, user_id: int, text: str) -> int:
+        nid = self._lowest_free_id_for_user("notes", int(user_id))
+        self.db.execute("INSERT INTO notes(user_id,id,text) VALUES(?,?,?)", (int(user_id), nid, text))
+        return nid
+
+    def list_notes(self, user_id: int) -> list[tuple[int,str]]:
+        rows = self.db.execute("SELECT id, text FROM notes WHERE user_id=? ORDER BY id", (int(user_id),)).fetchall()
+        return [(int(i), t) for i, t in rows]
+
+    def delete_note(self, user_id: int, note_id: int) -> bool:
+        cur = self.db.execute("DELETE FROM notes WHERE user_id=? AND id=?", (int(user_id), int(note_id)))
+        return cur.rowcount > 0
+
+    # ---------- pins ----------
+    def set_pin(self, channel_id: int, text: str):
+        self.db.execute("""INSERT INTO pins(channel_id,text) VALUES(?,?)
+                           ON CONFLICT(channel_id) DO UPDATE SET text=excluded.text""", (int(channel_id), text))
+
+    def get_pin(self, channel_id: int):
+        row = self.db.execute("SELECT text FROM pins WHERE channel_id=?", (int(channel_id),)).fetchone()
+        return row[0] if row else None
+
+    def clear_pin(self, channel_id: int):
+        self.db.execute("DELETE FROM pins WHERE channel_id=?", (int(channel_id),))
+
+    # ---------- polls ----------
+    def save_poll(self, message_id: int, poll: dict):
+        is_open = 1 if poll.get("open", True) else 0
+        self.db.execute("""INSERT INTO polls(message_id,json,is_open) VALUES(?,?,?)
+                           ON CONFLICT(message_id) DO UPDATE SET json=excluded.json,is_open=excluded.is_open""",
+                        (int(message_id), json.dumps(poll), is_open))
+
+    def get_poll(self, message_id: int):
+        row = self.db.execute("SELECT json FROM polls WHERE message_id=?", (int(message_id),)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def delete_poll(self, message_id: int):
+        self.db.execute("DELETE FROM polls WHERE message_id=?", (int(message_id),))
+
+    def list_open_polls(self) -> list[tuple[int, dict]]:
+        rows = self.db.execute("SELECT message_id, json FROM polls WHERE is_open=1").fetchall()
+        return [(int(mid), json.loads(js)) for mid, js in rows]
+
+    # ---------- reminders ----------
     def add_reminder(self, rem: dict) -> int:
-        data = self.read()
-        rid = int(data.get("reminder_seq", 0)) + 1
-        data["reminder_seq"] = rid
-        data["reminders"][str(rid)] = rem
-        self.write(data)
+        uid = int(rem["user_id"])
+        rid = self._lowest_free_id_for_user("reminders", uid)
+        self.db.execute("""INSERT INTO reminders(user_id,id,channel_id,dm,text,due_utc)
+                           VALUES(?,?,?,?,?,?)""",
+                        (uid, rid,
+                         (None if rem.get("channel_id") in (None,"","None") else int(rem["channel_id"])),
+                         1 if rem.get("dm") else 0, str(rem.get("text","")), str(rem["due_utc"])))
         return rid
 
-    def list_reminders(self, user_id: Optional[int] = None) -> List[dict]:
-        data = self.read()
-        arr = []
-        for rid, r in data["reminders"].items():
-            r2 = dict(r)
-            r2["id"] = int(rid)
-            if (user_id is None) or (int(r2.get("user_id", 0)) == int(user_id)):
-                arr.append(r2)
-        arr.sort(key=lambda x: x.get("due_utc", ""))
-        return arr
+    def list_reminders(self, user_id: int | None = None) -> list[dict]:
+        if user_id is None:
+            rows = self.db.execute("SELECT user_id,id,channel_id,dm,text,due_utc FROM reminders ORDER BY user_id,id").fetchall()
+        else:
+            rows = self.db.execute("SELECT user_id,id,channel_id,dm,text,due_utc FROM reminders WHERE user_id=? ORDER BY id",
+                                   (int(user_id),)).fetchall()
+        out = []
+        for uid, rid, cid, dm, text, due in rows:
+            out.append({"user_id": int(uid), "id": int(rid), "channel_id": (None if cid is None else int(cid)),
+                        "dm": bool(dm), "text": text, "due_utc": due})
+        return out
 
     def cancel_reminder(self, rid: int, requester_id: int, is_mod: bool) -> bool:
-        data = self.read()
-        r = data["reminders"].get(str(rid))
-        if not r:
-            return False
-        if (not is_mod) and int(r.get("user_id", 0)) != int(requester_id):
-            return False
-        data["reminders"].pop(str(rid), None)
-        self.write(data)
-        return True
+        # Since IDs are per-user, target by both user_id and id
+        if is_mod:
+            cur = self.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (int(requester_id), int(rid)))
+            return cur.rowcount > 0
+        else:
+            cur = self.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (int(requester_id), int(rid)))
+            return cur.rowcount > 0
 
-    # ---- Admin allowlist helpers (new) ----
+    # ---------- admin allowlist ----------
     def is_allowlisted(self, user_id: int) -> bool:
-        data = self.read()
-        return str(user_id) in {str(x) for x in data["admin_allowlist"]}
+        return self.db.execute("SELECT 1 FROM admin_allowlist WHERE user_id=?", (int(user_id),)).fetchone() is not None
 
     def add_allowlisted(self, user_id: int) -> bool:
-        data = self.read()
-        s = {str(x) for x in data["admin_allowlist"]}
-        if str(user_id) in s:
+        try:
+            self.db.execute("INSERT INTO admin_allowlist(user_id) VALUES(?)", (int(user_id),))
+            return True
+        except sqlite3.IntegrityError:
             return False
-        s.add(str(user_id))
-        data["admin_allowlist"] = sorted(map(int, s))
-        self.write(data)
-        return True
 
     def remove_allowlisted(self, user_id: int) -> bool:
-        data = self.read()
-        s = {str(x) for x in data["admin_allowlist"]}
-        if str(user_id) not in s:
-            return False
-        s.remove(str(user_id))
-        data["admin_allowlist"] = sorted(map(int, s))
-        self.write(data)
-        return True
+        cur = self.db.execute("DELETE FROM admin_allowlist WHERE user_id=?", (int(user_id),))
+        return cur.rowcount > 0
 
-    def list_allowlisted(self) -> List[int]:
-        data = self.read()
-        return list(map(int, data["admin_allowlist"]))
+    def list_allowlisted(self) -> list[int]:
+        rows = self.db.execute("SELECT user_id FROM admin_allowlist ORDER BY user_id").fetchall()
+        return [int(r[0]) for r in rows]
 
+    # ---------- autodelete ----------
+    def get_autodelete(self) -> dict:
+        rows = self.db.execute("SELECT channel_id, seconds FROM autodelete").fetchall()
+        return {str(int(cid)): int(secs) for cid, secs in rows}
+
+    def set_autodelete(self, channel_id: int, seconds: int):
+        self.db.execute("""INSERT INTO autodelete(channel_id,seconds) VALUES(?,?)
+                           ON CONFLICT(channel_id) DO UPDATE SET seconds=excluded.seconds""",
+                        (int(channel_id), int(seconds)))
+
+    def remove_autodelete(self, channel_id: int):
+        self.db.execute("DELETE FROM autodelete WHERE channel_id=?", (int(channel_id),))
 
 store = Store(DATA_PATH)
 
@@ -1070,8 +1160,6 @@ async def weather_scheduler():
         pass
 
 @weather_scheduler.before_loop
-async def before_weather():
-    await bot.wait_until_ready()
 async def before_weather():
     await bot.wait_until_ready()
 
@@ -2737,6 +2825,31 @@ async def admin_list(inter: discord.Interaction):
         except Exception:
             lines.append(f"- <@{uid}> (User {uid})")
     await inter.response.send_message("**Admin allowlist:**\n" + "\n".join(lines), ephemeral=True)
+
+
+# ---------- Debug / Health ----------
+@tree.command(name="debug_store", description="Show backend status and table counts.")
+async def debug_store(inter: discord.Interaction):
+    stats = store.get_backend_stats()
+    emb = discord.Embed(title="🧪 Store Health")
+    emb.add_field(name="Backend", value=stats["backend"], inline=True)
+    emb.add_field(name="DB Path", value=stats["db_path"], inline=False)
+    counts = stats["counts"]
+    # Show a compact summary
+    groups = [
+        ("Economy", ["wallets","inventory","stats","streaks","daily","work","achievements"]),
+        ("Weather", ["weather_zips","weather_subs"]),
+        ("Reminders", ["reminders"]),
+        ("Moderation", ["autodelete","pins","notes"]),
+        ("Polls", ["polls"]),
+        ("Admin", ["admin_allowlist"]),
+    ]
+    for title, keys in groups:
+        val = ", ".join(f"{k}:{counts.get(k,0)}" for k in keys)
+        if val:
+            emb.add_field(name=title, value=val, inline=False)
+    await inter.response.send_message(embed=emb, ephemeral=True)
+
 
 # ---------- Startup ----------
 @bot.event

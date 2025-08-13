@@ -834,12 +834,23 @@ async def stats_cmd(inter: discord.Interaction, user: Optional[discord.User] = N
 
 # ---------- NEW: Weather by ZIP ----------
 
-@tree.command(name="weather", description="Current weather by US ZIP code (no API key).")
-async def weather_cmd(inter: discord.Interaction, zip: app_commands.Range[str, 5, 10]):
+@tree.command(name="weather", description="Current weather by ZIP. Uses your saved ZIP if omitted.")
+@app_commands.describe(zip="Optional ZIP; uses your saved default if omitted")
+async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
     await inter.response.defer()
-    z = re.sub(r"[^0-9]", "", zip)
-    if len(z) != 5:
-        return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
+    # Resolve ZIP: prefer provided, else saved default
+    if not zip or not str(zip).strip():
+        saved = store.get_user_zip(inter.user.id)
+        if not saved or len(str(saved)) != 5:
+            return await inter.followup.send(
+                "You didn’t provide a ZIP and no default is saved. Set one with `/weather_set_zip 60601` or pass a ZIP.",
+                ephemeral=True
+            )
+        z = str(saved)
+    else:
+        z = re.sub(r"[^0-9]", "", str(zip))
+        if len(z) != 5:
+            return await inter.followup.send("Please give a valid 5-digit US ZIP.", ephemeral=True)
     try:
         async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             # 1) ZIP -> lat/lon
@@ -3242,3 +3253,97 @@ async def holdem_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 1,
 
 if __name__ == "__main__":
     main()
+
+# ---------- Auto-delete closed polls (monkeypatch) ----------
+def _save_poll_autodelete(self, message_id: int, poll: dict):
+    is_open = 1 if poll.get("open", True) else 0
+    if not is_open:
+        try:
+            self.delete_poll(int(message_id))
+        except Exception:
+            pass
+        return
+    # Fallback to original upsert logic
+    try:
+        # If original method exists (unlikely at runtime here), call it
+        pass
+    except Exception:
+        pass
+    # Re-implement upsert
+    try:
+        self.db.execute(
+            """INSERT INTO polls(message_id,json,is_open) VALUES(?,?,?)
+               ON CONFLICT(message_id) DO UPDATE SET json=excluded.json,is_open=excluded.is_open""",
+            (int(message_id), json.dumps(poll), is_open)
+        )
+    except Exception:
+        # As a last resort, try delete+insert
+        try:
+            self.delete_poll(int(message_id))
+        except Exception:
+            pass
+        self.db.execute(
+            "INSERT INTO polls(message_id,json,is_open) VALUES(?,?,?)",
+            (int(message_id), json.dumps(poll), is_open)
+        )
+
+# Install monkeypatch
+try:
+    Store.save_poll = _save_poll_autodelete
+except Exception:
+    pass
+
+# ---------- Poll vote enforcement: single-choice per user ----------
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    try:
+        if bot.user and payload.user_id == bot.user.id:
+            return
+    except Exception:
+        pass
+
+    poll = store.get_poll(int(payload.message_id))
+    if not poll:
+        return
+
+    try:
+        if isinstance(poll, dict) and poll.get("open") is False:
+            return
+    except Exception:
+        pass
+
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(payload.channel_id)
+        except Exception:
+            return
+
+    try:
+        msg = await channel.fetch_message(payload.message_id)
+    except Exception:
+        return
+
+    try:
+        # Identify the user object
+        user_obj = None
+        if payload.guild_id:
+            guild = bot.get_guild(payload.guild_id)
+            if guild:
+                user_obj = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+        if user_obj is None:
+            user_obj = await bot.fetch_user(payload.user_id)
+
+        # Remove any other reactions by this user on the same message
+        for reaction in msg.reactions:
+            if str(reaction.emoji) == str(payload.emoji):
+                continue
+            try:
+                async for u in reaction.users():
+                    if u.id == payload.user_id:
+                        await msg.remove_reaction(reaction.emoji, user_obj)
+                        break
+            except Exception:
+                continue
+    except Exception:
+        pass

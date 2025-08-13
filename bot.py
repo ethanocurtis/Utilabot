@@ -1131,7 +1131,7 @@ async def weather_scheduler():
                             next_local = next_local.replace(hour=s["hh"], minute=s["mi"], second=0, microsecond=0)
                             if next_local <= datetime.now(_chicago_tz_for(datetime.now())):
                                 next_local += timedelta(days=1)
-                            store.update_weather_sub(s["id"], next_run_utc=next_local.astimezone(timezone.utc).isoformat())
+                            store.update_weather_sub(s["id"], user_id=int(s["user_id"]), next_run_utc=next_local.astimezone(timezone.utc).isoformat())
                         else:
                             days = int(s.get("weekly_days", 7))
                             days = 10 if days > 10 else (3 if days < 3 else days)
@@ -1152,7 +1152,7 @@ async def weather_scheduler():
                                 next_local += timedelta(days=7)
                             else:
                                 next_local += timedelta(days=7)
-                            store.update_weather_sub(s["id"], next_run_utc=next_local.astimezone(timezone.utc).isoformat())
+                            store.update_weather_sub(s["id"], user_id=int(s["user_id"]), next_run_utc=next_local.astimezone(timezone.utc).isoformat())
                     except Exception:
                         fallback = now_utc + timedelta(minutes=5)
                         store.update_weather_sub(s["id"], next_run_utc=fallback.isoformat())
@@ -1462,15 +1462,15 @@ async def note_add(inter: discord.Interaction, text: str):
 @tree.command(name="notes", description="List or delete your notes.")
 async def notes(inter: discord.Interaction, delete_index: Optional[app_commands.Range[int, 1, 999]] = None):
     if delete_index:
-        ok = store.delete_note(inter.user.id, delete_index - 1)
+        ok = store.delete_note(inter.user.id, int(delete_index))
         if ok:
             return await inter.response.send_message("🗑️ Deleted.", ephemeral=True)
         else:
-            return await inter.response.send_message("Index out of range.", ephemeral=True)
-    arr = store.list_notes(inter.user.id)
+            return await inter.response.send_message("ID not found.", ephemeral=True)
+    arr = store.list_notes(inter.user.id)  # returns [(id, text)]
     if not arr:
         return await inter.response.send_message("No notes.", ephemeral=True)
-    lines = [f"{i+1}. {t}" for i,t in enumerate(arr)]
+    lines = [f"{i}. {t}" for i, t in arr]
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
 # ---------- Channel Pin ----------
@@ -2737,7 +2737,7 @@ async def reminders_scheduler():
                             await user.send(text)
                 except Exception:
                     pass
-                store.cancel_reminder(int(r.get("id", 0)), requester_id=0, is_mod=True)
+                store.cancel_reminder(int(r.get("id", 0)), requester_id=int(r.get("user_id")), is_mod=True)
     except Exception:
         pass
 

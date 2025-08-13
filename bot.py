@@ -604,94 +604,94 @@ async def polls_cleanup(inter: discord.Interaction, older_than_days: int | None 
 
     
     def save_poll(self, message_id: int, poll: dict):
-            is_open = 1 if poll.get("open", True) else 0
-            mid = int(message_id)
-            if is_open == 0:
-                # Auto-delete closed polls when saved
-                self.db.execute("DELETE FROM polls WHERE message_id=?", (mid,))
-                return
-            # Upsert open poll; if exists, update; else insert with created_at=now
-            cur = self.db.execute("UPDATE polls SET json=?, is_open=1 WHERE message_id=?", (json.dumps(poll), mid))
-            if cur.rowcount == 0:
-                # insert new with created_at timestamp (UTC)
-                self.db.execute("INSERT INTO polls(message_id,json,is_open,created_at) VALUES(?,?,1, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-                                (mid, json.dumps(poll)))
+        is_open = 1 if poll.get("open", True) else 0
+        mid = int(message_id)
+        if is_open == 0:
+            # Auto-delete closed polls when saved
+            self.db.execute("DELETE FROM polls WHERE message_id=?", (mid,))
+            return
+        # Upsert open poll; if exists, update; else insert with created_at=now
+        cur = self.db.execute("UPDATE polls SET json=?, is_open=1 WHERE message_id=?", (json.dumps(poll), mid))
+        if cur.rowcount == 0:
+            # insert new with created_at timestamp (UTC)
+            self.db.execute("INSERT INTO polls(message_id,json,is_open,created_at) VALUES(?,?,1, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+                            (mid, json.dumps(poll)))
+    
+    
+    def get_poll(self, message_id: int):
+        row = self.db.execute("SELECT json FROM polls WHERE message_id=?", (int(message_id),)).fetchone()
+        return json.loads(row[0]) if row else None
 
+    def delete_poll(self, message_id: int):
+        self.db.execute("DELETE FROM polls WHERE message_id=?", (int(message_id),))
 
-        def get_poll(self, message_id: int):
-            row = self.db.execute("SELECT json FROM polls WHERE message_id=?", (int(message_id),)).fetchone()
-            return json.loads(row[0]) if row else None
+    def list_open_polls(self) -> list[tuple[int, dict]]:
+        rows = self.db.execute("SELECT message_id, json FROM polls WHERE is_open=1").fetchall()
+        return [(int(mid), json.loads(js)) for mid, js in rows]
 
-        def delete_poll(self, message_id: int):
-            self.db.execute("DELETE FROM polls WHERE message_id=?", (int(message_id),))
+    # ---------- reminders ----------
+    def add_reminder(self, rem: dict) -> int:
+        uid = int(rem["user_id"])
+        rid = self._lowest_free_id_for_user("reminders", uid)
+        self.db.execute("""INSERT INTO reminders(user_id,id,channel_id,dm,text,due_utc)
+                           VALUES(?,?,?,?,?,?)""",
+                        (uid, rid,
+                         (None if rem.get("channel_id") in (None,"","None") else int(rem["channel_id"])),
+                         1 if rem.get("dm") else 0, str(rem.get("text","")), str(rem["due_utc"])))
+        return rid
 
-        def list_open_polls(self) -> list[tuple[int, dict]]:
-            rows = self.db.execute("SELECT message_id, json FROM polls WHERE is_open=1").fetchall()
-            return [(int(mid), json.loads(js)) for mid, js in rows]
+    def list_reminders(self, user_id: int | None = None) -> list[dict]:
+        if user_id is None:
+            rows = self.db.execute("SELECT user_id,id,channel_id,dm,text,due_utc FROM reminders ORDER BY user_id,id").fetchall()
+        else:
+            rows = self.db.execute("SELECT user_id,id,channel_id,dm,text,due_utc FROM reminders WHERE user_id=? ORDER BY id",
+                                   (int(user_id),)).fetchall()
+        out = []
+        for uid, rid, cid, dm, text, due in rows:
+            out.append({"user_id": int(uid), "id": int(rid), "channel_id": (None if cid is None else int(cid)),
+                        "dm": bool(dm), "text": text, "due_utc": due})
+        return out
 
-        # ---------- reminders ----------
-        def add_reminder(self, rem: dict) -> int:
-            uid = int(rem["user_id"])
-            rid = self._lowest_free_id_for_user("reminders", uid)
-            self.db.execute("""INSERT INTO reminders(user_id,id,channel_id,dm,text,due_utc)
-                               VALUES(?,?,?,?,?,?)""",
-                            (uid, rid,
-                             (None if rem.get("channel_id") in (None,"","None") else int(rem["channel_id"])),
-                             1 if rem.get("dm") else 0, str(rem.get("text","")), str(rem["due_utc"])))
-            return rid
-
-        def list_reminders(self, user_id: int | None = None) -> list[dict]:
-            if user_id is None:
-                rows = self.db.execute("SELECT user_id,id,channel_id,dm,text,due_utc FROM reminders ORDER BY user_id,id").fetchall()
-            else:
-                rows = self.db.execute("SELECT user_id,id,channel_id,dm,text,due_utc FROM reminders WHERE user_id=? ORDER BY id",
-                                       (int(user_id),)).fetchall()
-            out = []
-            for uid, rid, cid, dm, text, due in rows:
-                out.append({"user_id": int(uid), "id": int(rid), "channel_id": (None if cid is None else int(cid)),
-                            "dm": bool(dm), "text": text, "due_utc": due})
-            return out
-
-        def cancel_reminder(self, rid: int, requester_id: int, is_mod: bool) -> bool:
-            # Since IDs are per-user, target by both user_id and id
-            if is_mod:
-                cur = self.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (int(requester_id), int(rid)))
-                return cur.rowcount > 0
-            else:
-                cur = self.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (int(requester_id), int(rid)))
-                return cur.rowcount > 0
-
-        # ---------- admin allowlist ----------
-        def is_allowlisted(self, user_id: int) -> bool:
-            return self.db.execute("SELECT 1 FROM admin_allowlist WHERE user_id=?", (int(user_id),)).fetchone() is not None
-
-        def add_allowlisted(self, user_id: int) -> bool:
-            try:
-                self.db.execute("INSERT INTO admin_allowlist(user_id) VALUES(?)", (int(user_id),))
-                return True
-            except sqlite3.IntegrityError:
-                return False
-
-        def remove_allowlisted(self, user_id: int) -> bool:
-            cur = self.db.execute("DELETE FROM admin_allowlist WHERE user_id=?", (int(user_id),))
+    def cancel_reminder(self, rid: int, requester_id: int, is_mod: bool) -> bool:
+        # Since IDs are per-user, target by both user_id and id
+        if is_mod:
+            cur = self.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (int(requester_id), int(rid)))
+            return cur.rowcount > 0
+        else:
+            cur = self.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (int(requester_id), int(rid)))
             return cur.rowcount > 0
 
-        def list_allowlisted(self) -> list[int]:
-            rows = self.db.execute("SELECT user_id FROM admin_allowlist ORDER BY user_id").fetchall()
-            return [int(r[0]) for r in rows]
+    # ---------- admin allowlist ----------
+    def is_allowlisted(self, user_id: int) -> bool:
+        return self.db.execute("SELECT 1 FROM admin_allowlist WHERE user_id=?", (int(user_id),)).fetchone() is not None
 
-        # ---------- autodelete ----------
-        def get_autodelete(self) -> dict:
-            rows = self.db.execute("SELECT channel_id, seconds FROM autodelete").fetchall()
-            return {str(int(cid)): int(secs) for cid, secs in rows}
+    def add_allowlisted(self, user_id: int) -> bool:
+        try:
+            self.db.execute("INSERT INTO admin_allowlist(user_id) VALUES(?)", (int(user_id),))
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
-        def set_autodelete(self, channel_id: int, seconds: int):
-            self.db.execute("""INSERT INTO autodelete(channel_id,seconds) VALUES(?,?)
-                               ON CONFLICT(channel_id) DO UPDATE SET seconds=excluded.seconds""",
-                            (int(channel_id), int(seconds)))
+    def remove_allowlisted(self, user_id: int) -> bool:
+        cur = self.db.execute("DELETE FROM admin_allowlist WHERE user_id=?", (int(user_id),))
+        return cur.rowcount > 0
 
-        def remove_autodelete(self, channel_id: int):
-            self.db.execute("DELETE FROM autodelete WHERE channel_id=?", (int(channel_id),))
+    def list_allowlisted(self) -> list[int]:
+        rows = self.db.execute("SELECT user_id FROM admin_allowlist ORDER BY user_id").fetchall()
+        return [int(r[0]) for r in rows]
+
+    # ---------- autodelete ----------
+    def get_autodelete(self) -> dict:
+        rows = self.db.execute("SELECT channel_id, seconds FROM autodelete").fetchall()
+        return {str(int(cid)): int(secs) for cid, secs in rows}
+
+    def set_autodelete(self, channel_id: int, seconds: int):
+        self.db.execute("""INSERT INTO autodelete(channel_id,seconds) VALUES(?,?)
+                           ON CONFLICT(channel_id) DO UPDATE SET seconds=excluded.seconds""",
+                        (int(channel_id), int(seconds)))
+
+    def remove_autodelete(self, channel_id: int):
+        self.db.execute("DELETE FROM autodelete WHERE channel_id=?", (int(channel_id),))
 
 store = Store(DATA_PATH)
 

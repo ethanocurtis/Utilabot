@@ -23,6 +23,7 @@ except Exception:
 
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
+DB_PATH = os.environ.get("DB_PATH", "/app/data/bot.db")
 GUILD_IDS: List[int] = []  # e.g., [123456789012345678] for faster guild sync
 
 STARTING_DAILY = 250

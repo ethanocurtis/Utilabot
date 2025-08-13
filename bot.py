@@ -692,9 +692,7 @@ async def polls_cleanup(inter: discord.Interaction, older_than_days: int | None 
 
     def remove_autodelete(self, channel_id: int):
         self.db.execute("DELETE FROM autodelete WHERE channel_id=?", (int(channel_id),))
-
 store = Store(DATA_PATH)
-
     # ---------- Permissions helper ----------
 def require_manage_messages():
     def predicate(inter: discord.Interaction):
@@ -3283,50 +3281,59 @@ if __name__ == "__main__":
 
 
 
-# --- Auto-attach missing Store methods (safety net for accidental dedent/merge) ---
-import json as _json_for_store_patch
-
-def _store_list_open_polls(self):
-    rows = self.db.execute(
-        "SELECT message_id, json FROM polls WHERE is_open=1"
-    ).fetchall()
-    return [(int(mid), _json_for_store_patch.loads(js)) for mid, js in rows]
-
-def _store_get_poll(self, message_id: int):
-    row = self.db.execute(
-        "SELECT json FROM polls WHERE message_id=?",
-        (int(message_id),)
-    ).fetchone()
-    return _json_for_store_patch.loads(row[0]) if row else None
-
-def _store_delete_poll(self, message_id: int):
-    self.db.execute("DELETE FROM polls WHERE message_id=?", (int(message_id),))
-
-def _store_get_autodelete(self):
-    rows = self.db.execute(
-        "SELECT channel_id, seconds FROM autodelete"
-    ).fetchall()
-    return {str(int(cid)): int(secs) for cid, secs in rows}
-
-def _store_set_autodelete(self, channel_id: int, seconds: int):
-    self.db.execute(
-        """INSERT INTO autodelete(channel_id,seconds) VALUES(?,?)
-           ON CONFLICT(channel_id) DO UPDATE SET seconds=excluded.seconds""",
-        (int(channel_id), int(seconds))
-    )
-
-def _store_remove_autodelete(self, channel_id: int):
-    self.db.execute("DELETE FROM autodelete WHERE channel_id=?", (int(channel_id),))
-
+# === Safety patch: ensure Store has poll/autodelete methods and module-level `store` is an instance ===
 try:
     Store
 except NameError:
     pass
 else:
+    import json as _json_patch_  # local alias to avoid shadowing
+
+    def _store_list_open_polls(self):
+        rows = self.db.execute("SELECT message_id, json FROM polls WHERE is_open=1").fetchall()
+        return [(int(mid), _json_patch_.loads(js)) for mid, js in rows]
+
+    def _store_get_poll(self, message_id: int):
+        row = self.db.execute("SELECT json FROM polls WHERE message_id=?", (int(message_id),)).fetchone()
+        return _json_patch_.loads(row[0]) if row else None
+
+    def _store_delete_poll(self, message_id: int):
+        self.db.execute("DELETE FROM polls WHERE message_id=?", (int(message_id),))
+
+    def _store_get_autodelete(self):
+        rows = self.db.execute("SELECT channel_id, seconds FROM autodelete").fetchall()
+        return {str(int(cid)): int(secs) for cid, secs in rows}
+
+    def _store_set_autodelete(self, channel_id: int, seconds: int):
+        self.db.execute(
+            """INSERT INTO autodelete(channel_id,seconds) VALUES(?,?)
+               ON CONFLICT(channel_id) DO UPDATE SET seconds=excluded.seconds""",
+            (int(channel_id), int(seconds))
+        )
+
+    def _store_remove_autodelete(self, channel_id: int):
+        self.db.execute("DELETE FROM autodelete WHERE channel_id=?", (int(channel_id),))
+
+    # Attach to class if missing
     if not hasattr(Store, "list_open_polls"):   Store.list_open_polls   = _store_list_open_polls
     if not hasattr(Store, "get_poll"):          Store.get_poll          = _store_get_poll
     if not hasattr(Store, "delete_poll"):       Store.delete_poll       = _store_delete_poll
     if not hasattr(Store, "get_autodelete"):    Store.get_autodelete    = _store_get_autodelete
     if not hasattr(Store, "set_autodelete"):    Store.set_autodelete    = _store_set_autodelete
     if not hasattr(Store, "remove_autodelete"): Store.remove_autodelete = _store_remove_autodelete
-# -------------------------------------------------------------------------------
+
+# Ensure module-level `store` exists and is instance of Store
+try:
+    store
+except NameError:
+    try:
+        store = Store(DATA_PATH)  # type: ignore[name-defined]
+    except Exception:
+        pass
+else:
+    if not isinstance(store, Store):
+        try:
+            store = Store(DATA_PATH)  # type: ignore[name-defined]
+        except Exception:
+            pass
+# === End safety patch ===

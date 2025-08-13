@@ -3280,3 +3280,53 @@ async def holdem_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 1,
 
 if __name__ == "__main__":
     main()
+
+
+
+# --- Auto-attach missing Store methods (safety net for accidental dedent/merge) ---
+import json as _json_for_store_patch
+
+def _store_list_open_polls(self):
+    rows = self.db.execute(
+        "SELECT message_id, json FROM polls WHERE is_open=1"
+    ).fetchall()
+    return [(int(mid), _json_for_store_patch.loads(js)) for mid, js in rows]
+
+def _store_get_poll(self, message_id: int):
+    row = self.db.execute(
+        "SELECT json FROM polls WHERE message_id=?",
+        (int(message_id),)
+    ).fetchone()
+    return _json_for_store_patch.loads(row[0]) if row else None
+
+def _store_delete_poll(self, message_id: int):
+    self.db.execute("DELETE FROM polls WHERE message_id=?", (int(message_id),))
+
+def _store_get_autodelete(self):
+    rows = self.db.execute(
+        "SELECT channel_id, seconds FROM autodelete"
+    ).fetchall()
+    return {str(int(cid)): int(secs) for cid, secs in rows}
+
+def _store_set_autodelete(self, channel_id: int, seconds: int):
+    self.db.execute(
+        """INSERT INTO autodelete(channel_id,seconds) VALUES(?,?)
+           ON CONFLICT(channel_id) DO UPDATE SET seconds=excluded.seconds""",
+        (int(channel_id), int(seconds))
+    )
+
+def _store_remove_autodelete(self, channel_id: int):
+    self.db.execute("DELETE FROM autodelete WHERE channel_id=?", (int(channel_id),))
+
+try:
+    Store
+except NameError:
+    pass
+else:
+    if not hasattr(Store, "list_open_polls"):   Store.list_open_polls   = _store_list_open_polls
+    if not hasattr(Store, "get_poll"):          Store.get_poll          = _store_get_poll
+    if not hasattr(Store, "delete_poll"):       Store.delete_poll       = _store_delete_poll
+    if not hasattr(Store, "get_autodelete"):    Store.get_autodelete    = _store_get_autodelete
+    if not hasattr(Store, "set_autodelete"):    Store.set_autodelete    = _store_set_autodelete
+    if not hasattr(Store, "remove_autodelete"): Store.remove_autodelete = _store_remove_autodelete
+# -------------------------------------------------------------------------------

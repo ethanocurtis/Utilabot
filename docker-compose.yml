@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   utility-bot:
     build: .
@@ -8,4 +7,5 @@ services:
       - DATA_PATH=/app/data/db.json
     volumes:
       - ./data:/app/data
+      - ./bot.py:/app/bot.py:rw
     restart: unless-stopped

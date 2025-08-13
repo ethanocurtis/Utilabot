@@ -576,7 +576,6 @@ class Store:
     # ---------- polls ----------
     def save_poll(self, message_id: int, poll: dict):
         is_open = 1 if poll.get("open", True) else 0
-        # Auto-delete closed polls so they aren't stored permanently
         if not is_open:
             try:
                 self.delete_poll(int(message_id))
@@ -585,7 +584,9 @@ class Store:
             return
         self.db.execute("""INSERT INTO polls(message_id,json,is_open) VALUES(?,?,?)
                            ON CONFLICT(message_id) DO UPDATE SET json=excluded.json,is_open=excluded.is_open""",
-                        (int(message_id), json.dumps(poll), is_open))def get_poll(self, message_id: int):
+                        (int(message_id), json.dumps(poll), is_open))
+
+    def get_poll(self, message_id: int):
         row = self.db.execute("SELECT json FROM polls WHERE message_id=?", (int(message_id),)).fetchone()
         return json.loads(row[0]) if row else None
 
@@ -839,12 +840,23 @@ async def stats_cmd(inter: discord.Interaction, user: Optional[discord.User] = N
 
 # ---------- NEW: Weather by ZIP ----------
 
-@tree.command(name="weather", description="Current weather by US ZIP code (no API key).")
-async def weather_cmd(inter: discord.Interaction, zip: app_commands.Range[str, 5, 10]):
+@tree.command(name="weather", description="Current weather by ZIP. Uses your saved ZIP if omitted.")
+@app_commands.describe(zip="Optional ZIP; uses your saved default if omitted")
+async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
     await inter.response.defer()
-    z = re.sub(r"[^0-9]", "", zip)
-    if len(z) != 5:
-        return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
+    # Resolve ZIP: prefer provided, else saved default
+    if not zip or not str(zip).strip():
+        saved = store.get_user_zip(inter.user.id)
+        if not saved or len(str(saved)) != 5:
+            return await inter.followup.send(
+                "You didn’t provide a ZIP and no default is saved. Set one with `/weather_set_zip 60601` or pass a ZIP.",
+                ephemeral=True
+            )
+        z = str(saved)
+    else:
+        z = re.sub(r"[^0-9]", "", str(zip))
+        if len(z) != 5:
+            return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
     try:
         async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             # 1) ZIP -> lat/lon
@@ -1517,28 +1529,7 @@ class PollView(discord.ui.View):
             p = store.get_poll(self.message_id)
             if not p or not p.get("open", True):
                 return await inter.response.send_message("Poll is closed.", ephemeral=True)
-
-            # Ensure voters map exists
-            voters = p.get("voters") or {}
-            uid = str(inter.user.id)
-            prev = voters.get(uid)
-
-            # If the user is switching votes, decrement the previous choice
-            if isinstance(prev, int) and 0 <= prev < len(p["options"]) and prev != idx:
-                try:
-                    p["options"][prev]["votes"] = max(0, int(p["options"][prev]["votes"]) - 1)
-                except Exception:
-                    pass
-
-            # If same option as before, do nothing (single response per user)
-            if prev == idx:
-                return await inter.response.send_message("You already chose that option.", ephemeral=True)
-
-            # Record/overwrite the user's choice and increment this option
-            voters[uid] = idx
-            p["voters"] = voters
-            p["options"][idx]["votes"] = int(p["options"][idx]["votes"]) + 1
-
+            p["options"][idx]["votes"] += 1
             store.save_poll(self.message_id, p)
             await inter.response.defer()
             await update_poll_message(inter.channel, self.message_id, p)
@@ -1592,7 +1583,7 @@ async def poll(inter: discord.Interaction, question: str, options: str):
     emb = discord.Embed(title="📊 " + question, description="\n".join(f"**{o}** — 0 (0%)" for o in opts))
     await inter.response.send_message(embed=emb)
     msg = await inter.original_response()
-    poll_data = {"question": question, "options": [{"label": o, "votes": 0} for o in opts], "creator_id": inter.user.id, "open": True} | {"voters": {}}
+    poll_data = {"question": question, "options": [{"label": o, "votes": 0} for o in opts], "creator_id": inter.user.id, "open": True}
     store.save_poll(msg.id, poll_data)
     view = PollView(message_id=msg.id, options=opts, creator_id=inter.user.id, timeout=None)
     await msg.edit(view=view)
@@ -3268,3 +3259,105 @@ async def holdem_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 1,
 
 if __name__ == "__main__":
     main()
+
+
+# ====== Poll Overrides: single-vote + results on close ======
+
+class PollView(discord.ui.View):
+    def __init__(self, message_id: int, options: list[str], creator_id: int):
+        super().__init__(timeout=None)
+        self.message_id = int(message_id)
+        self.creator_id = int(creator_id)
+        for i, label in enumerate(options):
+            self.add_item(self._make_vote_button(i, label))
+        self.add_item(self._make_close_button())
+
+    def _make_vote_button(self, idx: int, label: str):
+        custom_id = f"poll_vote:{self.message_id}:{idx}"
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=custom_id)
+        async def cb(inter: discord.Interaction):
+            p = store.get_poll(self.message_id)
+            if not p or not p.get("open", True):
+                return await inter.response.send_message("Poll is closed.", ephemeral=True)
+
+            voters = p.get("voters") or {}
+            uid = str(inter.user.id)
+            prev = voters.get(uid)
+
+            if isinstance(prev, int) and 0 <= prev < len(p["options"]) and prev != idx:
+                try:
+                    p["options"][prev]["votes"] = max(0, int(p["options"][prev]["votes"]) - 1)
+                except Exception:
+                    pass
+
+            if prev == idx:
+                return await inter.response.send_message("You already chose that option.", ephemeral=True)
+
+            voters[uid] = idx
+            p["voters"] = voters
+            p["options"][idx]["votes"] = int(p["options"][idx]["votes"]) + 1
+
+            store.save_poll(self.message_id, p)
+            await inter.response.defer()
+            await update_poll_message(inter.channel, self.message_id, p)
+        btn.callback = cb
+        return btn
+
+    def _make_close_button(self):
+        custom_id = f"poll_close:{self.message_id}"
+        btn = discord.ui.Button(label="Close Poll", style=discord.ButtonStyle.danger, custom_id=custom_id)
+        async def cb(inter: discord.Interaction):
+            p = store.get_poll(self.message_id)
+            if not p:
+                return
+            is_mod = False
+            try:
+                if isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
+                    is_mod = inter.channel.permissions_for(inter.user).manage_messages
+            except Exception:
+                pass
+            if (inter.user.id != p.get("creator_id")) and not is_mod:
+                return await inter.response.send_message("Only the creator or a mod can close this poll.", ephemeral=True)
+
+            # Mark closed
+            p["open"] = False
+            # Compute results summary
+            total = sum(int(o.get("votes", 0)) for o in p.get("options", []))
+            lines = []
+            for o in p.get("options", []):
+                v = int(o.get("votes", 0))
+                pct = 0 if total == 0 else int(round((v / total) * 100))
+                lines.append(f"**{o.get('label','?')}** — {v} ({pct}%)")
+            results_embed = discord.Embed(title="📊 Poll Results — " + str(p.get("question","Poll")), description="\n".join(lines))
+            try:
+                await inter.channel.send(embed=results_embed)
+            except Exception:
+                pass
+
+            store.save_poll(self.message_id, p)  # this will delete it
+            await inter.response.defer()
+            await update_poll_message(inter.channel, self.message_id, p)
+        btn.callback = cb
+        return btn
+
+async def update_poll_message(channel: discord.abc.Messageable, message_id: int, poll: dict):
+    try:
+        if hasattr(channel, "fetch_message"):
+            msg = await channel.fetch_message(message_id)
+        else:
+            return
+        total = sum(int(o.get("votes", 0)) for o in poll.get("options", []))
+        bars = []
+        for o in poll.get("options", []):
+            v = int(o.get("votes", 0))
+            pct = 0 if total == 0 else int(round((v / total) * 100))
+            bars.append(f"**{o.get('label','?')}** — {v} ({pct}%)")
+        emb = discord.Embed(title="📊 " + str(poll.get("question","Poll")), description="\n".join(bars))
+        emb.set_footer(text=("Open" if poll.get("open", True) else "Closed"))
+        view = None
+        if poll.get("open", True):
+            view = PollView(message_id=message_id, options=[o.get("label","?") for o in poll.get("options", [])], creator_id=poll.get("creator_id", 0))
+        await msg.edit(embed=emb, view=view)
+    except Exception:
+        pass
+

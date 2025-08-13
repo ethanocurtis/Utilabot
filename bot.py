@@ -21,7 +21,7 @@ try:
 except Exception:
     ZoneInfo = None
 
-# ---------- Config ----------
+    # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/bot.db")
 GUILD_IDS: List[int] = []  # e.g., [123456789012345678] for faster guild sync
@@ -75,7 +75,7 @@ bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
 
-# ---------- Weather styling helpers (icons, colors, formatting) ----------
+    # ---------- Weather styling helpers (icons, colors, formatting) ----------
 WX_CODE_MAP = {
     0: ("☀️", "Clear sky"),
     1: ("🌤️", "Mainly clear"),
@@ -137,7 +137,7 @@ def fmt_sun(dt_str: str):
         except Exception:
             return dt_str
 
-# ---------- NEW: Shop & Inventory Config ----------
+    # ---------- NEW: Shop & Inventory Config ----------
 # name -> dict(price, sell, desc)
 SHOP_CATALOG: Dict[str, Dict[str, Any]] = {
     "Fishing Pole": {"price": 750, "sell": 375, "desc": "Required to /fish."},
@@ -176,7 +176,7 @@ def weighted_choice(pairs: List[Tuple[str, float]]) -> str:
             return name
     return pairs[-1][0]
 
-# ---------- SQLite Store (drop-in replacement for JSON) ----------
+    # ---------- SQLite Store (drop-in replacement for JSON) ----------
 class Store:
     def __init__(self, json_path: str):
         self.json_path = json_path
@@ -388,14 +388,14 @@ class Store:
         return i
 
     
-# ---------- Polls Cleanup ----------
+    # ---------- Polls Cleanup ----------
 @tree.command(name="polls_cleanup", description="Delete closed polls (and optionally those older than N days).")
 @app_commands.describe(older_than_days="Also delete polls older than this many days (optional)")
 async def polls_cleanup(inter: discord.Interaction, older_than_days: int | None = None):
     deleted = store.purge_closed_polls(older_than_days)
     await inter.response.send_message(f"🧹 Deleted {deleted} poll(s).", ephemeral=True)
 
-# ---------- Debug / Health ----------
+    # ---------- Debug / Health ----------
     def get_backend_stats(self) -> dict:
         tables = ["wallets","inventory","daily","work","streaks","stats","achievements","autodelete","notes","pins","polls","reminders","admin_allowlist","weather_zips","weather_subs"]
         counts = {}
@@ -695,7 +695,7 @@ async def polls_cleanup(inter: discord.Interaction, older_than_days: int | None 
 
 store = Store(DATA_PATH)
 
-# ---------- Permissions helper ----------
+    # ---------- Permissions helper ----------
 def require_manage_messages():
     def predicate(inter: discord.Interaction):
         perms = inter.channel.permissions_for(inter.user) if isinstance(inter.channel, (discord.TextChannel, discord.Thread)) else None
@@ -734,7 +734,7 @@ def require_real_admin():
     return app_commands.check(predicate)
 
 
-# ---------- Cards ----------
+    # ---------- Cards ----------
 SUITS = ["♠", "♥", "♦", "♣"]
 RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 VALUES = {**{str(i): i for i in range(2, 11)}, "J": 10, "Q": 10, "K": 10, "A": 11}
@@ -756,7 +756,7 @@ def fmt_hand(cards: List[Tuple[str, str]]) -> str:
     return " ".join(f"{r}{s}" for r, s in cards) + f" (={hand_value(cards)})"
 
 
-# ---------- Economy & Utility ----------
+    # ---------- Economy & Utility ----------
 @tree.command(name="balance", description="Check your balance.")
 async def balance(inter: discord.Interaction, user: Optional[discord.User] = None):
     target = user or inter.user
@@ -870,7 +870,7 @@ async def stats_cmd(inter: discord.Interaction, user: Optional[discord.User] = N
     emb.add_field(name="Daily Streak", value=f"{st.get('count',0)} days", inline=True)
     await inter.response.send_message(embed=emb)
 
-# ---------- NEW: Weather by ZIP ----------
+    # ---------- NEW: Weather by ZIP ----------
 
 @tree.command(name="weather", description="Current weather by US ZIP code (no API key).")
 async def weather_cmd(inter: discord.Interaction, zip: app_commands.Range[str, 5, 10]):
@@ -958,7 +958,7 @@ async def weather_cmd(inter: discord.Interaction, zip: app_commands.Range[str, 5
 
 
 
-# ---------- Weather Subscriptions (Daily/Weekly via DM, Chicago time) ----------
+    # ---------- Weather Subscriptions (Daily/Weekly via DM, Chicago time) ----------
 def _next_local_run(now_local: datetime, hh: int, mi: int, cadence: str) -> datetime:
     target = now_local.replace(hour=hh, minute=mi, second=0, microsecond=0)
     if target <= now_local:
@@ -1201,7 +1201,7 @@ async def weather_scheduler():
 async def before_weather():
     await bot.wait_until_ready()
 
-# ---------- NEW: Shop / Inventory / Fishing ----------
+    # ---------- NEW: Shop / Inventory / Fishing ----------
 def _find_catalog_item(name: str) -> Optional[str]:
     # case-insensitive name match
     name_norm = name.strip().lower()
@@ -1491,7 +1491,7 @@ async def fish_cmd(inter: discord.Interaction):
         description=f"{flair} You cast your line using **{bait_type}** and caught **{catch}**! (Sell value: **{sell_val}** cr)"
     )
     await inter.response.send_message(embed=emb, view=view)
-# ---------- Notes ----------
+    # ---------- Notes ----------
 @tree.command(name="note_add", description="Save a personal note.")
 async def note_add(inter: discord.Interaction, text: str):
     store.add_note(inter.user.id, text)
@@ -1511,7 +1511,7 @@ async def notes(inter: discord.Interaction, delete_index: Optional[app_commands.
     lines = [f"{i}. {t}" for i, t in arr]
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-# ---------- Channel Pin ----------
+    # ---------- Channel Pin ----------
 @tree.command(name="pin_set", description="Set a sticky pin for this channel.")
 async def pin_set(inter: discord.Interaction, text: str):
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
@@ -1533,7 +1533,7 @@ async def pin_clear(inter: discord.Interaction):
     store.clear_pin(inter.channel.id)
     await inter.response.send_message("🧹 Pin cleared.", ephemeral=True)
 
-# ---------- Polls (persistent) ----------
+    # ---------- Polls (persistent) ----------
 class PollView(discord.ui.View):
     def __init__(self, message_id: int, options: List[str], creator_id: int, timeout: Optional[float] = None):
         super().__init__(timeout=timeout)  # persistent
@@ -1609,7 +1609,7 @@ async def poll(inter: discord.Interaction, question: str, options: str):
     view = PollView(message_id=msg.id, options=opts, creator_id=inter.user.id, timeout=None)
     await msg.edit(view=view)
 
-# ---------- Helpers: choose & timer ----------
+    # ---------- Helpers: choose & timer ----------
 @tree.command(name="choose", description="Pick a random choice from a comma-separated list.")
 async def choose(inter: discord.Interaction, options: str):
     arr = [x.strip() for x in options.split(",") if x.strip()]
@@ -1637,7 +1637,7 @@ async def timer(inter: discord.Interaction, seconds: app_commands.Range[int, 1, 
     except discord.HTTPException:
         pass
 
-# ---------- Trivia via OpenTDB ----------
+    # ---------- Trivia via OpenTDB ----------
 async def _get_or_create_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
     token = store.get_trivia_token()
     if token:
@@ -1837,7 +1837,7 @@ async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.C
     else:
         await msg.edit(content=f"❌ Nope. Correct answer was **{letters[correct_idx]}**.", embed=None, view=None)
 
-# ---------- Blackjack (Dealer or PvP) ----------
+    # ---------- Blackjack (Dealer or PvP) ----------
 def is_blackjack(cards: List[Tuple[str, str]]) -> bool:
     return len(cards) == 2 and hand_value(cards) == 21
 
@@ -1980,7 +1980,7 @@ async def blackjack(inter: discord.Interaction, bet: app_commands.Range[int, 1, 
     final.add_field(name="Outcome", value=result, inline=False)
     await msg.edit(embed=final, view=None)
 
-# ---------- High/Low ----------
+    # ---------- High/Low ----------
 @tree.command(name="highlow", description="Guess if the next card is higher or lower (1:1 payout).")
 @app_commands.describe(bet="Amount to wager")
 async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
@@ -2026,7 +2026,7 @@ async def highlow(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_
     emb.add_field(name="Outcome", value=outcome, inline=False)
     await msg.edit(embed=emb, view=None)
 
-# ---------- Dice Duel ----------
+    # ---------- Dice Duel ----------
 @tree.command(name="diceduel", description="Challenge another player to a quick dice duel (2d6 vs 2d6).")
 @app_commands.describe(bet="Optional wager (both must afford it)", opponent="User to challenge")
 async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Optional[app_commands.Range[int, 1, 1_000_000]] = None):
@@ -2064,7 +2064,7 @@ async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Opti
     await inter.followup.send(embed=emb)
 
 
-# ---------- Connect 4 (AI or PvP, wagerable) ----------
+    # ---------- Connect 4 (AI or PvP, wagerable) ----------
 C4_ROWS, C4_COLS = 6, 7
 C4_EMPTY, C4_P1, C4_P2 = 0, 1, 2
 C4_EMOJI = {C4_EMPTY: "⚪", C4_P1: "🔴", C4_P2: "🟡"}
@@ -2323,7 +2323,7 @@ async def connect4_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 
     view = Connect4View(mode="pvp", bet=int(bet), starter_id=inter.user.id, opponent_id=opponent.id)
     await inter.followup.send(embed=view._embed(f"Turn: <@{view.current_player_id}>"), view=view)
 
-# ---------- Slots (animated) ----------
+    # ---------- Slots (animated) ----------
 SLOT_SYMBOLS_BASE = ["🍒", "🍋", "🔔", "⭐", "🍀", "7️⃣"]
 WILD = "🃏"
 SLOT_SYMBOLS = SLOT_SYMBOLS_BASE + [WILD]
@@ -2419,7 +2419,7 @@ async def slots_internal(inter_or_ctx: discord.Interaction, bet: int):
 async def slots(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000]):
     await inter.response.defer(); await slots_internal(inter, bet)
 
-# ---------- Moderation (restricted to admins/allowlist) ----------
+    # ---------- Moderation (restricted to admins/allowlist) ----------
 @tree.command(name="purge", description="Bulk delete recent messages (max 1000).")
 @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
 @require_admin_or_allowlisted()
@@ -2582,7 +2582,7 @@ async def autodelete_list(inter: discord.Interaction):
 
     await inter.response.send_message(embed=emb, ephemeral=True)
 
-# ---------- Leaderboard & Achievements ----------
+    # ---------- Leaderboard & Achievements ----------
 @tree.command(name="leaderboard", description="Show the top players.")
 @app_commands.describe(category="Choose 'balance' or 'wins'")
 @app_commands.choices(category=[app_commands.Choice(name="balance", value="balance"), app_commands.Choice(name="wins", value="wins")])
@@ -2609,7 +2609,7 @@ async def achievements(inter: discord.Interaction, user: Optional[discord.User] 
     emb.add_field(name="Record", value=f"{stats.get('wins',0)}W / {stats.get('losses',0)}L / {stats.get('pushes',0)}P", inline=False)
     await inter.response.send_message(embed=emb)
 
-# ---------- Background Cleaner ----------
+    # ---------- Background Cleaner ----------
 @tasks.loop(minutes=2)
 async def cleanup_loop():
     conf = store.get_autodelete()
@@ -2640,7 +2640,7 @@ async def cleanup_loop():
 async def before_cleanup():
     await bot.wait_until_ready()
 
-# ---------- Reminders ----------
+    # ---------- Reminders ----------
 def _chicago_tz_for(dt_naive: datetime):
     if ZoneInfo is not None:
         try:
@@ -2779,7 +2779,7 @@ async def reminders_scheduler():
     except Exception:
         pass
 
-# ---------- Per-message auto-delete for short TTL channels (<60s) ----------
+    # ---------- Per-message auto-delete for short TTL channels (<60s) ----------
 async def _schedule_autodelete(message: discord.Message, seconds: int):
     try:
         await asyncio.sleep(max(1, int(seconds)))
@@ -2828,7 +2828,7 @@ async def on_message(message: discord.Message):
 async def before_reminders():
     await bot.wait_until_ready()
 
-# ---------- Admin Allowlist Commands (real admins only) ----------
+    # ---------- Admin Allowlist Commands (real admins only) ----------
 @tree.command(name="admin_allow", description="Allow a user to use admin bot commands.")
 @require_real_admin()
 @app_commands.describe(user="User to allow")
@@ -2865,7 +2865,7 @@ async def admin_list(inter: discord.Interaction):
     await inter.response.send_message("**Admin allowlist:**\n" + "\n".join(lines), ephemeral=True)
 
 
-# ---------- Debug / Health ----------
+    # ---------- Debug / Health ----------
 @tree.command(name="debug_store", description="Show backend status and table counts.")
 async def debug_store(inter: discord.Interaction):
     stats = store.get_backend_stats()
@@ -2889,7 +2889,7 @@ async def debug_store(inter: discord.Interaction):
     await inter.response.send_message(embed=emb, ephemeral=True)
 
 
-# ---------- Startup ----------
+    # ---------- Startup ----------
 @bot.event
 async def on_ready():
     # Sync slash commands
@@ -2917,7 +2917,7 @@ async def on_ready():
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
-# ---------- Main ----------
+    # ---------- Main ----------
 def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
@@ -2925,7 +2925,7 @@ def main():
     bot.run(token)
 # ========================= NEW GAMES: Roulette & Texas Hold'em =========================
 
-# ---------- Roulette ----------
+    # ---------- Roulette ----------
 ROULETTE_RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 ROULETTE_BLACK = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
 
@@ -3024,7 +3024,7 @@ async def roulette_cmd(inter: discord.Interaction, bet: app_commands.Range[int, 
     final.add_field(name="Net", value=(f"+{net}" if net >= 0 else str(net)), inline=True)
     await msg.edit(embed=final)
 
-# ---------- Texas Hold'em (Heads-up, fixed-stake, animated reveal) ----------
+    # ---------- Texas Hold'em (Heads-up, fixed-stake, animated reveal) ----------
 
 POKER_RANK_ORDER = {"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13,"A":14}
 

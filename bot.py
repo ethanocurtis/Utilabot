@@ -369,6 +369,11 @@ class Store:
                                 (int(uid), int(sid), z, cad, hh, mi, wdays, next_run))
             self.db.execute("DROP TABLE weather_subs")
             self.db.execute("ALTER TABLE weather_subs_new RENAME TO weather_subs")
+        # polls: add created_at column if missing
+        cols_p = [r[1] for r in self.db.execute("PRAGMA table_info(polls)").fetchall()]
+        if 'created_at' not in cols_p:
+            self.db.execute("ALTER TABLE polls ADD COLUMN created_at TEXT")
+
 
     # ---------- ID allocation helpers ----------
     def _lowest_free_id_for_user(self, table: str, user_id: int) -> int:
@@ -382,7 +387,15 @@ class Store:
                 break
         return i
 
-    # ---------- Debug / Health ----------
+    
+# ---------- Polls Cleanup ----------
+@tree.command(name="polls_cleanup", description="Delete closed polls (and optionally those older than N days).")
+@app_commands.describe(older_than_days="Also delete polls older than this many days (optional)")
+async def polls_cleanup(inter: discord.Interaction, older_than_days: int | None = None):
+    deleted = store.purge_closed_polls(older_than_days)
+    await inter.response.send_message(f"🧹 Deleted {deleted} poll(s).", ephemeral=True)
+
+# ---------- Debug / Health ----------
     def get_backend_stats(self) -> dict:
         tables = ["wallets","inventory","daily","work","streaks","stats","achievements","autodelete","notes","pins","polls","reminders","admin_allowlist","weather_zips","weather_subs"]
         counts = {}
@@ -574,11 +587,36 @@ class Store:
         self.db.execute("DELETE FROM pins WHERE channel_id=?", (int(channel_id),))
 
     # ---------- polls ----------
-    def save_poll(self, message_id: int, poll: dict):
+
+    def purge_closed_polls(self, older_than_days: int | None = None) -> int:
+        deleted = 0
+        if older_than_days is None:
+            cur = self.db.execute("DELETE FROM polls WHERE is_open=0")
+            deleted += cur.rowcount
+        else:
+            # delete closed polls or any poll older than N days
+            cur = self.db.execute(
+                "DELETE FROM polls WHERE is_open=0 OR (created_at IS NOT NULL AND julianday('now') - julianday(created_at) > ?)",
+                (int(older_than_days),)
+            )
+            deleted += cur.rowcount
+        return deleted
+
+    
+def save_poll(self, message_id: int, poll: dict):
         is_open = 1 if poll.get("open", True) else 0
-        self.db.execute("""INSERT INTO polls(message_id,json,is_open) VALUES(?,?,?)
-                           ON CONFLICT(message_id) DO UPDATE SET json=excluded.json,is_open=excluded.is_open""",
-                        (int(message_id), json.dumps(poll), is_open))
+        mid = int(message_id)
+        if is_open == 0:
+            # Auto-delete closed polls when saved
+            self.db.execute("DELETE FROM polls WHERE message_id=?", (mid,))
+            return
+        # Upsert open poll; if exists, update; else insert with created_at=now
+        cur = self.db.execute("UPDATE polls SET json=?, is_open=1 WHERE message_id=?", (json.dumps(poll), mid))
+        if cur.rowcount == 0:
+            # insert new with created_at timestamp (UTC)
+            self.db.execute("INSERT INTO polls(message_id,json,is_open,created_at) VALUES(?,?,1, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+                            (mid, json.dumps(poll)))
+
 
     def get_poll(self, message_id: int):
         row = self.db.execute("SELECT json FROM polls WHERE message_id=?", (int(message_id),)).fetchone()

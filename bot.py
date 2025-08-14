@@ -2068,6 +2068,262 @@ async def coinflip(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1
 
     await inter.response.send_message(msg)
 
+# ============================
+#   PASSIVE BUSINESSES SYSTEM
+# ============================
+# Features:
+#  - /businesses           -> list owned businesses, levels, timers, yields
+#  - /buy_business         -> purchase a business
+#  - /collect_business     -> collect payouts (with random events)
+#  - /sell_business        -> sell a business for partial refund
+#  - /upgrade_business     -> increase business level (higher yield)
+#
+# Storage:
+#  - Inventory item: "Business: <name>"
+#  - Notes (per business):
+#      key f"biz_{name}_ts"  -> last-collect ISO timestamp
+#      key f"biz_{name}_lvl" -> int level >= 1
+#
+# Drop-in: requires only your existing `store` methods.
+
+import random
+from datetime import datetime, timezone, timedelta
+
+# ---- Catalog (tweak freely) ----
+BUSINESSES = {
+    "Lemonade Stand":  {"cost": 5_000,     "yield": 500,     "hours": 6},
+    "Food Truck":      {"cost": 20_000,    "yield": 2_500,   "hours": 6},
+    "Car Wash":        {"cost": 50_000,    "yield": 7_500,   "hours": 8},
+    "Mini-Mart":       {"cost": 100_000,   "yield": 15_000,  "hours": 8},
+    "Arcade":          {"cost": 250_000,   "yield": 40_000,  "hours": 12},
+    "Restaurant":      {"cost": 500_000,   "yield": 90_000,  "hours": 12},
+    "Tech Startup":    {"cost": 1_000_000, "yield": 225_000, "hours": 24},
+    "Casino":          {"cost": 5_000_000, "yield": 1_000_000, "hours": 24},
+}
+
+# Level scaling (applies to 'yield' only). Max level = len(LEVEL_MULTIPLIER)
+LEVEL_MULTIPLIER = [1.00, 1.60, 2.20, 3.00, 4.00]  # L1..L5
+MAX_LEVEL = len(LEVEL_MULTIPLIER)
+
+# Upgrade cost factor: base_cost * level * UPGRADE_FACTOR
+UPGRADE_FACTOR = 0.9
+
+# Sellback baseline: ~50% at level 1, +15% per extra level
+def sell_value(base_cost: int, level: int) -> int:
+    return int(base_cost * (0.50 + 0.15 * (max(level,1)-1)))
+
+# Random events — applied to THIS collection only
+# Each entry: (label, multiplier, probability)
+BUSINESS_EVENTS = [
+    ("Booming Day 🎉",       1.50, 0.10),
+    ("Slow Foot Traffic 🐢", 0.70, 0.12),
+    ("Supply Discount 📦",   1.20, 0.10),
+    ("Staff Shortage 😵",    0.85, 0.10),
+    ("VIP Visit 🌟",         1.30, 0.06),
+    ("Ad Flopped 🪫",        0.90, 0.12),
+    # implicit default: ("Normal Day", 1.00, remaining probability)
+]
+
+# -------- Helpers --------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _note_key_ts(name: str) -> str:  return f"biz_{name}_ts"
+def _note_key_lvl(name: str) -> str: return f"biz_{name}_lvl"
+def _inv_name(name: str) -> str:     return f"Business: {name}"
+
+def _get_level(uid: int, name: str) -> int:
+    s = store.get_note(uid, _note_key_lvl(name))
+    try:
+        return max(1, min(MAX_LEVEL, int(s)))
+    except Exception:
+        return 1
+
+def _set_level(uid: int, name: str, lvl: int):
+    lvl = max(1, min(MAX_LEVEL, int(lvl)))
+    store.set_note(uid, _note_key_lvl(name), str(lvl))
+
+def _get_last_ts(uid: int, name: str) -> datetime | None:
+    s = store.get_note(uid, _note_key_ts(name))
+    if not s: return None
+    try:
+        # try fromisoformat; fall back if library uses naive
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def _set_ts(uid: int, name: str, ts: datetime | None):
+    store.set_note(uid, _note_key_ts(name), (ts or now_utc()).isoformat())
+
+def _owns(uid: int, name: str) -> bool:
+    inv = store.get_inventory(uid) or {}
+    return inv.get(_inv_name(name), 0) > 0
+
+def _hours_until_ready(uid: int, name: str) -> float:
+    last = _get_last_ts(uid, name)
+    if not last: return 0.0
+    hrs = BUSINESSES[name]["hours"]
+    delta = now_utc() - last
+    rem = hrs - (delta.total_seconds() / 3600.0)
+    return max(0.0, rem)
+
+def _weighted_event() -> tuple[str, float]:
+    # roll one event based on BUSINESS_EVENTS probabilities
+    roll = random.random()
+    acc = 0.0
+    for label, mult, p in BUSINESS_EVENTS:
+        acc += p
+        if roll < acc:
+            return (label, mult)
+    return ("Normal Day", 1.0)
+
+# -------- Commands --------
+@tree.command(name="businesses", description="List your businesses, levels, yields, and timers.")
+async def businesses(inter: discord.Interaction, user: discord.User | None = None):
+    target = user or inter.user
+    inv = store.get_inventory(target.id) or {}
+    owned = [k.replace("Business: ", "") for k,v in inv.items() if k.startswith("Business: ") and v > 0]
+    if not owned:
+        return await inter.response.send_message(f"🔎 **{target.display_name}** owns no businesses.")
+
+    lines = []
+    for name in owned:
+        base = BUSINESSES.get(name)
+        if not base:
+            lines.append(f"• **{name}** (unknown)")
+            continue
+        lvl = _get_level(target.id, name)
+        mult = LEVEL_MULTIPLIER[lvl-1]
+        hourly = base["yield"] * mult / base["hours"]
+        hrs_left = _hours_until_ready(target.id, name)
+        status = "Ready ✅" if hrs_left == 0 else f"Ready in ~{hrs_left:.1f}h"
+        lines.append(
+            f"• **{name}** — L{lvl} | yield **{int(base['yield']*mult)}** every **{base['hours']}h** "
+            f"(~{int(hourly)}/h) — {status}"
+        )
+
+    emb = discord.Embed(title=f"🏢 Businesses — {target.display_name}", description="\n".join(lines))
+    await inter.response.send_message(embed=emb)
+
+@tree.command(name="buy_business", description="Purchase a business to earn passive income.")
+@app_commands.describe(name="Exact business name (see /businesses)", confirm="Type YES to confirm purchase")
+async def buy_business(inter: discord.Interaction, name: str, confirm: str = "NO"):
+    name = name.strip()
+    base = BUSINESSES.get(name)
+    if not base:
+        return await inter.response.send_message("❌ Unknown business name.", ephemeral=True)
+    if _owns(inter.user.id, name):
+        return await inter.response.send_message("You already own this business.", ephemeral=True)
+    if confirm.upper() != "YES":
+        return await inter.response.send_message(f"Type `YES` to confirm buying **{name}** for **{base['cost']}**.", ephemeral=True)
+    if store.get_balance(inter.user.id) < base["cost"]:
+        return await inter.response.send_message("Not enough credits.", ephemeral=True)
+
+    store.add_balance(inter.user.id, -base["cost"])
+    store.add_item(inter.user.id, _inv_name(name), 1)
+    _set_level(inter.user.id, name, 1)
+    _set_ts(inter.user.id, name, now_utc())  # start the timer now
+    await inter.response.send_message(f"✅ Bought **{name}** (L1). Pays **{base['yield']}** every **{base['hours']}h**.")
+
+@tree.command(name="sell_business", description="Sell one of your businesses for a partial refund.")
+@app_commands.describe(name="Exact business name (see /businesses)", confirm="Type YES to confirm selling")
+async def sell_business(inter: discord.Interaction, name: str, confirm: str = "NO"):
+    name = name.strip()
+    base = BUSINESSES.get(name)
+    if not base or not _owns(inter.user.id, name):
+        return await inter.response.send_message("❌ You don't own that.", ephemeral=True)
+    lvl = _get_level(inter.user.id, name)
+    value = sell_value(base["cost"], lvl)
+    if confirm.upper() != "YES":
+        return await inter.response.send_message(f"Type `YES` to confirm selling **{name} (L{lvl})** for **{value}**.", ephemeral=True)
+
+    store.remove_item(inter.user.id, _inv_name(name), 1)
+    store.add_balance(inter.user.id, value)
+    # clear notes
+    store.set_note(inter.user.id, _note_key_ts(name), "")
+    store.set_note(inter.user.id, _note_key_lvl(name), "")
+    await inter.response.send_message(f"💸 Sold **{name} (L{lvl})** for **{value}**.")
+
+@tree.command(name="upgrade_business", description="Upgrade a business to increase its yield.")
+@app_commands.describe(name="Exact business name (see /businesses)")
+async def upgrade_business(inter: discord.Interaction, name: str):
+    name = name.strip()
+    if not _owns(inter.user.id, name):
+        return await inter.response.send_message("❌ You don't own that business.", ephemeral=True)
+    base = BUSINESSES.get(name)
+    lvl = _get_level(inter.user.id, name)
+    if lvl >= MAX_LEVEL:
+        return await inter.response.send_message(f"⚠️ **{name}** is already max level (L{MAX_LEVEL}).", ephemeral=True)
+
+    cost = int(base["cost"] * (lvl) * UPGRADE_FACTOR)
+    if store.get_balance(inter.user.id) < cost:
+        return await inter.response.send_message(f"Need **{cost}** credits to upgrade to L{lvl+1}.", ephemeral=True)
+
+    store.add_balance(inter.user.id, -cost)
+    _set_level(inter.user.id, name, lvl+1)
+    new_yield = int(base["yield"] * LEVEL_MULTIPLIER[lvl])  # lvl+1 index
+    await inter.response.send_message(
+        f"⬆️ Upgraded **{name}** to **L{lvl+1}**. New yield: **{new_yield}** every **{base['hours']}h**."
+    )
+
+@tree.command(name="collect_business", description="Collect earnings from all your businesses (random events may apply).")
+async def collect_business(inter: discord.Interaction):
+    inv = store.get_inventory(inter.user.id) or {}
+    owned = [k.replace("Business: ", "") for k,v in inv.items() if k.startswith("Business: ") and v > 0]
+    if not owned:
+        return await inter.response.send_message("You don't own any businesses.", ephemeral=True)
+
+    total_earned = 0
+    lines = []
+
+    for name in owned:
+        base = BUSINESSES.get(name)
+        if not base:
+            continue
+        lvl = _get_level(inter.user.id, name)
+        mult = LEVEL_MULTIPLIER[lvl-1]
+        per_cycle = int(base["yield"] * mult)
+
+        last = _get_last_ts(inter.user.id, name)
+        if not last:
+            # if never collected, set to now and skip paying to avoid instant farm
+            _set_ts(inter.user.id, name, now_utc())
+            lines.append(f"• **{name} (L{lvl})** — timer started. Come back later.")
+            continue
+
+        hours = base["hours"]
+        elapsed_h = (now_utc() - last).total_seconds() / 3600.0
+        cycles = int(elapsed_h // hours)
+
+        if cycles <= 0:
+            rem = hours - elapsed_h
+            lines.append(f"• **{name} (L{lvl})** — not ready. (~{rem:.1f}h left)")
+            continue
+
+        # Apply random event ONCE to the whole batch being collected for this business
+        label, event_mult = _weighted_event()
+        earned = int(per_cycle * cycles * event_mult)
+        total_earned += earned
+        store.add_balance(inter.user.id, earned)
+        _set_ts(inter.user.id, name, last + timedelta(hours=cycles*hours))
+
+        # Explain result
+        base_amt = per_cycle * cycles
+        note_event = "" if event_mult == 1.0 else f" × {event_mult:.2f} **{label}**"
+        lines.append(
+            f"• **{name} (L{lvl})** — {cycles}× cycles: {base_amt}{note_event} → **{earned}**"
+        )
+
+    if total_earned == 0:
+        return await inter.response.send_message("\n".join(lines))
+
+    bal = store.get_balance(inter.user.id)
+    emb = discord.Embed(title="💰 Business Collection")
+    emb.add_field(name="Collections", value="\n".join(lines), inline=False)
+    emb.set_footer(text=f"Total earned: {total_earned} • New balance: {bal}")
+    await inter.response.send_message(embed=emb)
+
 # ---------- Connect 4 (AI or PvP, wagerable) ----------
 C4_ROWS, C4_COLS = 6, 7
 C4_EMPTY, C4_P1, C4_P2 = 0, 1, 2

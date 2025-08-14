@@ -2068,9 +2068,7 @@ async def coinflip(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1
 
     await inter.response.send_message(msg)
 
-# ============================
-#   PASSIVE BUSINESSES SYSTEM
-# ============================
+
 # Features:
 #  - /businesses           -> list owned businesses, levels, timers, yields
 #  - /buy_business         -> purchase a business
@@ -3768,3 +3766,142 @@ async def update_poll_message(channel: discord.abc.Messageable, message_id: int,
     except Exception:
         pass
 
+# ============================
+#   PASSIVE BUSINESSES SYSTEM
+# ============================
+# Features:
+#  - /businesses           -> list owned businesses, levels, timers, yields
+#  - /buy_business         -> purchase a business (dropdown selection)
+#  - /collect_business     -> collect payouts (with random events)
+#  - /sell_business        -> sell a business for partial refund
+#  - /upgrade_business     -> increase business level (higher yield)
+#
+# Storage:
+#  - Inventory item: "Business: <name>"
+#  - Notes (per business):
+#      key f"biz_{name}_ts"  -> last-collect ISO timestamp
+#      key f"biz_{name}_lvl" -> int level >= 1
+#
+# Drop-in: requires only your existing `store` methods.
+
+import random
+from datetime import datetime, timezone, timedelta
+import discord
+from discord import app_commands
+
+# ---- Catalog (tweak freely) ----
+BUSINESSES = {
+    "Lemonade Stand":  {"cost": 5_000,     "yield": 500,     "hours": 6},
+    "Food Truck":      {"cost": 20_000,    "yield": 2_500,   "hours": 6},
+    "Car Wash":        {"cost": 50_000,    "yield": 7_500,   "hours": 8},
+    "Mini-Mart":       {"cost": 100_000,   "yield": 15_000,  "hours": 8},
+    "Arcade":          {"cost": 250_000,   "yield": 40_000,  "hours": 12},
+    "Restaurant":      {"cost": 500_000,   "yield": 90_000,  "hours": 12},
+    "Tech Startup":    {"cost": 1_000_000, "yield": 225_000, "hours": 24},
+    "Casino":          {"cost": 5_000_000, "yield": 1_000_000, "hours": 24},
+}
+
+# Level scaling (applies to 'yield' only). Max level = len(LEVEL_MULTIPLIER)
+LEVEL_MULTIPLIER = [1.00, 1.60, 2.20, 3.00, 4.00]  # L1..L5
+MAX_LEVEL = len(LEVEL_MULTIPLIER)
+
+# Upgrade cost factor: base_cost * level * UPGRADE_FACTOR
+UPGRADE_FACTOR = 0.9
+
+# Sellback baseline: ~50% at level 1, +15% per extra level
+def sell_value(base_cost: int, level: int) -> int:
+    return int(base_cost * (0.50 + 0.15 * (max(level,1)-1)))
+
+# Random events — applied to THIS collection only
+# Each entry: (label, multiplier, probability)
+BUSINESS_EVENTS = [
+    ("Booming Day 🎉",       1.50, 0.10),
+    ("Slow Foot Traffic 🐢", 0.70, 0.12),
+    ("Supply Discount 📦",   1.20, 0.10),
+    ("Staff Shortage 😵",    0.85, 0.10),
+    ("VIP Visit 🌟",         1.30, 0.06),
+    ("Ad Flopped 🪫",        0.90, 0.12),
+]
+
+# -------- Helpers --------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _note_key_ts(name: str) -> str:  return f"biz_{name}_ts"
+def _note_key_lvl(name: str) -> str: return f"biz_{name}_lvl"
+def _inv_name(name: str) -> str:     return f"Business: {name}"
+
+def _get_level(uid: int, name: str) -> int:
+    s = store.get_note(uid, _note_key_lvl(name))
+    try:
+        return max(1, min(MAX_LEVEL, int(s)))
+    except Exception:
+        return 1
+
+def _set_level(uid: int, name: str, lvl: int):
+    lvl = max(1, min(MAX_LEVEL, int(lvl)))
+    store.set_note(uid, _note_key_lvl(name), str(lvl))
+
+def _get_last_ts(uid: int, name: str) -> datetime | None:
+    s = store.get_note(uid, _note_key_ts(name))
+    if not s: return None
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def _set_ts(uid: int, name: str, ts: datetime | None):
+    store.set_note(uid, _note_key_ts(name), (ts or now_utc()).isoformat())
+
+def _owns(uid: int, name: str) -> bool:
+    inv = store.get_inventory(uid) or {}
+    return inv.get(_inv_name(name), 0) > 0
+
+def _hours_until_ready(uid: int, name: str) -> float:
+    last = _get_last_ts(uid, name)
+    if not last: return 0.0
+    hrs = BUSINESSES[name]["hours"]
+    delta = now_utc() - last
+    rem = hrs - (delta.total_seconds() / 3600.0)
+    return max(0.0, rem)
+
+def _weighted_event() -> tuple[str, float]:
+    roll = random.random()
+    acc = 0.0
+    for label, mult, p in BUSINESS_EVENTS:
+        acc += p
+        if roll < acc:
+            return (label, mult)
+    return ("Normal Day", 1.0)
+
+# -------- Dropdown View --------
+class BusinessDropdown(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=name, description=f"Cost: {info['cost']}, Yield: {info['yield']} / {info['hours']}h")
+            for name, info in BUSINESSES.items()
+        ]
+        super().__init__(placeholder="Select a business to buy...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        name = self.values[0]
+        base = BUSINESSES[name]
+        if _owns(interaction.user.id, name):
+            return await interaction.response.send_message("You already own this business.", ephemeral=True)
+        if store.get_balance(interaction.user.id) < base["cost"]:
+            return await interaction.response.send_message("Not enough credits.", ephemeral=True)
+        store.add_balance(interaction.user.id, -base["cost"])
+        store.add_item(interaction.user.id, _inv_name(name), 1)
+        _set_level(interaction.user.id, name, 1)
+        _set_ts(interaction.user.id, name, now_utc())
+        await interaction.response.send_message(f"✅ Bought **{name}** (L1). Pays **{base['yield']}** every **{base['hours']}h**.")
+
+class BusinessView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.add_item(BusinessDropdown())
+
+@tree.command(name="buy_business", description="Purchase a business via dropdown selection.")
+async def buy_business(inter: discord.Interaction):
+    await inter.response.send_message("Select a business to buy:", view=BusinessView(), ephemeral=True)

@@ -174,7 +174,7 @@ def _weighted_event() -> tuple[str, float]:
     return ("Normal Day", 1.0)
 
 # ---------- Core (standalone) commands ----------
-@tree.command(name="businesses", description="List your businesses, levels, yields, and timers.")
+
 async def businesses(inter: discord.Interaction, user: discord.User | None = None):
     target = user or inter.user
     inv = store.get_inventory(target.id) or {}

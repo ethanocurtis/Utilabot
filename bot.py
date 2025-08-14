@@ -60,6 +60,35 @@ US_STATE_TO_ABBR = {
 }
 
 
+async def _http_get_json(session: aiohttp.ClientSession, url: str, *, params: dict | None = None, timeout: int = 15):
+    \"\"\"GET JSON with retries and safer transfer handling.\"\"\"
+    to = aiohttp.ClientTimeout(total=timeout)
+    last_err = None
+    hdrs = dict(HTTP_HEADERS)
+    hdrs.setdefault("Accept-Encoding", "identity")
+    hdrs.setdefault("Connection", "close")
+    for _ in range(3):
+        try:
+            async with session.get(url, params=params, timeout=to, headers=hdrs) as r:
+                if r.status != 200:
+                    last_err = RuntimeError(f\"HTTP {r.status} from {url}\")
+                    continue
+                # Read the body explicitly; avoid chunk/gzip weirdness.
+                raw = await r.read()
+                # Try to decode and parse JSON
+                try:
+                    txt = raw.decode(\"utf-8\", errors=\"strict\")
+                except UnicodeDecodeError:
+                    txt = raw.decode(\"latin-1\", errors=\"ignore\")
+                return json.loads(txt)
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(str(last_err) if last_err else \"Request failed\")
+
+
+
+
 
 # Local offline fallback so trivia always works even if external APIs are down
 OFFLINE_TRIVIA = [
@@ -887,7 +916,7 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
         if len(z) != 5:
             return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
     try:
-        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS, connector=aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)) as session:
             # 1) ZIP -> lat/lon
             city, state, lat, lon = await _zip_to_place_and_coords(session, z)
             # (geocoding handled above)
@@ -903,10 +932,7 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
                 "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,precipitation,weather_code",
                 "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max,sunrise,sunset,wind_speed_10m_max",
             }
-            async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r2:
-                if r2.status != 200:
-                    return await inter.followup.send("Weather service is unavailable right now.", ephemeral=True)
-                wx = await r2.json()
+            wx = await _http_get_json(session, "https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
 
         cur = wx.get("current") or wx.get("current_weather") or {}
         # Normalize
@@ -1180,7 +1206,7 @@ async def weather_scheduler():
         subs = store.list_weather_subs(None)
         if not subs:
             return
-        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS, connector=aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)) as session:
             for s in subs:
                 due = datetime.fromisoformat(s["next_run_utc"]).replace(tzinfo=timezone.utc)
                 if due <= now_utc:

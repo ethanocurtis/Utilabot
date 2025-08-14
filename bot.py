@@ -371,6 +371,25 @@ class Store:
             self.db.execute("ALTER TABLE weather_subs_new RENAME TO weather_subs")
 
     # ---------- ID allocation helpers ----------
+
+# ---------- per-user note helpers (used by Business system) ----------
+def set_note(self, user_id: int, key: str, text: str) -> None:
+    """Store a small text note for a user under a string key.
+    Implemented on top of the existing KV table so we don't need a new schema.
+    Namespaced as note:{user_id}:{key}. Empty/None text clears the value to empty string."""
+    ns_key = f"note:{int(user_id)}:{key}"
+    val = "" if text is None else str(text)
+    self.db.execute(
+        "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (ns_key, val),
+    )
+
+def get_note(self, user_id: int, key: str) -> str:
+    """Fetch a per-user note stored via set_note. Returns '' if not set."""
+    ns_key = f"note:{int(user_id)}:{key}"
+    row = self.db.execute("SELECT value FROM kv WHERE key=?", (ns_key,)).fetchone()
+    return row[0] if row and row[0] is not None else ""
+
     def _lowest_free_id_for_user(self, table: str, user_id: int) -> int:
         cur = self.db.execute(f"SELECT id FROM {table} WHERE user_id=? ORDER BY id", (int(user_id),))
         used = [row[0] for row in cur.fetchall()]

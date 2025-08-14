@@ -48,48 +48,6 @@ HTTP_HEADERS = {
     "Accept": "application/json",
 }
 
-US_STATE_TO_ABBR = {
-    "Alabama":"AL","Alaska":"AK","Arizona":"AZ","Arkansas":"AR","California":"CA","Colorado":"CO","Connecticut":"CT",
-    "Delaware":"DE","District of Columbia":"DC","Florida":"FL","Georgia":"GA","Hawaii":"HI","Idaho":"ID","Illinois":"IL",
-    "Indiana":"IN","Iowa":"IA","Kansas":"KS","Kentucky":"KY","Louisiana":"LA","Maine":"ME","Maryland":"MD","Massachusetts":"MA",
-    "Michigan":"MI","Minnesota":"MN","Mississippi":"MS","Missouri":"MO","Montana":"MT","Nebraska":"NE","Nevada":"NV",
-    "New Hampshire":"NH","New Jersey":"NJ","New Mexico":"NM","New York":"NY","North Carolina":"NC","North Dakota":"ND",
-    "Ohio":"OH","Oklahoma":"OK","Oregon":"OR","Pennsylvania":"PA","Rhode Island":"RI","South Carolina":"SC","South Dakota":"SD",
-    "Tennessee":"TN","Texas":"TX","Utah":"UT","Vermont":"VT","Virginia":"VA","Washington":"WA","West Virginia":"WV",
-    "Wisconsin":"WI","Wyoming":"WY","Puerto Rico":"PR"
-}
-
-
-async def _http_get_json(session: aiohttp.ClientSession, url: str, *, params: dict | None = None, timeout: int = 15):
-    \"\"\"GET JSON with retries and safer transfer handling.\"\"\"
-    to = aiohttp.ClientTimeout(total=timeout)
-    last_err = None
-    hdrs = dict(HTTP_HEADERS)
-    hdrs.setdefault("Accept-Encoding", "identity")
-    hdrs.setdefault("Connection", "close")
-    for _ in range(3):
-        try:
-            async with session.get(url, params=params, timeout=to, headers=hdrs) as r:
-                if r.status != 200:
-                    last_err = RuntimeError(f\"HTTP {r.status} from {url}\")
-                    continue
-                # Read the body explicitly; avoid chunk/gzip weirdness.
-                raw = await r.read()
-                # Try to decode and parse JSON
-                try:
-                    txt = raw.decode(\"utf-8\", errors=\"strict\")
-                except UnicodeDecodeError:
-                    txt = raw.decode(\"latin-1\", errors=\"ignore\")
-                return json.loads(txt)
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(str(last_err) if last_err else \"Request failed\")
-
-
-
-
-
 # Local offline fallback so trivia always works even if external APIs are down
 OFFLINE_TRIVIA = [
     {"q": "What is the capital of France?", "choices": ["Berlin", "Madrid", "Paris", "Rome"], "answer_idx": 2},
@@ -916,11 +874,15 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
         if len(z) != 5:
             return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
     try:
-        async with aiohttp.ClientSession(headers=HTTP_HEADERS, connector=aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)) as session:
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             # 1) ZIP -> lat/lon
-            city, state, lat, lon = await _zip_to_place_and_coords(session, z)
-            # (geocoding handled above)
-                
+            async with session.get(f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status != 200:
+                    return await inter.followup.send("Couldn't look up that ZIP.", ephemeral=True)
+                zp = await r.json()
+            place = zp["places"][0]
+            lat = float(place["latitude"]); lon = float(place["longitude"])
+            city = place["place name"]; state = place["state abbreviation"]
 
             # 2) Weather: current + today's daily (for sunrise/sunset/uv and description)
             params = {
@@ -932,7 +894,10 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
                 "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,precipitation,weather_code",
                 "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max,sunrise,sunset,wind_speed_10m_max",
             }
-            wx = await _http_get_json(session, "https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
+            async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r2:
+                if r2.status != 200:
+                    return await inter.followup.send("Weather service is unavailable right now.", ephemeral=True)
+                wx = await r2.json()
 
         cur = wx.get("current") or wx.get("current_weather") or {}
         # Normalize
@@ -995,53 +960,15 @@ def _next_local_run(now_local: datetime, hh: int, mi: int, cadence: str) -> date
         target += timedelta(days=1 if cadence == "daily" else 7)
     return target
 
-
 async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str):
-    """Reliable ZIP -> (city, state_abbr, lat, lon) using Open-Meteo Geocoding.
-    Filters to US results and retries once on transient failures.
-    """
-    params = {
-        "name": str(zip_code),
-        "count": 5,
-        "language": "en",
-        "format": "json"
-    }
-    last_err = None
-    for _ in range(2):  # simple retry
-        try:
-            async with session.get("https://geocoding-api.open-meteo.com/v1/search", params=params, timeout=aiohttp.ClientTimeout(total=12)) as r:
-                if r.status != 200:
-                    last_err = RuntimeError(f"Geocoding failed with HTTP {r.status}")
-                    continue
-                payload = await r.json()
-            results = (payload or {}).get("results") or []
-            # Filter to US postal code matches first
-            def score(item):
-                # Prefer US + postal code matches; otherwise fall back to any US result
-                s = 0
-                if item.get("country_code") == "US":
-                    s += 2
-                if str(item.get("name","")).strip() == str(zip_code):
-                    s += 3
-                if str(item.get("feature_code","")).lower() == "postalcode":
-                    s += 2
-                return -s  # for min() selection
-            us_results = [it for it in results if it.get("country_code") == "US"]
-            pool = us_results or results
-            if not pool:
-                last_err = RuntimeError("ZIP not found.")
-                continue
-            best = min(pool, key=score)
-            city = (best.get("admin3") or best.get("admin2") or best.get("admin1") or best.get("name") or "").strip()
-            state_full = (best.get("admin1") or "").strip()
-            state_abbr = US_STATE_TO_ABBR.get(state_full, state_full or "US")
-            lat = float(best["latitude"])
-            lon = float(best["longitude"])
-            return city or best.get("name","Unknown"), state_abbr, lat, lon
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(str(last_err) if last_err else "Geocoding failed.")
+    async with session.get(f"https://api.zippopotam.us/us/{zip_code}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+        if r.status != 200:
+            raise RuntimeError("Invalid ZIP or lookup failed.")
+        zp = await r.json()
+    place = zp["places"][0]
+    city = place["place name"]; state = place["state abbreviation"]
+    lat = float(place["latitude"]); lon = float(place["longitude"])
+    return city, state, lat, lon
 
 
 async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float, days: int, tz_name: str = "auto"):
@@ -1206,7 +1133,7 @@ async def weather_scheduler():
         subs = store.list_weather_subs(None)
         if not subs:
             return
-        async with aiohttp.ClientSession(headers=HTTP_HEADERS, connector=aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)) as session:
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             for s in subs:
                 due = datetime.fromisoformat(s["next_run_utc"]).replace(tzinfo=timezone.utc)
                 if due <= now_utc:

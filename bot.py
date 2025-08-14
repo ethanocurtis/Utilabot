@@ -2042,6 +2042,31 @@ async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Opti
     emb.add_field(name="Outcome", value=outcome, inline=False)
     await inter.followup.send(embed=emb)
 
+#----- Coin Flip----
+@tree.command(name="coinflip", description="50/50 coin flip. Win 2x on a correct call.")
+@app_commands.describe(bet="Amount to wager", choice="heads or tails")
+async def coinflip(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], choice: str):
+    choice = choice.strip().lower()
+    if choice not in ("heads", "tails"):
+        return await inter.response.send_message("Pick **heads** or **tails**.", ephemeral=True)
+
+    bal = store.get_balance(inter.user.id)  # wallet helpers already exist 
+    if bet > bal:
+        return await inter.response.send_message("❌ You don't have that many credits.", ephemeral=True)
+    store.add_balance(inter.user.id, -bet)        # take bet 
+
+    import random
+    result = random.choice(["heads", "tails"])
+    if result == choice:
+        payout = bet * 2
+        store.add_balance(inter.user.id, payout)  # pay out 
+        store.add_result(inter.user.id, "win")    # stats W/L/P are tracked 
+        msg = f"🪙 It’s **{result}**! You won **{payout - bet}**. Balance: **{store.get_balance(inter.user.id)}**"
+    else:
+        store.add_result(inter.user.id, "loss")
+        msg = f"🪙 It’s **{result}**. You lost **{bet}**. Balance: **{store.get_balance(inter.user.id)}**"
+
+    await inter.response.send_message(msg)
 
 # ---------- Connect 4 (AI or PvP, wagerable) ----------
 C4_ROWS, C4_COLS = 6, 7

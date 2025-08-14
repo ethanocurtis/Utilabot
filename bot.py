@@ -12,7 +12,6 @@ from discord import app_commands
 
 # External deps
 import aiohttp
-from aiohttp.http_exceptions import TransferEncodingError
 import html
 import urllib.parse
 import sqlite3  # NEW
@@ -861,10 +860,10 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
     try:
         async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             # 1) ZIP -> lat/lon
-            data = await _get_json(session, f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+            async with session.get(f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
                 if r.status != 200:
                     return await inter.followup.send("Couldn't look up that ZIP.", ephemeral=True)
-                zp = await r.json(content_type=None)
+                zp = await r.json()
             place = zp["places"][0]
             lat = float(place["latitude"]); lon = float(place["longitude"])
             city = place["place name"]; state = place["state abbreviation"]
@@ -882,7 +881,7 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
             async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r2:
                 if r2.status != 200:
                     return await inter.followup.send("Weather service is unavailable right now.", ephemeral=True)
-                wx = await r2.json(content_type=None)
+                wx = await r2.json()
 
         cur = wx.get("current") or wx.get("current_weather") or {}
         # Normalize
@@ -949,7 +948,7 @@ async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str
     async with session.get(f"https://api.zippopotam.us/us/{zip_code}", timeout=aiohttp.ClientTimeout(total=12)) as r:
         if r.status != 200:
             raise RuntimeError("Invalid ZIP or lookup failed.")
-        zp = await r.json(content_type=None)
+        zp = await r.json()
     place = zp["places"][0]
     city = place["place name"]; state = place["state abbreviation"]
     lat = float(place["latitude"]); lon = float(place["longitude"])
@@ -968,7 +967,7 @@ async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float,
     async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
         if r.status != 200:
             raise RuntimeError("Weather API unavailable.")
-        data = await r.json(content_type=None)
+        data = await r.json()
     daily = data.get("daily") or {}
     out = []
     dates = (daily.get("time") or [])[:days]
@@ -1623,7 +1622,8 @@ async def _get_or_create_trivia_token(session: aiohttp.ClientSession) -> Optiona
     if token:
         return token
     try:
-        async with session.get(TRIVIA_TOKEN_API, params={"command": "request"})
+        async with session.get(TRIVIA_TOKEN_API, params={"command": "request"}) as resp:
+            data = await resp.json()
             t = data.get("token")
             if t:
                 store.set_trivia_token(t)
@@ -1637,7 +1637,8 @@ async def _reset_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
     if not token:
         return await _get_or_create_trivia_token(session)
     try:
-        _ = await _get_json(session, TRIVIA_TOKEN_API, params={"command": "reset", "token": token})
+        async with session.get(TRIVIA_TOKEN_API, params={"command": "reset", "token": token}) as resp:
+            _ = await resp.json()
         return token
     except Exception:
         return None
@@ -1655,7 +1656,7 @@ async def _fetch_from_opentdb(session: aiohttp.ClientSession, difficulty: Option
             if resp.status != 200:
                 return None
             try:
-                return await resp.json(content_type=None)
+                return await resp.json()
             except Exception:
                 return None
 
@@ -1702,7 +1703,7 @@ async def _fetch_from_the_trivia_api(session: aiohttp.ClientSession, difficulty:
             if resp.status != 200:
                 return None
             try:
-                data = await resp.json(content_type=None)
+                data = await resp.json()
             except Exception:
                 return None
         if not isinstance(data, list) or not data:
@@ -1772,7 +1773,7 @@ DIFF_CHOICES = [
 async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.Choice[str]] = None):
     await inter.response.defer()
     diff_val = difficulty.value if difficulty else None
-    async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+    async with aiohttp.ClientSession() as session:
         fetched = await fetch_trivia_question(session, diff_val or None)
     if not fetched:
         await inter.followup.send("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
@@ -2041,31 +2042,6 @@ async def diceduel(inter: discord.Interaction, opponent: discord.User, bet: Opti
     emb.add_field(name="Outcome", value=outcome, inline=False)
     await inter.followup.send(embed=emb)
 
-#----- Coin Flip----
-@tree.command(name="coinflip", description="50/50 coin flip. Win 2x on a correct call.")
-@app_commands.describe(bet="Amount to wager", choice="heads or tails")
-async def coinflip(inter: discord.Interaction, bet: app_commands.Range[int, 1, 1_000_000], choice: str):
-    choice = choice.strip().lower()
-    if choice not in ("heads", "tails"):
-        return await inter.response.send_message("Pick **heads** or **tails**.", ephemeral=True)
-
-    bal = store.get_balance(inter.user.id)  # wallet helpers already exist 
-    if bet > bal:
-        return await inter.response.send_message("❌ You don't have that many credits.", ephemeral=True)
-    store.add_balance(inter.user.id, -bet)        # take bet 
-
-    import random
-    result = random.choice(["heads", "tails"])
-    if result == choice:
-        payout = bet * 2
-        store.add_balance(inter.user.id, payout)  # pay out 
-        store.add_result(inter.user.id, "win")    # stats W/L/P are tracked 
-        msg = f"🪙 It’s **{result}**! You won **{payout - bet}**. Balance: **{store.get_balance(inter.user.id)}**"
-    else:
-        store.add_result(inter.user.id, "loss")
-        msg = f"🪙 It’s **{result}**. You lost **{bet}**. Balance: **{store.get_balance(inter.user.id)}**"
-
-    await inter.response.send_message(msg)
 
 # ---------- Connect 4 (AI or PvP, wagerable) ----------
 C4_ROWS, C4_COLS = 6, 7
@@ -3062,14 +3038,6 @@ def _evaluate_best_5(cards: list) -> tuple:
 
     # counts
     from collections import Counter
-
-# --- HTTP defaults (added by fixer) ---
-HTTP_HEADERS = {
-    "User-Agent": "UtilaBot/1.0 (+https://github.com/ethanocurtis/Utilabot)",
-    "Accept": "application/json",
-    "Accept-Encoding": "identity",
-}
-
     rc = Counter(ranks)
     sc = Counter(suits)
 
@@ -3393,29 +3361,3 @@ async def update_poll_message(channel: discord.abc.Messageable, message_id: int,
     except Exception:
         pass
 
-
-# --- Robust JSON fetch helper (added by fixer) ---
-import asyncio, json as _json_mod
-
-async def _get_json(session: aiohttp.ClientSession, url: str, *, params=None, timeout_s: int = 15, retries: int = 2):
-    for attempt in range(retries + 1):
-        try:
-            async with session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=timeout_s),
-            ) as resp:
-                if resp.status != 200:
-                    raise aiohttp.ClientResponseError(
-                        resp.request_info, resp.history, status=resp.status, message="bad status", headers=resp.headers
-                    )
-                try:
-                    return await resp.json(content_type=None)
-                except aiohttp.ContentTypeError:
-                    txt = await resp.text()
-                    return _json_mod.loads(txt)
-        except (aiohttp.ClientPayloadError, TransferEncodingError, asyncio.TimeoutError, aiohttp.ClientOSError):
-            if attempt < retries:
-                await asyncio.sleep(0.4 * (attempt + 1))
-                continue
-            raise

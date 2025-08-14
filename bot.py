@@ -661,6 +661,22 @@ class Store:
     def remove_autodelete(self, channel_id: int):
         self.db.execute("DELETE FROM autodelete WHERE channel_id=?", (int(channel_id),))
 
+
+    def set_note(self, user_id: int, key: str, text: str) -> None:
+        ns_key = f"note:{int(user_id)}:{key}"
+        val = "" if text is None else str(text)
+        self.db.execute(
+            "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (ns_key, val),
+        )
+
+
+
+    def get_note(self, user_id: int, key: str) -> str:
+        ns_key = f"note:{int(user_id)}:{key}"
+        row = self.db.execute("SELECT value FROM kv WHERE key=?", (ns_key,)).fetchone()
+        return row[0] if row and row[0] is not None else ""
+
 store = Store(DATA_PATH)
 
 # ---------- Permissions helper ----------

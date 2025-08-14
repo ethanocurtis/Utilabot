@@ -474,7 +474,7 @@ except Exception:
     pass
 
 # Standalone alias: /business => open catalog (non-group)
-@tree.command(name="business", description="View the business catalog (alias).")
+
 async def business_alias(inter: discord.Interaction):
     await business_catalog.callback(inter, affordable_only=False)
 

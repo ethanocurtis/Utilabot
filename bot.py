@@ -863,10 +863,7 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
     try:
         async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             # 1) ZIP -> lat/lon
-            data = await _get_json(session, f"https://api.zippopotam.us/us/{z}", timeout_s=12)
-                if r.status != 200:
-                    return await inter.followup.send("Couldn't look up that ZIP.", ephemeral=True)
-                zp = await r.json(content_type=None)
+            data = await _get_json(session, f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
             place = zp["places"][0]
             lat = float(place["latitude"]); lon = float(place["longitude"])
             city = place["place name"]; state = place["state abbreviation"]
@@ -949,9 +946,8 @@ def _next_local_run(now_local: datetime, hh: int, mi: int, cadence: str) -> date
 
 async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str):
     async with session.get(f"https://api.zippopotam.us/us/{zip_code}", timeout=aiohttp.ClientTimeout(total=12)) as r:
-        if r.status != 200:
             raise RuntimeError("Invalid ZIP or lookup failed.")
-        zp = await r.json(content_type=None)
+        zp = zp  # already parsed JSON from _get_json
     place = zp["places"][0]
     city = place["place name"]; state = place["state abbreviation"]
     lat = float(place["latitude"]); lon = float(place["longitude"])
@@ -968,7 +964,6 @@ async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float,
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,sunrise,sunset,uv_index_max",
     }
     async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
-        if r.status != 200:
             raise RuntimeError("Weather API unavailable.")
         data = await r.json(content_type=None)
     daily = data.get("daily") or {}
@@ -3458,4 +3453,3 @@ async def diag_net(self, interaction: discord.Interaction):
             except Exception as e:
                 results.append(f"{url}\nERR {type(e).__name__}: {str(e)[:200]}")
     await interaction.followup.send("**Network diagnostics:**\n" + "\n\n".join(results))
-

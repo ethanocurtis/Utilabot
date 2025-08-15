@@ -19,7 +19,7 @@ import html
 import urllib.parse
 import sqlite3  # NEW
 
-try:
+    try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
@@ -861,10 +861,11 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
         z = re.sub(r"[^0-9]", "", str(zip))
         if len(z) != 5:
             return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
+    
     try:
-        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+        async with make_session() as session:
             # 1) ZIP -> lat/lon
-            data = await _get_json(session, f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+            zp = await _get_json(session, f"https://api.zippopotam.us/us/{z}", timeout_s=12)
             place = zp["places"][0]
             lat = float(place["latitude"]); lon = float(place["longitude"])
             city = place["place name"]; state = place["state abbreviation"]
@@ -879,10 +880,8 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
                 "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,precipitation,weather_code",
                 "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max,sunrise,sunset,wind_speed_10m_max",
             }
-            async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r2:
-                if r2.status != 200:
-                    return await inter.followup.send("Weather service is unavailable right now.", ephemeral=True)
-                wx = await r2.json(content_type=None)
+            wx = await _get_json(session, "https://api.open-meteo.com/v1/forecast", params=params, timeout_s=15)
+
 
         cur = wx.get("current") or wx.get("current_weather") or {}
         # Normalize
@@ -948,7 +947,7 @@ def _next_local_run(now_local: datetime, hh: int, mi: int, cadence: str) -> date
 async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str):
     async with session.get(f"https://api.zippopotam.us/us/{zip_code}", timeout=aiohttp.ClientTimeout(total=12)) as r:
             raise RuntimeError("Invalid ZIP or lookup failed.")
-        zp = zp  # already parsed JSON from _get_json
+            zp = zp  # already parsed JSON from _get_json
     place = zp["places"][0]
     city = place["place name"]; state = place["state abbreviation"]
     lat = float(place["latitude"]); lon = float(place["longitude"])

@@ -863,7 +863,7 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
     try:
         async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             # 1) ZIP -> lat/lon
-            data = await _get_json(session, f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+            data = await _get_json(session, f"https://api.zippopotam.us/us/{z}", timeout_s=12)
                 if r.status != 200:
                     return await inter.followup.send("Couldn't look up that ZIP.", ephemeral=True)
                 zp = await r.json(content_type=None)

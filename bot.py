@@ -12,8 +12,6 @@ from discord import app_commands
 
 # External deps
 import aiohttp
-import socket
-from aiohttp.http_exceptions import TransferEncodingError
 import html
 import urllib.parse
 import sqlite3  # NEW
@@ -46,7 +44,6 @@ TRIVIA_API_FALLBACK = "https://the-trivia-api.com/v2/questions"
 
 # HTTP headers to avoid 403s on some free APIs
 HTTP_HEADERS = {
-    "Connection": "close",
     "User-Agent": "UtilaBot/1.0 (+https://github.com/ethanocurtis/Utilabot)",
     "Accept": "application/json",
 }
@@ -863,7 +860,10 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
     try:
         async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             # 1) ZIP -> lat/lon
-            data = await _get_json(session, f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+            async with session.get(f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status != 200:
+                    return await inter.followup.send("Couldn't look up that ZIP.", ephemeral=True)
+                zp = await r.json()
             place = zp["places"][0]
             lat = float(place["latitude"]); lon = float(place["longitude"])
             city = place["place name"]; state = place["state abbreviation"]
@@ -881,7 +881,7 @@ async def weather_cmd(inter: discord.Interaction, zip: Optional[str] = None):
             async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r2:
                 if r2.status != 200:
                     return await inter.followup.send("Weather service is unavailable right now.", ephemeral=True)
-                wx = await r2.json(content_type=None)
+                wx = await r2.json()
 
         cur = wx.get("current") or wx.get("current_weather") or {}
         # Normalize
@@ -946,8 +946,9 @@ def _next_local_run(now_local: datetime, hh: int, mi: int, cadence: str) -> date
 
 async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str):
     async with session.get(f"https://api.zippopotam.us/us/{zip_code}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+        if r.status != 200:
             raise RuntimeError("Invalid ZIP or lookup failed.")
-        zp = zp  # already parsed JSON from _get_json
+        zp = await r.json()
     place = zp["places"][0]
     city = place["place name"]; state = place["state abbreviation"]
     lat = float(place["latitude"]); lon = float(place["longitude"])
@@ -964,8 +965,9 @@ async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float,
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,sunrise,sunset,uv_index_max",
     }
     async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200:
             raise RuntimeError("Weather API unavailable.")
-        data = await r.json(content_type=None)
+        data = await r.json()
     daily = data.get("daily") or {}
     out = []
     dates = (daily.get("time") or [])[:days]
@@ -1620,7 +1622,8 @@ async def _get_or_create_trivia_token(session: aiohttp.ClientSession) -> Optiona
     if token:
         return token
     try:
-        async with session.get(TRIVIA_TOKEN_API, params={"command": "request"})
+        async with session.get(TRIVIA_TOKEN_API, params={"command": "request"}) as resp:
+            data = await resp.json()
             t = data.get("token")
             if t:
                 store.set_trivia_token(t)
@@ -1634,7 +1637,8 @@ async def _reset_trivia_token(session: aiohttp.ClientSession) -> Optional[str]:
     if not token:
         return await _get_or_create_trivia_token(session)
     try:
-        _ = await _get_json(session, TRIVIA_TOKEN_API, params={"command": "reset", "token": token})
+        async with session.get(TRIVIA_TOKEN_API, params={"command": "reset", "token": token}) as resp:
+            _ = await resp.json()
         return token
     except Exception:
         return None
@@ -1652,7 +1656,7 @@ async def _fetch_from_opentdb(session: aiohttp.ClientSession, difficulty: Option
             if resp.status != 200:
                 return None
             try:
-                return await resp.json(content_type=None)
+                return await resp.json()
             except Exception:
                 return None
 
@@ -1699,7 +1703,7 @@ async def _fetch_from_the_trivia_api(session: aiohttp.ClientSession, difficulty:
             if resp.status != 200:
                 return None
             try:
-                data = await resp.json(content_type=None)
+                data = await resp.json()
             except Exception:
                 return None
         if not isinstance(data, list) or not data:
@@ -1769,7 +1773,7 @@ DIFF_CHOICES = [
 async def trivia(inter: discord.Interaction, difficulty: Optional[app_commands.Choice[str]] = None):
     await inter.response.defer()
     diff_val = difficulty.value if difficulty else None
-    async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+    async with aiohttp.ClientSession() as session:
         fetched = await fetch_trivia_question(session, diff_val or None)
     if not fetched:
         await inter.followup.send("⚠️ Couldn't fetch a trivia question right now. Try again in a bit.")
@@ -3059,15 +3063,6 @@ def _evaluate_best_5(cards: list) -> tuple:
 
     # counts
     from collections import Counter
-
-# --- HTTP defaults (added by fixer) ---
-HTTP_HEADERS = {
-    "Connection": "close",
-    "User-Agent": "UtilaBot/1.0 (+https://github.com/ethanocurtis/Utilabot)",
-    "Accept": "application/json",
-    "Accept-Encoding": "identity",
-}
-
     rc = Counter(ranks)
     sc = Counter(suits)
 
@@ -3391,65 +3386,3 @@ async def update_poll_message(channel: discord.abc.Messageable, message_id: int,
     except Exception:
         pass
 
-
-# --- Robust JSON fetch helper (added by fixer) ---
-import asyncio, json as _json_mod
-
-async def _get_json(session: aiohttp.ClientSession, url: str, *, params=None, timeout_s: int = 15, retries: int = 2):
-    for attempt in range(retries + 1):
-        try:
-            async with session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=timeout_s),
-            ) as resp:
-                if resp.status != 200:
-                    raise aiohttp.ClientResponseError(
-                        resp.request_info, resp.history, status=resp.status, message="bad status", headers=resp.headers
-                    )
-                try:
-                    return await resp.json(content_type=None)
-                except aiohttp.ContentTypeError:
-                    txt = await resp.text()
-                    return _json_mod.loads(txt)
-        except (aiohttp.ClientPayloadError, TransferEncodingError, asyncio.TimeoutError, aiohttp.ClientOSError):
-            if attempt < retries:
-                await asyncio.sleep(0.4 * (attempt + 1))
-                continue
-            raise
-
-
-# --- Centralized HTTP session factory (added by fixer v2) ---
-def make_session():
-    """Return an aiohttp.ClientSession with robust defaults.
-    - force_close avoids half-closed/kept-alive sockets lingering
-    - enable_cleanup_closed helps swallow "transport is closing" races
-    - ttl_dns_cache reduces DNS churn for repeated calls
-    - global timeouts prevent hung awaits
-    """
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, force_close=True, enable_cleanup_closed=True, ttl_dns_cache=300, limit=0)
-    timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=15)
-    return aiohttp.ClientSession(headers=HTTP_HEADERS, connector=connector, timeout=timeout)
-
-
-
-@app_commands.command(name="diag_net", description="Run internal network diagnostics for weather APIs.")
-async def diag_net(self, interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    urls = [
-        "https://api.zippopotam.us/us/63101",
-        "https://api.open-meteo.com/v1/forecast?latitude=38.63&longitude=-90.20&hourly=temperature_2m&forecast_days=1",
-    ]
-    results = []
-    async with make_session() as s:
-        for url in urls:
-            try:
-                import time
-                t0 = time.perf_counter()
-                async with s.get(url) as r:
-                    body = await r.read()
-                    dt = time.perf_counter() - t0
-                    results.append(f"{url}\nStatus: {r.status}\nBytes: {len(body)} / {r.headers.get('content-length')}\nTime: {dt:.2f}s")
-            except Exception as e:
-                results.append(f"{url}\nERR {type(e).__name__}: {str(e)[:200]}")
-    await interaction.followup.send("**Network diagnostics:**\n" + "\n\n".join(results))

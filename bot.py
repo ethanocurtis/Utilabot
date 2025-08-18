@@ -10,31 +10,6 @@ import discord
 from discord.ext import tasks
 from discord import app_commands
 
-# --- Proper app_commands check for Manage Messages ---
-def has_manage_messages():
-    def predicate(inter: discord.Interaction) -> bool:
-        try:
-            return bool(getattr(inter.user, "guild_permissions", None) and inter.user.guild_permissions.manage_messages)
-        except Exception:
-            return False
-    return app_commands.check(predicate)
-
-
-# --- Slash command sync scope ---
-# Parse GUILD_IDS from environment (comma-separated). If empty => global sync.
-_GUILD_IDS_RAW = os.getenv("GUILD_IDS", "").strip()
-GUILD_IDS: list[int] = []
-if _GUILD_IDS_RAW:
-    for _part in _GUILD_IDS_RAW.split(","):
-        _part = _part.strip()
-        if not _part:
-            continue
-        try:
-            GUILD_IDS.append(int(_part))
-        except Exception:
-            pass
-
-
 # External deps
 import aiohttp
 import html
@@ -49,7 +24,7 @@ except Exception:
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/bot.db")
-
+GUILD_IDS: List[int] = []  # e.g., [123456789012345678] for faster guild sync
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120
@@ -598,49 +573,6 @@ class Store:
     def clear_pin(self, channel_id: int):
         self.db.execute("DELETE FROM pins WHERE channel_id=?", (int(channel_id),))
 
-
-    # ---------- sticky ----------
-    def set_sticky(self, channel_id: int, payload):
-        """Save sticky payload (dict) into kv as JSON. Pass None to clear."""
-        key = f"sticky:{int(channel_id)}"
-        if not payload:
-            self.db.execute("DELETE FROM kv WHERE key=?", (key,))
-            return
-        self.db.execute(
-            "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, json.dumps(payload)),
-        )
-
-    def get_sticky(self, channel_id: int):
-        key = f"sticky:{int(channel_id)}"
-        row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
-        try:
-            return json.loads(row[0]) if row and row[0] else None
-        except Exception:
-            return None
-
-    def clear_sticky(self, channel_id: int):
-        key = f"sticky:{int(channel_id)}"
-        self.db.execute("DELETE FROM kv WHERE key=?", (key,))
-
-    def get_sticky_msg(self, channel_id: int):
-        key = f"sticky_msg:{int(channel_id)}"
-        row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
-        try:
-            return int(row[0]) if row and row[0] not in (None, "") else None
-        except Exception:
-            return None
-
-    def set_sticky_msg(self, channel_id: int, message_id):
-        key = f"sticky_msg:{int(channel_id)}"
-        if message_id is None:
-            self.db.execute("DELETE FROM kv WHERE key=?", (key,))
-        else:
-            self.db.execute(
-                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, str(int(message_id))),
-            )
-
     # ---------- polls ----------
     def save_poll(self, message_id: int, poll: dict):
         is_open = 1 if poll.get("open", True) else 0
@@ -809,22 +741,6 @@ def fmt_hand(cards: List[Tuple[str, str]]) -> str:
 
 
 # ---------- Economy & Utility ----------
-
-# ---- Ensure decorators attach to the LIVE CommandTree ----
-# Some setups define a standalone `tree = app_commands.CommandTree(...)`,
-# others use `bot.tree` or `client.tree`. We alias `tree` to the active one.
-try:
-    _TREE_LIVE = bot.tree  # type: ignore
-except Exception:
-    try:
-        _TREE_LIVE = client.tree  # type: ignore
-    except Exception:
-        _TREE_LIVE = 'UNRESOLVED'
-
-if _TREE_LIVE != 'UNRESOLVED':
-    tree = _TREE_LIVE  # ensure @tree.command binds to the running client's tree
-# ----------------------------------------------------------
-
 @tree.command(name="balance", description="Check your balance.")
 async def balance(inter: discord.Interaction, user: Optional[discord.User] = None):
     target = user or inter.user
@@ -3381,9 +3297,6 @@ async def _schedule_autodelete(message: discord.Message, seconds: int):
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
     # Skip system messages and if we can't determine a channel
     if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
         return
@@ -3409,12 +3322,6 @@ async def on_message(message: discord.Message):
     except Exception:
         pass
 
-
-    try:
-        if not message.author.bot and store.get_sticky(message.channel.id):
-            await bump_sticky_in_channel(message.channel)
-    except Exception:
-        pass
 @reminders_scheduler.before_loop
 async def before_reminders():
     await bot.wait_until_ready()
@@ -3481,25 +3388,16 @@ async def debug_store(inter: discord.Interaction):
 
 
 # ---------- Startup ----------
-
 @bot.event
 async def on_ready():
-    # Print and force a quick sync on startup
-    # Sync slash commands (per-guild if GUILD_IDS is configured)
-    if 'GUILD_IDS' in globals() and GUILD_IDS:
+    # Sync slash commands
+    if GUILD_IDS:
         for gid in GUILD_IDS:
             guild = discord.Object(id=gid)
-            try:
-                await tree.sync(guild=guild)
-            except Exception:
-                pass
+            await tree.sync(guild=guild)
     else:
-        try:
-            await tree.sync()
-        except Exception:
-            pass
+        await tree.sync()
 
-    # Start background loops if not running
     if not cleanup_loop.is_running():
         cleanup_loop.start()
     if not reminders_scheduler.is_running():
@@ -3508,16 +3406,12 @@ async def on_ready():
         weather_scheduler.start()
 
     # Re-register persistent poll views
-    try:
-        for mid, p in store.list_open_polls():
-            try:
-                labels = [o.get("label") for o in (p.get("options") or []) if isinstance(o, dict)]
-                view = PollView(message_id=mid, options=labels, creator_id=p.get("creator_id", 0), timeout=None)
-                bot.add_view(view)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    for mid, p in store.list_open_polls():
+        try:
+            view = PollView(message_id=mid, options=[o["label"] for o in p["options"]], creator_id=p.get("creator_id", 0), timeout=None)
+            bot.add_view(view)
+        except Exception:
+            pass
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
@@ -3986,192 +3880,3 @@ async def update_poll_message(channel: discord.abc.Messageable, message_id: int,
     except Exception:
         pass
 
-
-
-
-async def bump_sticky_in_channel(channel: discord.abc.Messageable):
-    try:
-        if not hasattr(channel, "send"):
-            return
-        # must have id
-        chan_id = getattr(channel, "id", None)
-        if not chan_id:
-            return
-        sticky = store.get_sticky(chan_id)
-        if not sticky:
-            return
-        prev = store.get_sticky_msg(chan_id)
-        if prev:
-            try:
-                msg = await channel.fetch_message(prev)
-                await msg.delete()
-            except Exception:
-                pass
-        if sticky.get("mode") == "embed":
-            emb = discord.Embed(
-                title=sticky.get("title") or "Sticky",
-                description=sticky.get("desc") or ""
-            )
-            col = sticky.get("color")
-            if isinstance(col, int):
-                emb.colour = discord.Colour(col)
-            new_msg = await channel.send(embed=emb)
-        else:
-            new_msg = await channel.send(sticky.get("text") or "")
-        store.set_sticky_msg(chan_id, new_msg.id)
-    except Exception:
-        pass
-
-
-
-@tree.command(name="sticky_set", description="Create or update a bottom-sticky in this channel (text or embed).")
-@has_manage_messages()
-@app_commands.describe(
-    mode="text or embed",
-    text="For mode=text: the content. For mode=embed: the description/body.",
-    title="(embed only) Title",
-    color="(embed only) Hex like #2ecc71 or 0x2ecc71"
-)
-@app_commands.choices(mode=[
-    app_commands.Choice(name="text", value="text"),
-    app_commands.Choice(name="embed", value="embed"),
-])
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_messages=True)
-@require_admin_or_allowlisted()
-async def sticky_set(
-    inter: discord.Interaction,
-    mode: app_commands.Choice[str],
-    text: str,
-    title: str | None = None,
-    color: str | None = None,
-):
-    channel = inter.channel
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-
-    if mode.value == "text":
-        payload = {"mode": "text", "text": text}
-    else:
-        col = None
-        if color:
-            s = color.strip().lower().replace("#", "")
-            if s.startswith("0x"):
-                s = s[2:]
-            try:
-                col = int(s, 16)
-            except Exception:
-                col = None
-        payload = {"mode": "embed", "title": title or "Sticky", "desc": text, "color": col}
-
-    store.set_sticky(channel.id, payload)
-    await inter.response.defer(ephemeral=True)
-    await bump_sticky_in_channel(channel)
-    await inter.followup.send("📌 Sticky is set and bumped.", ephemeral=True)
-
-
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_messages=True)
-@require_admin_or_allowlisted()
-@tree.command(name="sticky_clear", description="Remove the bottom-sticky from this channel.")
-@has_manage_messages()
-async def sticky_clear(inter: discord.Interaction):
-    channel = inter.channel
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    store.clear_sticky(channel.id)
-    mid = store.get_sticky_msg(channel.id)
-    if mid:
-        try:
-            msg = await channel.fetch_message(mid)
-            await msg.delete()
-        except Exception:
-            pass
-    store.set_sticky_msg(channel.id, None)
-    await inter.response.send_message("🧹 Sticky cleared.", ephemeral=True)
-
-
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_messages=True)
-@require_admin_or_allowlisted()
-@tree.command(name="sticky_bump", description="Re-post the sticky to the bottom now.")
-@has_manage_messages()
-async def sticky_bump(inter: discord.Interaction):
-    channel = inter.channel
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
-    await bump_sticky_in_channel(channel)
-    await inter.response.send_message("✅ Bumped.", ephemeral=True)
-
-
-
-@tree.command(name="commands_debug", description="Show command debug info")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@require_real_admin()
-async def commands_debug(inter: discord.Interaction):
-    try:
-        cmds = [c.name for c in tree.get_commands()]
-    except Exception:
-        cmds = []
-    sticky = [n for n in cmds if n.startswith("sticky")]
-    msg = f"Local commands: {len(cmds)}\nSticky seen: {sticky or 'none'}"
-    await inter.response.send_message(msg, ephemeral=True)
-
-
-
-@tree.command(name="sync_now", description="Force a command sync now")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@require_real_admin()
-async def sync_now(inter: discord.Interaction):
-    # Force sync immediately; per-guild if GUILD_IDS set
-    if 'GUILD_IDS' in globals() and GUILD_IDS:
-        for gid in GUILD_IDS:
-            try:
-                await tree.sync(guild=discord.Object(id=gid))
-            except Exception:
-                pass
-        await inter.response.send_message(f"Synced to {GUILD_IDS}", ephemeral=True)
-    else:
-        try:
-            await tree.sync()
-            await inter.response.send_message("Global sync triggered", ephemeral=True)
-        except Exception as e:
-            await inter.response.send_message(f"Sync error: {e}", ephemeral=True)
-
-@bot.event
-async def on_ready():
-    try:
-        if GUILD_IDS:
-            for gid in GUILD_IDS:
-                guild = discord.Object(id=gid)
-                await tree.sync(guild=guild)
-            print(f"✅ Synced commands to {len(GUILD_IDS)} guild(s)")
-        else:
-            await tree.sync()
-            print("✅ Synced commands globally")
-    except Exception as e:
-        print(f"⚠️ Sync failed: {e}")
-    print(f"🤖 Logged in as {bot.user} (ID: {bot.user.id})")
-
-
-@client.event if False else None  # dummy to keep syntax highlighters happy
-async def _noop(): pass
-
-async def _force_sync_on_ready_print():
-    try:
-        cmds = [c.name for c in tree.get_commands()]
-        print(f"[startup] Local command count: {len(cmds)}; names: {cmds}")
-    except Exception as e:
-        print(f"[startup] Could not list commands: {e}")
-    try:
-        if 'GUILD_IDS' in globals() and GUILD_IDS:
-            for gid in GUILD_IDS:
-                await tree.sync(guild=discord.Object(id=gid))
-            print(f"[startup] Force-synced per-guild to: {GUILD_IDS}")
-        else:
-            await tree.sync()
-            print("[startup] Force-synced globally")
-    except Exception as e:
-        print(f"[startup] Sync error: {e}")

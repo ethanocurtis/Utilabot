@@ -598,6 +598,49 @@ class Store:
     def clear_pin(self, channel_id: int):
         self.db.execute("DELETE FROM pins WHERE channel_id=?", (int(channel_id),))
 
+
+    # ---------- sticky ----------
+    def set_sticky(self, channel_id: int, payload):
+        """Save sticky payload (dict) into kv as JSON. Pass None to clear."""
+        key = f"sticky:{int(channel_id)}"
+        if not payload:
+            self.db.execute("DELETE FROM kv WHERE key=?", (key,))
+            return
+        self.db.execute(
+            "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(payload)),
+        )
+
+    def get_sticky(self, channel_id: int):
+        key = f"sticky:{int(channel_id)}"
+        row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        try:
+            return json.loads(row[0]) if row and row[0] else None
+        except Exception:
+            return None
+
+    def clear_sticky(self, channel_id: int):
+        key = f"sticky:{int(channel_id)}"
+        self.db.execute("DELETE FROM kv WHERE key=?", (key,))
+
+    def get_sticky_msg(self, channel_id: int):
+        key = f"sticky_msg:{int(channel_id)}"
+        row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        try:
+            return int(row[0]) if row and row[0] not in (None, "") else None
+        except Exception:
+            return None
+
+    def set_sticky_msg(self, channel_id: int, message_id):
+        key = f"sticky_msg:{int(channel_id)}"
+        if message_id is None:
+            self.db.execute("DELETE FROM kv WHERE key=?", (key,))
+        else:
+            self.db.execute(
+                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(int(message_id))),
+            )
+
     # ---------- polls ----------
     def save_poll(self, message_id: int, poll: dict):
         is_open = 1 if poll.get("open", True) else 0
@@ -766,6 +809,22 @@ def fmt_hand(cards: List[Tuple[str, str]]) -> str:
 
 
 # ---------- Economy & Utility ----------
+
+# ---- Ensure decorators attach to the LIVE CommandTree ----
+# Some setups define a standalone `tree = app_commands.CommandTree(...)`,
+# others use `bot.tree` or `client.tree`. We alias `tree` to the active one.
+try:
+    _TREE_LIVE = bot.tree  # type: ignore
+except Exception:
+    try:
+        _TREE_LIVE = client.tree  # type: ignore
+    except Exception:
+        _TREE_LIVE = 'UNRESOLVED'
+
+if _TREE_LIVE != 'UNRESOLVED':
+    tree = _TREE_LIVE  # ensure @tree.command binds to the running client's tree
+# ----------------------------------------------------------
+
 @tree.command(name="balance", description="Check your balance.")
 async def balance(inter: discord.Interaction, user: Optional[discord.User] = None):
     target = user or inter.user
@@ -3322,6 +3381,9 @@ async def _schedule_autodelete(message: discord.Message, seconds: int):
 
 @bot.event
 async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
     # Skip system messages and if we can't determine a channel
     if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
         return
@@ -3419,16 +3481,26 @@ async def debug_store(inter: discord.Interaction):
 
 
 # ---------- Startup ----------
+
 @bot.event
 async def on_ready():
-    # Sync slash commands
-    if GUILD_IDS:
+    # Print and force a quick sync on startup
+    await _force_sync_on_ready_print()
+    # Sync slash commands (per-guild if GUILD_IDS is configured)
+    if 'GUILD_IDS' in globals() and GUILD_IDS:
         for gid in GUILD_IDS:
             guild = discord.Object(id=gid)
-            await tree.sync(guild=guild)
+            try:
+                await tree.sync(guild=guild)
+            except Exception:
+                pass
     else:
-        await tree.sync()
+        try:
+            await tree.sync()
+        except Exception:
+            pass
 
+    # Start background loops if not running
     if not cleanup_loop.is_running():
         cleanup_loop.start()
     if not reminders_scheduler.is_running():
@@ -3437,12 +3509,16 @@ async def on_ready():
         weather_scheduler.start()
 
     # Re-register persistent poll views
-    for mid, p in store.list_open_polls():
-        try:
-            view = PollView(message_id=mid, options=[o["label"] for o in p["options"]], creator_id=p.get("creator_id", 0), timeout=None)
-            bot.add_view(view)
-        except Exception:
-            pass
+    try:
+        for mid, p in store.list_open_polls():
+            try:
+                labels = [o.get("label") for o in (p.get("options") or []) if isinstance(o, dict)]
+                view = PollView(message_id=mid, options=labels, creator_id=p.get("creator_id", 0), timeout=None)
+                bot.add_view(view)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
@@ -3961,6 +4037,8 @@ async def bump_sticky_in_channel(channel: discord.abc.Messageable):
     app_commands.Choice(name="text", value="text"),
     app_commands.Choice(name="embed", value="embed"),
 ])
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
 @require_admin_or_allowlisted()
 async def sticky_set(
     inter: discord.Interaction,
@@ -3993,6 +4071,7 @@ async def sticky_set(
     await inter.followup.send("📌 Sticky is set and bumped.", ephemeral=True)
 
 
+@app_commands.guild_only()
 @app_commands.default_permissions(manage_messages=True)
 @require_admin_or_allowlisted()
 @tree.command(name="sticky_clear", description="Remove the bottom-sticky from this channel.")
@@ -4013,6 +4092,7 @@ async def sticky_clear(inter: discord.Interaction):
     await inter.response.send_message("🧹 Sticky cleared.", ephemeral=True)
 
 
+@app_commands.guild_only()
 @app_commands.default_permissions(manage_messages=True)
 @require_admin_or_allowlisted()
 @tree.command(name="sticky_bump", description="Re-post the sticky to the bottom now.")
@@ -4027,6 +4107,7 @@ async def sticky_bump(inter: discord.Interaction):
 
 
 @tree.command(name="commands_debug", description="Show command debug info")
+@app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @require_real_admin()
 async def commands_debug(inter: discord.Interaction):
@@ -4059,3 +4140,25 @@ async def sync_now(inter: discord.Interaction):
             await inter.response.send_message("Global sync triggered", ephemeral=True)
         except Exception as e:
             await inter.response.send_message(f"Sync error: {e}", ephemeral=True)
+
+
+
+@client.event if False else None  # dummy to keep syntax highlighters happy
+async def _noop(): pass
+
+async def _force_sync_on_ready_print():
+    try:
+        cmds = [c.name for c in tree.get_commands()]
+        print(f"[startup] Local command count: {len(cmds)}; names: {cmds}")
+    except Exception as e:
+        print(f"[startup] Could not list commands: {e}")
+    try:
+        if 'GUILD_IDS' in globals() and GUILD_IDS:
+            for gid in GUILD_IDS:
+                await tree.sync(guild=discord.Object(id=gid))
+            print(f"[startup] Force-synced per-guild to: {GUILD_IDS}")
+        else:
+            await tree.sync()
+            print("[startup] Force-synced globally")
+    except Exception as e:
+        print(f"[startup] Sync error: {e}")

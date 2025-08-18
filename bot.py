@@ -4201,7 +4201,7 @@ async def sticky_clear(inter: discord.Interaction):
 
 
 # ===== Sticky Listener (keep at bottom) =====
-async def _sticky_on_message(message: discord.Message):
+async async def _sticky_on_message(message: discord.Message):
     if getattr(message, "author", None) and message.author.bot:
         return
     if not isinstance(getattr(message, "channel", None), (discord.TextChannel, discord.Thread)):

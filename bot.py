@@ -683,13 +683,13 @@ store = Store(DATA_PATH)
 # Ensure sticky table exists and attach helpers to Store dynamically,
 # so we don't have to modify the original Store class definition.
 try:
-    store.db.execute(\"\"\"
-    CREATE TABLE IF NOT EXISTS stickies (
-        channel_id INTEGER PRIMARY KEY,
-        payload TEXT NOT NULL,
-        last_message_id INTEGER
-    )
-    \"\"\")
+    store.db.execute("""
+CREATE TABLE IF NOT EXISTS stickies (
+    channel_id INTEGER PRIMARY KEY,
+    payload TEXT NOT NULL,
+    last_message_id INTEGER
+)
+""")
 except Exception as _e:
     print(f"[sticky:init] warning: {type(_e).__name__}: {_e}")
 

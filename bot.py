@@ -3449,30 +3449,14 @@ async def debug_store(inter: discord.Interaction):
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
-    # Sync slash commands
-    if GUILD_IDS:
-        for gid in GUILD_IDS:
-            guild = discord.Object(id=gid)
-            await tree.sync(guild=guild)
-    else:
-        await tree.sync()
 
-    if not cleanup_loop.is_running():
-        cleanup_loop.start()
-    if not reminders_scheduler.is_running():
-        reminders_scheduler.start()
-    if not weather_scheduler.is_running():
-        weather_scheduler.start()
+    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    try:
+        synced = await tree.sync()
+        print(f"[global sync] Synced {len(synced)} commands globally")
+    except Exception as e:
+        print(f"[sync error] {type(e).__name__}: {e}")
 
-    # Re-register persistent poll views
-    for mid, p in store.list_open_polls():
-        try:
-            view = PollView(message_id=mid, options=[o["label"] for o in p["options"]], creator_id=p.get("creator_id", 0), timeout=None)
-            bot.add_view(view)
-        except Exception:
-            pass
-
-    print(f"Logged in as {bot.user} ({bot.user.id})")
 
 # ---------- Main ----------
 def main():
@@ -3945,6 +3929,27 @@ async def update_poll_message(channel: discord.abc.Messageable, message_id: int,
 
 # ===== Sticky Commands (clean quotes) =====
 from typing import Optional as _StickyOptional
+
+
+import os
+
+def _parse_guild_ids(val: str | None) -> list[int]:
+    if not val:
+        return []
+    ids: list[int] = []
+    for tok in str(val).replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            ids.append(int(tok))
+        except ValueError:
+            print(f"[guild sync] Skipping invalid GUILD_ID token: {tok!r}")
+    return ids
+
+# Supports either GUILD_IDS="123,456" or GUILD_ID="123"
+GUILD_IDS = _parse_guild_ids(os.getenv("GUILD_IDS") or os.getenv("GUILD_ID"))
+
 
 @tree.command(name="sticky_set", description="Set a sticky message or embed that stays at the bottom.")
 @require_manage_messages()

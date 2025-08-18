@@ -3449,15 +3449,17 @@ async def debug_store(inter: discord.Interaction):
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
-
     print(f"Logged in as {bot.user} (id={bot.user.id})")
     try:
         synced = await tree.sync()
         print(f"[global sync] Synced {len(synced)} commands globally")
+        # 🔽 New: dump names
+        print("[command list]")
+        for cmd in synced:
+            print(f" - /{cmd.name} ({cmd.description})")
     except Exception as e:
         print(f"[sync error] {type(e).__name__}: {e}")
-
-
+        
 # ---------- Main ----------
 def main():
     token = os.environ.get("DISCORD_TOKEN")

@@ -678,18 +678,18 @@ class Store:
         return row[0] if row and row[0] is not None else ""
 
 store = Store(DATA_PATH)
-
-# === Sticky system bootstrap ===
-# Ensure sticky table exists and attach helpers to Store dynamically,
-# so we don't have to modify the original Store class definition.
+# === Sticky system bootstrap (clean quotes) ===
+# Create table and add helper methods to existing Store.
 try:
-    store.db.execute("""
+    store.db.execute(
+        """
 CREATE TABLE IF NOT EXISTS stickies (
     channel_id INTEGER PRIMARY KEY,
     payload TEXT NOT NULL,
     last_message_id INTEGER
 )
-""")
+"""
+    )
 except Exception as _e:
     print(f"[sticky:init] warning: {type(_e).__name__}: {_e}")
 
@@ -699,15 +699,17 @@ def _sticky_set_sticky(self, channel_id: int, payload: dict, last_message_id: in
         data["last_message_id"] = int(last_message_id)
     js = json.dumps(data)
     self.db.execute(
-        \"\"\"
-        INSERT INTO stickies(channel_id, payload, last_message_id) VALUES(?,?,?)
-        ON CONFLICT(channel_id) DO UPDATE SET payload=excluded.payload, last_message_id=excluded.last_message_id
-        \"\"\",
-        (int(channel_id), js, data.get(\"last_message_id\"))
+        """
+INSERT INTO stickies (channel_id, payload, last_message_id) VALUES (?,?,?)
+ON CONFLICT(channel_id) DO UPDATE SET
+    payload = excluded.payload,
+    last_message_id = excluded.last_message_id
+""",
+        (int(channel_id), js, data.get("last_message_id"))
     )
 
 def _sticky_get_sticky(self, channel_id: int):
-    row = self.db.execute(\"SELECT payload FROM stickies WHERE channel_id=?\", (int(channel_id),)).fetchone()
+    row = self.db.execute("SELECT payload FROM stickies WHERE channel_id=?", (int(channel_id),)).fetchone()
     if not row:
         return None
     try:
@@ -716,16 +718,15 @@ def _sticky_get_sticky(self, channel_id: int):
         return None
 
 def _sticky_set_last_id(self, channel_id: int, last_message_id: int | None):
-    self.db.execute(\"UPDATE stickies SET last_message_id=? WHERE channel_id=?\", (None if last_message_id is None else int(last_message_id), int(channel_id)))
+    self.db.execute("UPDATE stickies SET last_message_id=? WHERE channel_id=?", (None if last_message_id is None else int(last_message_id), int(channel_id)))
 
 def _sticky_get_last_id(self, channel_id: int):
-    row = self.db.execute(\"SELECT last_message_id FROM stickies WHERE channel_id=?\", (int(channel_id),)).fetchone()
+    row = self.db.execute("SELECT last_message_id FROM stickies WHERE channel_id=?", (int(channel_id),)).fetchone()
     return (int(row[0]) if row and row[0] is not None else None)
 
 def _sticky_clear(self, channel_id: int):
-    self.db.execute(\"DELETE FROM stickies WHERE channel_id=?\", (int(channel_id),))
+    self.db.execute("DELETE FROM stickies WHERE channel_id=?", (int(channel_id),))
 
-# Bind methods to Store
 try:
     Store.set_sticky = _sticky_set_sticky
     Store.get_sticky = _sticky_get_sticky
@@ -733,9 +734,8 @@ try:
     Store.get_sticky_last_id = _sticky_get_last_id
     Store.clear_sticky = _sticky_clear
 except Exception as _e:
-    print(f\"[sticky:bind] warning: {type(_e).__name__}: {_e}\")
+    print(f"[sticky:bind] warning: {type(_e).__name__}: {_e}")
 # === end Sticky system bootstrap ===
-
 
 
 # ---------- Permissions helper ----------
@@ -3941,11 +3941,10 @@ async def update_poll_message(channel: discord.abc.Messageable, message_id: int,
 
 
 
-# ---- STICKY PATCH BELOW ----
+# ---- STICKY PATCH BELOW (CLEAN) ----
 
-
-# ===== Sticky Commands =====
-from typing import Optional as _StickyOptional  # safe alias
+# ===== Sticky Commands (clean quotes) =====
+from typing import Optional as _StickyOptional
 
 @tree.command(name="sticky_set", description="Set a sticky message or embed that stays at the bottom.")
 @require_manage_messages()
@@ -3967,7 +3966,6 @@ async def sticky_set(
     if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
 
-    # Build payload
     if (title or description):
         col = None
         if color:
@@ -4058,9 +4056,9 @@ async def _sticky_on_message(message: discord.Message):
     if last_id:
         try:
             old = await message.channel.fetch_message(int(last_id))
-            if getattr(old, "author", None) and getattr(message.guild.me if hasattr(message.guild, "me") else bot.user, "id", None):
-                if old.author.id == (message.guild.me.id if message.guild and message.guild.me else bot.user.id):
-                    await old.delete()
+            me = (message.guild.me.id if message.guild and message.guild.me else (bot.user.id if bot.user else None))
+            if getattr(old, "author", None) and me and old.author.id == me:
+                await old.delete()
         except Exception:
             pass
 
@@ -4090,7 +4088,6 @@ async def _sticky_on_message(message: discord.Message):
     except Exception:
         pass
 
-# Register listener safely
 try:
     bot.add_listener(_sticky_on_message, "on_message")
 except Exception as _e:

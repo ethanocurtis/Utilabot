@@ -3485,7 +3485,6 @@ async def debug_store(inter: discord.Interaction):
 @bot.event
 async def on_ready():
     # Print and force a quick sync on startup
-    await _force_sync_on_ready_print()
     # Sync slash commands (per-guild if GUILD_IDS is configured)
     if 'GUILD_IDS' in globals() and GUILD_IDS:
         for gid in GUILD_IDS:
@@ -4141,6 +4140,20 @@ async def sync_now(inter: discord.Interaction):
         except Exception as e:
             await inter.response.send_message(f"Sync error: {e}", ephemeral=True)
 
+@bot.event
+async def on_ready():
+    try:
+        if GUILD_IDS:
+            for gid in GUILD_IDS:
+                guild = discord.Object(id=gid)
+                await tree.sync(guild=guild)
+            print(f"✅ Synced commands to {len(GUILD_IDS)} guild(s)")
+        else:
+            await tree.sync()
+            print("✅ Synced commands globally")
+    except Exception as e:
+        print(f"⚠️ Sync failed: {e}")
+    print(f"🤖 Logged in as {bot.user} (ID: {bot.user.id})")
 
 
 @client.event if False else None  # dummy to keep syntax highlighters happy

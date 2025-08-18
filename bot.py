@@ -10,6 +10,16 @@ import discord
 from discord.ext import tasks
 from discord import app_commands
 
+# --- Proper app_commands check for Manage Messages ---
+def has_manage_messages():
+    def predicate(inter: discord.Interaction) -> bool:
+        try:
+            return bool(getattr(inter.user, "guild_permissions", None) and inter.user.guild_permissions.manage_messages)
+        except Exception:
+            return False
+    return app_commands.check(predicate)
+
+
 # --- Slash command sync scope ---
 # Parse GUILD_IDS from environment (comma-separated). If empty => global sync.
 _GUILD_IDS_RAW = os.getenv("GUILD_IDS", "").strip()
@@ -3940,7 +3950,7 @@ async def bump_sticky_in_channel(channel: discord.abc.Messageable):
 
 
 @tree.command(name="sticky_set", description="Create or update a bottom-sticky in this channel (text or embed).")
-@require_manage_messages()
+@has_manage_messages()
 @app_commands.describe(
     mode="text or embed",
     text="For mode=text: the content. For mode=embed: the description/body.",
@@ -3983,7 +3993,7 @@ async def sticky_set(
 
 
 @tree.command(name="sticky_clear", description="Remove the bottom-sticky from this channel.")
-@require_manage_messages()
+@has_manage_messages()
 async def sticky_clear(inter: discord.Interaction):
     channel = inter.channel
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
@@ -4001,7 +4011,7 @@ async def sticky_clear(inter: discord.Interaction):
 
 
 @tree.command(name="sticky_bump", description="Re-post the sticky to the bottom now.")
-@require_manage_messages()
+@has_manage_messages()
 async def sticky_bump(inter: discord.Interaction):
     channel = inter.channel
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):

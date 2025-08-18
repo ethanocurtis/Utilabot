@@ -3961,7 +3961,6 @@ async def bump_sticky_in_channel(channel: discord.abc.Messageable):
     app_commands.Choice(name="text", value="text"),
     app_commands.Choice(name="embed", value="embed"),
 ])
-@app_commands.guild_only()
 @require_admin_or_allowlisted()
 async def sticky_set(
     inter: discord.Interaction,
@@ -3994,7 +3993,6 @@ async def sticky_set(
     await inter.followup.send("📌 Sticky is set and bumped.", ephemeral=True)
 
 
-@app_commands.guild_only()
 @app_commands.default_permissions(manage_messages=True)
 @require_admin_or_allowlisted()
 @tree.command(name="sticky_clear", description="Remove the bottom-sticky from this channel.")
@@ -4015,7 +4013,6 @@ async def sticky_clear(inter: discord.Interaction):
     await inter.response.send_message("🧹 Sticky cleared.", ephemeral=True)
 
 
-@app_commands.guild_only()
 @app_commands.default_permissions(manage_messages=True)
 @require_admin_or_allowlisted()
 @tree.command(name="sticky_bump", description="Re-post the sticky to the bottom now.")
@@ -4030,7 +4027,6 @@ async def sticky_bump(inter: discord.Interaction):
 
 
 @tree.command(name="commands_debug", description="Show command debug info")
-@app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @require_real_admin()
 async def commands_debug(inter: discord.Interaction):

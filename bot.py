@@ -3961,6 +3961,9 @@ async def bump_sticky_in_channel(channel: discord.abc.Messageable):
     app_commands.Choice(name="text", value="text"),
     app_commands.Choice(name="embed", value="embed"),
 ])
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@require_admin_or_allowlisted()
 async def sticky_set(
     inter: discord.Interaction,
     mode: app_commands.Choice[str],
@@ -3992,6 +3995,9 @@ async def sticky_set(
     await inter.followup.send("📌 Sticky is set and bumped.", ephemeral=True)
 
 
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@require_admin_or_allowlisted()
 @tree.command(name="sticky_clear", description="Remove the bottom-sticky from this channel.")
 @has_manage_messages()
 async def sticky_clear(inter: discord.Interaction):
@@ -4010,6 +4016,9 @@ async def sticky_clear(inter: discord.Interaction):
     await inter.response.send_message("🧹 Sticky cleared.", ephemeral=True)
 
 
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@require_admin_or_allowlisted()
 @tree.command(name="sticky_bump", description="Re-post the sticky to the bottom now.")
 @has_manage_messages()
 async def sticky_bump(inter: discord.Interaction):
@@ -4018,3 +4027,40 @@ async def sticky_bump(inter: discord.Interaction):
         return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
     await bump_sticky_in_channel(channel)
     await inter.response.send_message("✅ Bumped.", ephemeral=True)
+
+
+
+@tree.command(name="commands_debug", description="Show command debug info")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@require_real_admin()
+async def commands_debug(inter: discord.Interaction):
+    try:
+        cmds = [c.name for c in tree.get_commands()]
+    except Exception:
+        cmds = []
+    sticky = [n for n in cmds if n.startswith("sticky")]
+    msg = f"Local commands: {len(cmds)}\nSticky seen: {sticky or 'none'}"
+    await inter.response.send_message(msg, ephemeral=True)
+
+
+
+@tree.command(name="sync_now", description="Force a command sync now")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@require_real_admin()
+async def sync_now(inter: discord.Interaction):
+    # Force sync immediately; per-guild if GUILD_IDS set
+    if 'GUILD_IDS' in globals() and GUILD_IDS:
+        for gid in GUILD_IDS:
+            try:
+                await tree.sync(guild=discord.Object(id=gid))
+            except Exception:
+                pass
+        await inter.response.send_message(f"Synced to {GUILD_IDS}", ephemeral=True)
+    else:
+        try:
+            await tree.sync()
+            await inter.response.send_message("Global sync triggered", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"Sync error: {e}", ephemeral=True)

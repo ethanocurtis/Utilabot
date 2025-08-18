@@ -1587,6 +1587,160 @@ async def pin_clear(inter: discord.Interaction):
     store.clear_pin(inter.channel.id)
     await inter.response.send_message("🧹 Pin cleared.", ephemeral=True)
 
+
+# ===== Sticky Commands =====
+from typing import Optional as _StickyOptional
+
+@tree.command(name="sticky_set", description="Set a sticky message or embed that stays at the bottom.")
+@require_manage_messages()
+@app_commands.describe(
+    text="Plain text to stick (ignored if title/description provided).",
+    title="Embed title (optional)",
+    description="Embed description (optional)",
+    color="Embed color (#rrggbb or integer)",
+    image="Embed image URL (optional)"
+)
+async def sticky_set(
+    inter: discord.Interaction,
+    text: _StickyOptional[str] = None,
+    title: _StickyOptional[str] = None,
+    description: _StickyOptional[str] = None,
+    color: _StickyOptional[str] = None,
+    image: _StickyOptional[str] = None
+):
+    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
+        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
+
+    if (title or description):
+        col = None
+        if color:
+            try:
+                if isinstance(color, str) and color.strip().lower().startswith("#"):
+                    col = int(color.strip().lstrip("#"), 16)
+                else:
+                    col = int(color)
+            except Exception:
+                return await inter.response.send_message("Invalid color. Use hex like `#ff8800` or an integer.", ephemeral=True)
+        payload = {
+            "type": "embed",
+            "title": title or "",
+            "description": description or "",
+            "color": col,
+            "image": (image or "").strip() or None,
+        }
+    else:
+        if not text or not text.strip():
+            return await inter.response.send_message("Provide `text` or an embed `title/description`.", ephemeral=True)
+        payload = {"type": "text", "text": text}
+
+    store.set_sticky(inter.channel.id, payload, last_message_id=None)
+    await inter.response.send_message("✅ Sticky set. It will auto-bump to the bottom on the next message.", ephemeral=True)
+
+
+@tree.command(name="sticky_show", description="Preview the sticky for this channel.")
+@require_manage_messages()
+async def sticky_show(inter: discord.Interaction):
+    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
+        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
+    data = store.get_sticky(inter.channel.id)
+    if not data:
+        return await inter.response.send_message("No sticky is configured.", ephemeral=True)
+
+    if data.get("type") == "embed":
+        col = data.get("color")
+        color_obj = None
+        if isinstance(col, int):
+            try:
+                color_obj = discord.Colour(col)
+            except Exception:
+                color_obj = None
+        emb = discord.Embed(
+            title=(data.get("title") or ""),
+            description=(data.get("description") or ""),
+            colour=(color_obj or discord.Colour.blurple())
+        )
+        if data.get("image"):
+            try:
+                emb.set_image(url=str(data["image"]))
+            except Exception:
+                pass
+        await inter.response.send_message(embed=emb, ephemeral=True)
+    else:
+        await inter.response.send_message(content=data.get("text",""), ephemeral=True)
+
+
+@tree.command(name="sticky_clear", description="Remove the sticky for this channel and delete the last posted one if possible.")
+@require_manage_messages()
+async def sticky_clear(inter: discord.Interaction):
+    if not isinstance(inter.channel, (discord.TextChannel, discord.Thread)):
+        return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
+
+    last_id = store.get_sticky_last_id(inter.channel.id)
+    if last_id:
+        try:
+            msg = await inter.channel.fetch_message(int(last_id))
+            await msg.delete()
+        except Exception:
+            pass
+    store.clear_sticky(inter.channel.id)
+    await inter.response.send_message("🧹 Sticky cleared.", ephemeral=True)
+
+
+# ===== Sticky Listener (keep at bottom) =====
+async def _sticky_on_message(message: discord.Message):
+    try:
+        if getattr(message, "author", None) and message.author.bot:
+            return
+        if not isinstance(getattr(message, "channel", None), (discord.TextChannel, discord.Thread)):
+            return
+
+        data = store.get_sticky(message.channel.id)
+        if not data:
+            return
+
+        last_id = store.get_sticky_last_id(message.channel.id)
+        if last_id:
+            try:
+                old = await message.channel.fetch_message(int(last_id))
+                me = (message.guild.me.id if message.guild and message.guild.me else (bot.user.id if bot.user else None))
+                if getattr(old, "author", None) and me and old.author.id == me:
+                    await old.delete()
+            except Exception:
+                pass
+
+        try:
+            if data.get("type") == "embed":
+                col = data.get("color")
+                color_obj = None
+                if isinstance(col, int):
+                    try:
+                        color_obj = discord.Colour(col)
+                    except Exception:
+                        color_obj = None
+                emb = discord.Embed(
+                    title=(data.get("title") or ""),
+                    description=(data.get("description") or ""),
+                    colour=(color_obj or discord.Colour.blurple())
+                )
+                if data.get("image"):
+                    try:
+                        emb.set_image(url=str(data["image"]))
+                    except Exception:
+                        pass
+                sent = await message.channel.send(embed=emb)
+            else:
+                sent = await message.channel.send(content=data.get("text",""))
+            store.set_sticky_last_id(message.channel.id, sent.id)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+try:
+    bot.add_listener(_sticky_on_message, "on_message")
+except Exception as _e:
+    print(f"[sticky:listener] warning: {type(_e).__name__}: {_e}")
+
 # ---------- Polls (persistent) ----------
 
 # ---------- notes (per-user string KV) used by Business system ----------
@@ -3449,17 +3603,15 @@ async def debug_store(inter: discord.Interaction):
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
+
     print(f"Logged in as {bot.user} (id={bot.user.id})")
     try:
         synced = await tree.sync()
         print(f"[global sync] Synced {len(synced)} commands globally")
-        # 🔽 New: dump names
-        print("[command list]")
-        for cmd in synced:
-            print(f" - /{cmd.name} ({cmd.description})")
     except Exception as e:
         print(f"[sync error] {type(e).__name__}: {e}")
-        
+
+
 # ---------- Main ----------
 def main():
     token = os.environ.get("DISCORD_TOKEN")

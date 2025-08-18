@@ -3962,7 +3962,6 @@ async def bump_sticky_in_channel(channel: discord.abc.Messageable):
     app_commands.Choice(name="embed", value="embed"),
 ])
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_messages=True)
 @require_admin_or_allowlisted()
 async def sticky_set(
     inter: discord.Interaction,

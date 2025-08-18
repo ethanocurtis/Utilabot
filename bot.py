@@ -766,22 +766,6 @@ def fmt_hand(cards: List[Tuple[str, str]]) -> str:
 
 
 # ---------- Economy & Utility ----------
-
-# ---- Ensure decorators attach to the LIVE CommandTree ----
-# Some setups define a standalone `tree = app_commands.CommandTree(...)`,
-# others use `bot.tree` or `client.tree`. We alias `tree` to the active one.
-try:
-    _TREE_LIVE = bot.tree  # type: ignore
-except Exception:
-    try:
-        _TREE_LIVE = client.tree  # type: ignore
-    except Exception:
-        _TREE_LIVE = 'UNRESOLVED'
-
-if _TREE_LIVE != 'UNRESOLVED':
-    tree = _TREE_LIVE  # ensure @tree.command binds to the running client's tree
-# ----------------------------------------------------------
-
 @tree.command(name="balance", description="Check your balance.")
 async def balance(inter: discord.Interaction, user: Optional[discord.User] = None):
     target = user or inter.user
@@ -3436,7 +3420,7 @@ async def debug_store(inter: discord.Interaction):
 
 # ---------- Startup ----------
 @bot.event
-\1    await _force_sync_on_ready_print()
+async def on_ready():
     # Sync slash commands
     if GUILD_IDS:
         for gid in GUILD_IDS:
@@ -4080,25 +4064,3 @@ async def sync_now(inter: discord.Interaction):
             await inter.response.send_message("Global sync triggered", ephemeral=True)
         except Exception as e:
             await inter.response.send_message(f"Sync error: {e}", ephemeral=True)
-
-
-
-@client.event if False else None  # dummy to keep syntax highlighters happy
-async def _noop(): pass
-
-async def _force_sync_on_ready_print():
-    try:
-        cmds = [c.name for c in tree.get_commands()]
-        print(f"[startup] Local command count: {len(cmds)}; names: {cmds}")
-    except Exception as e:
-        print(f"[startup] Could not list commands: {e}")
-    try:
-        if 'GUILD_IDS' in globals() and GUILD_IDS:
-            for gid in GUILD_IDS:
-                await tree.sync(guild=discord.Object(id=gid))
-            print(f"[startup] Force-synced per-guild to: {GUILD_IDS}")
-        else:
-            await tree.sync()
-            print("[startup] Force-synced globally")
-    except Exception as e:
-        print(f"[startup] Sync error: {e}")

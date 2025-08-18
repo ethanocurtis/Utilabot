@@ -10,6 +10,21 @@ import discord
 from discord.ext import tasks
 from discord import app_commands
 
+# --- Slash command sync scope ---
+# Parse GUILD_IDS from environment (comma-separated). If empty => global sync.
+_GUILD_IDS_RAW = os.getenv("GUILD_IDS", "").strip()
+GUILD_IDS: list[int] = []
+if _GUILD_IDS_RAW:
+    for _part in _GUILD_IDS_RAW.split(","):
+        _part = _part.strip()
+        if not _part:
+            continue
+        try:
+            GUILD_IDS.append(int(_part))
+        except Exception:
+            pass
+
+
 # External deps
 import aiohttp
 import html
@@ -24,7 +39,7 @@ except Exception:
 # ---------- Config ----------
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/bot.db")
-GUILD_IDS: List[int] = []  # e.g., [123456789012345678] for faster guild sync
+
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120

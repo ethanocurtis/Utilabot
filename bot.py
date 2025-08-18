@@ -696,7 +696,7 @@ except Exception as _e:
 def _sticky_set_sticky(self, channel_id: int, payload: dict, last_message_id: int | None = None):
     data = dict(payload)
     if last_message_id is not None:
-        data[\"last_message_id\"] = int(last_message_id)
+        data["last_message_id"] = int(last_message_id)
     js = json.dumps(data)
     self.db.execute(
         \"\"\"

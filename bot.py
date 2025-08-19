@@ -3151,13 +3151,12 @@ def _is_valid_url(u: str) -> bool:
     except Exception:
         return False
 
-@bot.tree.command(name="shorten", description="Shorten a URL using your Kutt instance")
+@app_commands.command(name="shorten", description="Shorten a URL using your Kutt instance")
 @app_commands.describe(
     url="The URL to shorten",
     custom="Optional custom slug (e.g. 'my-alias')"
 )
-async def shorten(interaction, url: str, custom: str | None = None):
-    # Fast config validation
+async def shorten(interaction: discord.Interaction, url: str, custom: str | None = None):
     if not KUTT_API_KEY:
         await interaction.response.send_message(
             "❌ Kutt is not configured. Set **KUTT_API_KEY** (and optional **KUTT_BASE_URL**) in your `.env`.",
@@ -3171,25 +3170,17 @@ async def shorten(interaction, url: str, custom: str | None = None):
 
     await interaction.response.defer(thinking=True)
 
-    headers = {
-        "X-API-Key": KUTT_API_KEY,
-        "Content-Type": "application/json",
-    }
+    headers = {"X-API-Key": KUTT_API_KEY, "Content-Type": "application/json"}
     payload = {"target": url}
     if custom:
         payload["customurl"] = custom.strip()
 
     try:
         r = requests.post(f"{KUTT_BASE_URL}/api/url/submit", json=payload, headers=headers, timeout=15)
-        # Try to parse JSON either way
-        content_type = r.headers.get("content-type", "")
-        data = r.json() if "application/json" in content_type else {}
-
+        data = r.json() if "application/json" in r.headers.get("content-type","") else {}
         if r.ok and data.get("link"):
-            # Kutt returns absolute link (e.g., https://your.tld/alias)
             await interaction.followup.send(f"🔗 Shortened: {data['link']}")
         else:
-            # Show a friendly error pulled from Kutt response if available
             msg = data.get("error") or data.get("message") or r.text
             await interaction.followup.send(f"⚠️ Shorten failed: {msg}")
     except requests.RequestException as e:

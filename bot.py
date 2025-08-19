@@ -3144,7 +3144,15 @@ async def cleanup_loop():
 async def before_cleanup():
     await bot.wait_until_ready()
 
-# ---- /shorten (Kutt integration) 
+# ---- /shorten (Kutt v2+v3 compatible) --------------------------------------
+import os, requests, discord
+from urllib.parse import urlparse
+from discord import app_commands
+
+KUTT_API_KEY     = os.getenv("KUTT_API_KEY")
+KUTT_BASE_URL    = (os.getenv("KUTT_BASE_URL") or "https://kutt.it").rstrip("/")
+KUTT_LINK_DOMAIN = os.getenv("KUTT_LINK_DOMAIN")  # optional but recommended
+
 def _is_valid_url(u: str) -> bool:
     try:
         p = urlparse(u)
@@ -3155,16 +3163,16 @@ def _is_valid_url(u: str) -> bool:
 @tree.command(name="shorten", description="Shorten a URL using your Kutt instance")
 @app_commands.describe(
     url="The URL to shorten",
-    custom="Optional custom slug (e.g. 'my-alias')"
+    custom="Optional custom slug (letters/numbers/-_)"
 )
 async def shorten(interaction: discord.Interaction, url: str, custom: str | None = None):
+    # quick config checks
     if not KUTT_API_KEY:
         await interaction.response.send_message(
-            "❌ Kutt is not configured. Set **KUTT_API_KEY** (and optional **KUTT_BASE_URL**) in your `.env`.",
+            "❌ Kutt not configured. Add **KUTT_API_KEY** (and **KUTT_BASE_URL**, **KUTT_LINK_DOMAIN**) in `.env`.",
             ephemeral=True
         )
         return
-
     if not _is_valid_url(url):
         await interaction.response.send_message("⚠️ Please provide a valid http(s) URL.", ephemeral=True)
         return
@@ -3176,31 +3184,54 @@ async def shorten(interaction: discord.Interaction, url: str, custom: str | None
     if custom:
         payload["customurl"] = custom.strip()
     if KUTT_LINK_DOMAIN:
-        payload["domain"] = KUTT_LINK_DOMAIN
+        payload["domain"] = KUTT_LINK_DOMAIN.strip()
+
+    # Try v3 first, then fall back to v2 if 404
+    endpoint_v3 = f"{KUTT_BASE_URL}/api/v2/links"
+    endpoint_v2 = f"{KUTT_BASE_URL}/api/url/submit"
 
     try:
-        r = requests.post(
-            f"{KUTT_BASE_URL.rstrip('/')}/api/v2/links",
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-        ct = r.headers.get("content-type", "")
-        try:
-            data = r.json() if "application/json" in ct else {}
-        except Exception:
-            data = {}
-
-        if r.ok and data.get("link"):
-            await interaction.followup.send(f"🔗 Shortened: {data['link']}")
-        else:
-            await interaction.followup.send(
-                f"⚠️ Shorten failed.\n"
-                f"Status: {r.status_code}\n"
-                f"Body: {data or r.text[:400]}"
-            )
+        r = requests.post(endpoint_v3, json=payload, headers=headers, timeout=15)
+        if r.status_code == 404:
+            r = requests.post(endpoint_v2, json=payload, headers=headers, timeout=15)
     except requests.RequestException as e:
         await interaction.followup.send(f"❌ Network error: {e}")
+        return
+
+    # Parse response safely
+    ct = r.headers.get("content-type", "")
+    try:
+        data = r.json() if "application/json" in ct else {}
+    except Exception:
+        data = {}
+
+    # Success codes for Kutt
+    ok = r.status_code in (200, 201)
+
+    # v2: { "link": "https://domain/slug", ... }
+    link = data.get("link")
+
+    # v3: sometimes { "shortUrl": "https://domain/slug" }
+    if not link:
+        link = data.get("shortUrl")
+
+    # v3 common: build from { "domain": "glint.zip", "address": "abc123" }
+    if not link and data.get("address"):
+        domain = (data.get("domain") or KUTT_LINK_DOMAIN or "").strip().strip("/")
+        if domain:
+            link = f"https://{domain}/{data['address']}"
+
+    if ok and link:
+        await interaction.followup.send(f"🔗 Shortened: {link}")
+    else:
+        # Helpful debug (trim huge bodies)
+        body_preview = (data or r.text or "")[:500]
+        await interaction.followup.send(
+            "⚠️ Shorten failed.\n"
+            f"Status: {r.status_code}\n"
+            f"Endpoint: {'v3' if r.request.url.endswith('/api/v2/links') else 'v2'}\n"
+            f"Body: {body_preview}"
+        )
 # ---------------------------------------------------------------------------
 
 # ---------- Reminders ----------

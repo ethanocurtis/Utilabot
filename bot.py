@@ -3454,6 +3454,16 @@ async def on_ready():
     if not weather_scheduler.is_running():
         weather_scheduler.start()
 
+@bot.event
+async def on_ready():
+    try:
+        synced = await tree.sync()  # global sync
+        print(f"[slash] Globally synced {len(synced)} commands")
+        # What Discord currently sees globally:
+        global_cmds = await tree.fetch_commands()  # global
+        print("[slash] Global commands now:", [c.name for c in global_cmds])
+    except Exception as e:
+        print("[slash] Global sync error:", e)
     # Re-register persistent poll views
     for mid, p in store.list_open_polls():
         try:

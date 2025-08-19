@@ -3160,7 +3160,7 @@ def _is_valid_url(u: str) -> bool:
 async def shorten(interaction: discord.Interaction, url: str, custom: str | None = None):
     if not KUTT_API_KEY:
         await interaction.response.send_message(
-            "❌ Kutt is not configured. Set **KUTT_API_KEY** (and optional **KUTT_BASE_URL**, **KUTT_LINK_DOMAIN**) in your `.env`.",
+            "❌ Kutt is not configured. Set **KUTT_API_KEY** (and optional **KUTT_BASE_URL**) in your `.env`.",
             ephemeral=True
         )
         return
@@ -3173,34 +3173,34 @@ async def shorten(interaction: discord.Interaction, url: str, custom: str | None
 
     headers = {"X-API-Key": KUTT_API_KEY, "Content-Type": "application/json"}
     payload = {"target": url}
-if custom:
-    payload["customurl"] = custom.strip()
-if KUTT_LINK_DOMAIN:
-    payload["domain"] = KUTT_LINK_DOMAIN
+    if custom:
+        payload["customurl"] = custom.strip()
+    if KUTT_LINK_DOMAIN:
+        payload["domain"] = KUTT_LINK_DOMAIN
 
-r = requests.post(
-    f"{KUTT_BASE_URL.rstrip('/')}/api/url/submit",
-    json=payload,
-    headers={"X-API-Key": KUTT_API_KEY, "Content-Type": "application/json"},
-    timeout=15,
-)
+    try:
+        r = requests.post(
+            f"{KUTT_BASE_URL.rstrip('/')}/api/url/submit",
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        ct = r.headers.get("content-type", "")
+        try:
+            data = r.json() if "application/json" in ct else {}
+        except Exception:
+            data = {}
 
-ct = r.headers.get("content-type", "")
-try:
-    data = r.json() if "application/json" in ct else {}
-except Exception:
-    data = {}
-
-if r.ok and data.get("link"):
-    await interaction.followup.send(f"🔗 Shortened: {data['link']}")
-else:
-    await interaction.followup.send(
-        "⚠️ Shorten failed.\n"
-        f"URL used: {KUTT_BASE_URL}/api/url/submit\n"
-        f"Status: {r.status_code}\n"
-        f"Content-Type: {ct}\n"
-        f"Body: {data or r.text[:400]}"
-    )
+        if r.ok and data.get("link"):
+            await interaction.followup.send(f"🔗 Shortened: {data['link']}")
+        else:
+            await interaction.followup.send(
+                f"⚠️ Shorten failed.\n"
+                f"Status: {r.status_code}\n"
+                f"Body: {data or r.text[:400]}"
+            )
+    except requests.RequestException as e:
+        await interaction.followup.send(f"❌ Network error: {e}")
 # ---------------------------------------------------------------------------
 
 # ---------- Reminders ----------

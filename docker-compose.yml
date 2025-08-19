@@ -2,6 +2,8 @@ services:
   utility-bot:
     build: .
     container_name: utility-bot
+    env_file:
+      - .env
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - DATA_PATH=/app/data/db.json

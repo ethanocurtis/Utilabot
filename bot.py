@@ -9,6 +9,8 @@ from typing import Optional, Dict, List, Tuple, Any
 import discord
 from discord.ext import tasks
 from discord import app_commands
+import requests
+from urllib.parse import urlparse
 
 # External deps
 import aiohttp
@@ -25,6 +27,9 @@ except Exception:
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data/db.json")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/bot.db")
 GUILD_IDS: List[int] = []  # e.g., [123456789012345678] for faster guild sync
+
+KUTT_API_KEY = os.getenv("KUTT_API_KEY")
+KUTT_BASE_URL = (os.getenv("KUTT_BASE_URL", "https://kutt.it") or "https://kutt.it").rstrip("/")
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120
@@ -3137,6 +3142,59 @@ async def cleanup_loop():
 @cleanup_loop.before_loop
 async def before_cleanup():
     await bot.wait_until_ready()
+
+# ---- /shorten (Kutt integration) 
+def _is_valid_url(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+@bot.tree.command(name="shorten", description="Shorten a URL using your Kutt instance")
+@app_commands.describe(
+    url="The URL to shorten",
+    custom="Optional custom slug (e.g. 'my-alias')"
+)
+async def shorten(interaction, url: str, custom: str | None = None):
+    # Fast config validation
+    if not KUTT_API_KEY:
+        await interaction.response.send_message(
+            "❌ Kutt is not configured. Set **KUTT_API_KEY** (and optional **KUTT_BASE_URL**) in your `.env`.",
+            ephemeral=True
+        )
+        return
+
+    if not _is_valid_url(url):
+        await interaction.response.send_message("⚠️ Please provide a valid http(s) URL.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    headers = {
+        "X-API-Key": KUTT_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {"target": url}
+    if custom:
+        payload["customurl"] = custom.strip()
+
+    try:
+        r = requests.post(f"{KUTT_BASE_URL}/api/url/submit", json=payload, headers=headers, timeout=15)
+        # Try to parse JSON either way
+        content_type = r.headers.get("content-type", "")
+        data = r.json() if "application/json" in content_type else {}
+
+        if r.ok and data.get("link"):
+            # Kutt returns absolute link (e.g., https://your.tld/alias)
+            await interaction.followup.send(f"🔗 Shortened: {data['link']}")
+        else:
+            # Show a friendly error pulled from Kutt response if available
+            msg = data.get("error") or data.get("message") or r.text
+            await interaction.followup.send(f"⚠️ Shorten failed: {msg}")
+    except requests.RequestException as e:
+        await interaction.followup.send(f"❌ Network error: {e}")
+# ---------------------------------------------------------------------------
 
 # ---------- Reminders ----------
 def _chicago_tz_for(dt_naive: datetime):

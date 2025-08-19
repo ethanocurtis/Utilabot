@@ -3151,7 +3151,7 @@ def _is_valid_url(u: str) -> bool:
     except Exception:
         return False
 
-@tree.commands.command(name="shorten", description="Shorten a URL using your Kutt instance")
+@tree.command(name="shorten", description="Shorten a URL using your Kutt instance")
 @app_commands.describe(
     url="The URL to shorten",
     custom="Optional custom slug (e.g. 'my-alias')"

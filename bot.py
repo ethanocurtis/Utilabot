@@ -29,7 +29,8 @@ DB_PATH = os.environ.get("DB_PATH", "/app/data/bot.db")
 GUILD_IDS: List[int] = []  # e.g., [123456789012345678] for faster guild sync
 
 KUTT_API_KEY = os.getenv("KUTT_API_KEY")
-KUTT_BASE_URL = (os.getenv("KUTT_BASE_URL", "https://kutt.it") or "https://kutt.it").rstrip("/")
+KUTT_BASE_URL = os.getenv("KUTT_BASE_URL", "https://kutt.it").rstrip("/")
+KUTT_LINK_DOMAIN = os.getenv("KUTT_LINK_DOMAIN")  # optional
 
 STARTING_DAILY = 250
 PVP_TIMEOUT = 120
@@ -3159,7 +3160,7 @@ def _is_valid_url(u: str) -> bool:
 async def shorten(interaction: discord.Interaction, url: str, custom: str | None = None):
     if not KUTT_API_KEY:
         await interaction.response.send_message(
-            "❌ Kutt is not configured. Set **KUTT_API_KEY** (and optional **KUTT_BASE_URL**) in your `.env`.",
+            "❌ Kutt is not configured. Set **KUTT_API_KEY** (and optional **KUTT_BASE_URL**, **KUTT_LINK_DOMAIN**) in your `.env`.",
             ephemeral=True
         )
         return
@@ -3174,10 +3175,13 @@ async def shorten(interaction: discord.Interaction, url: str, custom: str | None
     payload = {"target": url}
     if custom:
         payload["customurl"] = custom.strip()
+    if KUTT_LINK_DOMAIN:
+        payload["domain"] = KUTT_LINK_DOMAIN
 
     try:
         r = requests.post(f"{KUTT_BASE_URL}/api/url/submit", json=payload, headers=headers, timeout=15)
-        data = r.json() if "application/json" in r.headers.get("content-type","") else {}
+        ct = r.headers.get("content-type", "")
+        data = r.json() if "application/json" in ct else {}
         if r.ok and data.get("link"):
             await interaction.followup.send(f"🔗 Shortened: {data['link']}")
         else:

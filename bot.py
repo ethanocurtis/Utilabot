@@ -3173,22 +3173,34 @@ async def shorten(interaction: discord.Interaction, url: str, custom: str | None
 
     headers = {"X-API-Key": KUTT_API_KEY, "Content-Type": "application/json"}
     payload = {"target": url}
-    if custom:
-        payload["customurl"] = custom.strip()
-    if KUTT_LINK_DOMAIN:
-        payload["domain"] = KUTT_LINK_DOMAIN
+if custom:
+    payload["customurl"] = custom.strip()
+if KUTT_LINK_DOMAIN:
+    payload["domain"] = KUTT_LINK_DOMAIN
 
-    try:
-        r = requests.post(f"{KUTT_BASE_URL}/api/url/submit", json=payload, headers=headers, timeout=15)
-        ct = r.headers.get("content-type", "")
-        data = r.json() if "application/json" in ct else {}
-        if r.ok and data.get("link"):
-            await interaction.followup.send(f"🔗 Shortened: {data['link']}")
-        else:
-            msg = data.get("error") or data.get("message") or r.text
-            await interaction.followup.send(f"⚠️ Shorten failed: {msg}")
-    except requests.RequestException as e:
-        await interaction.followup.send(f"❌ Network error: {e}")
+r = requests.post(
+    f"{KUTT_BASE_URL.rstrip('/')}/api/url/submit",
+    json=payload,
+    headers={"X-API-Key": KUTT_API_KEY, "Content-Type": "application/json"},
+    timeout=15,
+)
+
+ct = r.headers.get("content-type", "")
+try:
+    data = r.json() if "application/json" in ct else {}
+except Exception:
+    data = {}
+
+if r.ok and data.get("link"):
+    await interaction.followup.send(f"🔗 Shortened: {data['link']}")
+else:
+    await interaction.followup.send(
+        "⚠️ Shorten failed.\n"
+        f"URL used: {KUTT_BASE_URL}/api/url/submit\n"
+        f"Status: {r.status_code}\n"
+        f"Content-Type: {ct}\n"
+        f"Body: {data or r.text[:400]}"
+    )
 # ---------------------------------------------------------------------------
 
 # ---------- Reminders ----------

@@ -3682,7 +3682,9 @@ async def on_ready():
     if not weather_scheduler.is_running():
         weather_scheduler.start()
 
-    # --- Re-register persistent views ---
+    
+    if not wx_alerts_scheduler.is_running():
+        wx_alerts_scheduler.start()# --- Re-register persistent views ---
     for mid, p in store.list_open_polls():
         try:
             view = PollView(

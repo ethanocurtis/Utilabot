@@ -3180,7 +3180,7 @@ async def shorten(interaction: discord.Interaction, url: str, custom: str | None
 
     try:
         r = requests.post(
-            f"{KUTT_BASE_URL.rstrip('/')}/api/url/submit",
+            f"{KUTT_BASE_URL.rstrip('/')}/api/url/links",
             json=payload,
             headers=headers,
             timeout=15,

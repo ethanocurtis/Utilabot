@@ -3486,14 +3486,26 @@ async def debug_store(inter: discord.Interaction):
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
-    # Sync slash commands
-    if GUILD_IDS:
-        for gid in GUILD_IDS:
-            guild = discord.Object(id=gid)
-            await tree.sync(guild=guild)
-    else:
-        await tree.sync()
+    # prevent running twice on reconnects
+    if getattr(bot, "_ready_once", False):
+        return
+    bot._ready_once = True
 
+    # --- Slash sync ---
+    try:
+        if GUILD_IDS:
+            for gid in GUILD_IDS:
+                guild = discord.Object(id=gid)
+                await tree.sync(guild=guild)
+        else:
+            synced = await tree.sync()  # global sync
+            print(f"[slash] Globally synced {len(synced)} commands")
+            global_cmds = await tree.fetch_commands()
+            print("[slash] Global commands now:", [c.name for c in global_cmds])
+    except Exception as e:
+        print("[slash] Global sync error:", e)
+
+    # --- Start background loops ---
     if not cleanup_loop.is_running():
         cleanup_loop.start()
     if not reminders_scheduler.is_running():
@@ -3501,26 +3513,20 @@ async def on_ready():
     if not weather_scheduler.is_running():
         weather_scheduler.start()
 
-@bot.event
-async def on_ready():
-    try:
-        synced = await tree.sync()  # global sync
-        print(f"[slash] Globally synced {len(synced)} commands")
-        # What Discord currently sees globally:
-        global_cmds = await tree.fetch_commands()  # global
-        print("[slash] Global commands now:", [c.name for c in global_cmds])
-    except Exception as e:
-        print("[slash] Global sync error:", e)
-    # Re-register persistent poll views
+    # --- Re-register persistent views ---
     for mid, p in store.list_open_polls():
         try:
-            view = PollView(message_id=mid, options=[o["label"] for o in p["options"]], creator_id=p.get("creator_id", 0), timeout=None)
+            view = PollView(
+                message_id=mid,
+                options=[o["label"] for o in p["options"]],
+                creator_id=p.get("creator_id", 0),
+                timeout=None
+            )
             bot.add_view(view)
         except Exception:
             pass
 
-    print(f"Logged in as {bot.user} ({bot.user.id})")
-
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 # ---------- Main ----------
 def main():
     token = os.environ.get("DISCORD_TOKEN")

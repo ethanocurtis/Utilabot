@@ -3708,10 +3708,7 @@ async def on_ready():
         weather_scheduler.start()
 
     
-    
-    if not recurring_reminders_scheduler.is_running():
-        recurring_reminders_scheduler.start()
-if not wx_alerts_scheduler.is_running():
+    if not wx_alerts_scheduler.is_running():
         wx_alerts_scheduler.start()# --- Re-register persistent views ---
     for mid, p in store.list_open_polls():
         try:
@@ -4262,16 +4259,16 @@ def next_occurrence(now_local: _dt.datetime, rule: dict) -> _dt.datetime:
 
 @tree.command(name="remind_every", description="Create a recurring reminder (15m, 2h, 1d, daily@09:00, mon,wed@08:30).")
 @app_commands.describe(every="15m | 2h | 1d | 1w | daily@09:00 | mon,wed@08:30",
-                       text="What to remind you about",
-                       occurrences="Optional max repeats",
-                       until="Optional end date YYYY-MM-DD",
-                       dm="Send via DM instead of this channel")
+                    text="What to remind you about",
+                    occurrences="Optional max repeats",
+                    until="Optional end date YYYY-MM-DD",
+                    dm="Send via DM instead of this channel")
 async def remind_every(inter: discord.Interaction,
-                       every: str,
-                       text: str,
-                       occurrences: app_commands.Range[int, 1, 365] | None = None,
-                       until: str | None = None,
-                       dm: bool = True):
+                    every: str,
+                    text: str,
+                    occurrences: app_commands.Range[int, 1, 365] | None = None,
+                    until: str | None = None,
+                    dm: bool = True):
     await inter.response.defer(ephemeral=True)
     rule = parse_every(every)
     if not rule:
@@ -4295,7 +4292,7 @@ async def remind_every(inter: discord.Interaction,
 
     try:
         store.db.execute("UPDATE reminders SET repeat_rule=?, repeat_until=?, repeat_max=? WHERE user_id=? AND id=?",
-                         (every, until, occurrences, int(inter.user.id), int(rid)))
+                        (every, until, occurrences, int(inter.user.id), int(rid)))
         store.db.commit()
     except Exception:
         pass
@@ -4389,3 +4386,4 @@ async def recurring_reminders_scheduler():
 @recurring_reminders_scheduler.before_loop
 async def _before_recurring_reminders():
     await bot.wait_until_ready()
+

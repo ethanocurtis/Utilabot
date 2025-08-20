@@ -685,6 +685,31 @@ class Store:
 
 store = Store(DATA_PATH)
 
+
+
+
+# --- Recurring reminders: ensure extra columns exist ---
+def _ensure_recurring_columns(conn):
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()]
+        stmts = []
+        if "repeat_rule" not in cols:
+            stmts.append("ALTER TABLE reminders ADD COLUMN repeat_rule TEXT DEFAULT ''")
+        if "repeat_until" not in cols:
+            stmts.append("ALTER TABLE reminders ADD COLUMN repeat_until TEXT")
+        if "repeat_max" not in cols:
+            stmts.append("ALTER TABLE reminders ADD COLUMN repeat_max INTEGER")
+        for s in stmts:
+            try:
+                conn.execute(s)
+            except Exception:
+                pass
+        conn.commit()
+    except Exception:
+        pass
+
+_ensure_recurring_columns(store.db)
+
 # ---------- Permissions helper ----------
 def require_manage_messages():
     def predicate(inter: discord.Interaction):
@@ -3683,7 +3708,10 @@ async def on_ready():
         weather_scheduler.start()
 
     
-    if not wx_alerts_scheduler.is_running():
+    
+    if not recurring_reminders_scheduler.is_running():
+        recurring_reminders_scheduler.start()
+if not wx_alerts_scheduler.is_running():
         wx_alerts_scheduler.start()# --- Re-register persistent views ---
     for mid, p in store.list_open_polls():
         try:
@@ -4163,3 +4191,201 @@ async def update_poll_message(channel: discord.abc.Messageable, message_id: int,
     except Exception:
         pass
 
+
+
+# ============================
+#   RECURRING REMINDERS
+# ============================
+import datetime as _dt
+import re as _re
+
+DOW = {"mon":0,"tue":1,"wed":2,"thu":3,"fri":4,"sat":5,"sun":6}
+
+def _user_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(DEFAULT_TZ_NAME)
+    except Exception:
+        from datetime import timezone
+        return timezone.utc
+
+def parse_every(every: str) -> dict | None:
+    """
+    Supported patterns:
+      - '15m', '2h', '1d', '1w'
+      - 'daily@09:00'
+      - 'mon,wed,fri@08:30'
+    """
+    s = (every or "").strip().lower().replace(" ", "")
+    if not s: return None
+
+    m = _re.fullmatch(r"(\d+)(m|h|d|w)", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        mult = {"m":60, "h":3600, "d":86400, "w":604800}[unit]
+        return {"kind":"duration","seconds":n*mult}
+
+    m = _re.fullmatch(r"daily@(\d{1,2}):(\d{2})", s)
+    if m:
+        return {"kind":"daily_time", "hh":int(m.group(1)), "mm":int(m.group(2))}
+
+    m = _re.fullmatch(r"([a-z,]+)@(\d{1,2}):(\d{2})", s)
+    if m:
+        days = []
+        for part in m.group(1).split(","):
+            key = part[:3]
+            if key in DOW:
+                days.append(DOW[key])
+        if not days: return None
+        return {"kind":"dow_time","days":sorted(set(days)), "hh":int(m.group(2)), "mm":int(m.group(3))}
+    return None
+
+def next_occurrence(now_local: _dt.datetime, rule: dict) -> _dt.datetime:
+    if rule["kind"] == "duration":
+        return now_local + _dt.timedelta(seconds=rule["seconds"])
+    if rule["kind"] == "daily_time":
+        candidate = now_local.replace(hour=rule["hh"], minute=rule["mm"], second=0, microsecond=0)
+        if candidate <= now_local:
+            candidate += _dt.timedelta(days=1)
+        return candidate
+    if rule["kind"] == "dow_time":
+        hh, mm = rule["hh"], rule["mm"]
+        today = now_local.weekday()
+        for delta in range(0, 8):
+            wd = (today + delta) % 7
+            if wd in rule["days"]:
+                candidate = (now_local + _dt.timedelta(days=delta)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if candidate > now_local:
+                    return candidate
+        delta = ((min(rule["days"]) - today) % 7) or 7
+        return (now_local + _dt.timedelta(days=delta)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+@tree.command(name="remind_every", description="Create a recurring reminder (15m, 2h, 1d, daily@09:00, mon,wed@08:30).")
+@app_commands.describe(every="15m | 2h | 1d | 1w | daily@09:00 | mon,wed@08:30",
+                       text="What to remind you about",
+                       occurrences="Optional max repeats",
+                       until="Optional end date YYYY-MM-DD",
+                       dm="Send via DM instead of this channel")
+async def remind_every(inter: discord.Interaction,
+                       every: str,
+                       text: str,
+                       occurrences: app_commands.Range[int, 1, 365] | None = None,
+                       until: str | None = None,
+                       dm: bool = True):
+    await inter.response.defer(ephemeral=True)
+    rule = parse_every(every)
+    if not rule:
+        return await inter.followup.send("Invalid pattern. Try `15m`, `2h`, `1d`, `daily@09:00`, or `mon,wed@08:30`.", ephemeral=True)
+
+    tz = _user_tz()
+    now_local = _dt.datetime.now(tz)
+    first_local = next_occurrence(now_local, rule)
+    first_utc = first_local.astimezone(_dt.timezone.utc)
+
+    try:
+        rid = store.add_reminder({
+            "user_id": inter.user.id,
+            "text": text,
+            "due_utc": first_utc.isoformat(timespec="seconds"),
+            "channel_id": (None if dm else inter.channel_id),
+            "dm": 1 if dm else 0,
+        })
+    except TypeError:
+        rid = store.add_reminder(inter.user.id, text, first_utc.isoformat(timespec="seconds"), (None if dm else inter.channel_id), int(dm))
+
+    try:
+        store.db.execute("UPDATE reminders SET repeat_rule=?, repeat_until=?, repeat_max=? WHERE user_id=? AND id=?",
+                         (every, until, occurrences, int(inter.user.id), int(rid)))
+        store.db.commit()
+    except Exception:
+        pass
+
+    where_txt = "DMs" if dm else f"<#{inter.channel_id}>"
+    await inter.followup.send(
+        f"🔁 Recurring reminder set in **{where_txt}**: **{text}**\nPattern: `{every}` • First run: **{first_local:%a %b %d, %I:%M %p %Z}**",
+        ephemeral=True
+    )
+
+async def _reschedule_or_delete(rem_row: dict):
+    rr = (rem_row.get("repeat_rule") or "").strip()
+    uid = int(rem_row["user_id"]); rid = int(rem_row["id"])
+    if not rr:
+        try:
+            store.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (uid, rid))
+            store.db.commit()
+        except Exception:
+            pass
+        return
+
+    rule = parse_every(rr)
+    if not rule:
+        try:
+            store.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (uid, rid))
+            store.db.commit()
+        except Exception:
+            pass
+        return
+
+    tz = _user_tz()
+    now_local = _dt.datetime.now(tz)
+    next_local = next_occurrence(now_local, rule)
+    next_utc = next_local.astimezone(_dt.timezone.utc)
+
+    until_iso = rem_row.get("repeat_until")
+    if until_iso:
+        try:
+            until_dt = _dt.datetime.fromisoformat(until_iso)
+            if until_dt.tzinfo is None:
+                until_dt = until_dt.replace(tzinfo=_dt.timezone.utc)
+            else:
+                until_dt = until_dt.astimezone(_dt.timezone.utc)
+            if next_utc > until_dt:
+                store.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (uid, rid))
+                store.db.commit()
+                return
+        except Exception:
+            pass
+
+    remaining = rem_row.get("repeat_max")
+    if isinstance(remaining, int) or (isinstance(remaining, str) and str(remaining).isdigit()):
+        remaining = int(remaining)
+        if remaining <= 1:
+            store.db.execute("DELETE FROM reminders WHERE user_id=? AND id=?", (uid, rid))
+            store.db.commit()
+            return
+        store.db.execute("UPDATE reminders SET repeat_max=? WHERE user_id=? AND id=?", (remaining - 1, uid, rid))
+
+    store.db.execute("UPDATE reminders SET due_utc=? WHERE user_id=? AND id=?", (next_utc.isoformat(timespec='seconds'), uid, rid))
+    store.db.commit()
+
+# A separate scheduler that only processes repeating reminders to avoid double-sends with your existing loop.
+@tasks.loop(seconds=60)
+async def recurring_reminders_scheduler():
+    try:
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')
+        rows = store.db.execute(
+            "SELECT user_id,id,channel_id,dm,text,due_utc,repeat_rule,repeat_until,repeat_max "
+            "FROM reminders WHERE repeat_rule != '' AND due_utc <= ? ORDER BY user_id,id",
+            (now,)
+        ).fetchall()
+        for (uid, rid, cid, dm, text, due, rr, ru, rm) in rows:
+            uid = int(uid); rid = int(rid)
+            try:
+                if dm:
+                    user = await bot.fetch_user(uid)
+                    await user.send(f\"⏰ {text}\")
+                else:
+                    if cid:
+                        channel = bot.get_channel(int(cid))
+                        if channel:
+                            await channel.send(f\"⏰ <@{uid}> {text}\")
+            finally:
+                await _reschedule_or_delete({
+                    "user_id": uid, "id": rid, "repeat_rule": rr, "repeat_until": ru, "repeat_max": rm
+                })
+    except Exception:
+        pass
+
+@recurring_reminders_scheduler.before_loop
+async def _before_recurring_reminders():
+    await bot.wait_until_ready()

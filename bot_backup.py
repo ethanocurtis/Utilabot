@@ -1202,6 +1202,175 @@ async def weather_scheduler():
 async def before_weather():
     await bot.wait_until_ready()
 
+
+
+
+# ---------- Severe Weather Alerts (NWS) ----------
+
+from typing import Optional as _Optional  # ensure Optional alias available (no-op if already imported)
+
+SEVERITY_ORDER = {"advisory": 0, "watch": 1, "warning": 2}
+# Map NWS "severity" to our threshold scale
+NWS_SEV_MAP = {"minor": 0, "moderate": 1, "severe": 2, "extreme": 2}
+
+def _seen_key(uid: int, alert_id: str) -> str:
+    return f"wx_seen:{int(uid)}:{alert_id}"
+
+@tree.command(name="wx_alerts", description="Enable/disable severe weather alerts via DM (NWS).")
+@app_commands.describe(
+    mode="on or off",
+    zip="Optional ZIP (defaults to your saved ZIP)",
+    min_severity="advisory | watch | warning (default: watch)"
+)
+async def wx_alerts(inter: discord.Interaction,
+                    mode: str,
+                    zip: _Optional[str] = None,
+                    min_severity: _Optional[str] = "watch"):
+    mode = (mode or "").strip().lower()
+    if mode not in ("on", "off"):
+        return await inter.response.send_message("Use **on** or **off**.", ephemeral=True)
+    if mode == "off":
+        store.set_note(inter.user.id, "wx_alerts_enabled", "0")
+        return await inter.response.send_message("🔕 Severe weather alerts disabled.", ephemeral=True)
+
+    # Enable
+    z = re.sub(r"[^0-9]", "", zip) if zip else (store.get_user_zip(inter.user.id) or "")
+    if len(z) != 5:
+        return await inter.response.send_message("Set a ZIP with `/weather_set_zip` or provide it here.", ephemeral=True)
+
+    sev = (min_severity or "watch").strip().lower()
+    if sev not in ("advisory", "watch", "warning"):
+        sev = "watch"
+
+    store.set_note(inter.user.id, "wx_alerts_enabled", "1")
+    store.set_note(inter.user.id, "wx_alerts_zip", z)
+    store.set_note(inter.user.id, "wx_alerts_min_sev", sev)
+    await inter.response.send_message(f"🔔 Alerts **ON** for **{z}** (min severity: **{sev}**).", ephemeral=True)
+
+
+async def _fetch_nws_alerts(session: aiohttp.ClientSession, lat: float, lon: float):
+    """Fetch active NWS alerts for a point (lat,lon)."""
+    url = "https://api.weather.gov/alerts/active"
+    params = {"point": f"{lat},{lon}", "status": "actual", "message_type": "alert"}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12), headers=HTTP_HEADERS) as r:
+            if r.status != 200:
+                return []
+            data = await r.json()
+    except Exception:
+        return []
+    feats = data.get("features", []) or []
+    out = []
+    for f in feats:
+        p = f.get("properties", {}) or {}
+        out.append({
+            "id": p.get("id") or f.get("id"),
+            "event": p.get("event"),
+            "headline": p.get("headline"),
+            "severity": (p.get("severity") or "").lower(),    # minor, moderate, severe, extreme
+            "certainty": (p.get("certainty") or "").lower(),  # possible, likely, observed
+            "urgency": (p.get("urgency") or "").lower(),      # expected, immediate
+            "areas": p.get("areaDesc"),
+            "starts": p.get("onset") or p.get("effective"),
+            "ends": p.get("ends") or p.get("expires"),
+            "instr": p.get("instruction"),
+            "desc": p.get("description"),
+            "sender": p.get("senderName"),
+            "link":  p.get("uri"),
+        })
+    return out
+
+
+@tasks.loop(seconds=300)  # every 5 minutes
+async def wx_alerts_scheduler():
+    try:
+        # Build a candidate user set from subs and stored zips
+        user_ids = set()
+        try:
+            for s in store.list_weather_subs(None):
+                user_ids.add(int(s.get("user_id")))
+        except Exception:
+            pass
+        try:
+            rows = store.db.execute("SELECT user_id FROM weather_zips").fetchall()
+            user_ids |= {int(r[0]) for r in rows}
+        except Exception:
+            pass
+        if not user_ids:
+            return
+
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            for uid in user_ids:
+                if store.get_note(uid, "wx_alerts_enabled") != "1":
+                    continue
+                z = store.get_note(uid, "wx_alerts_zip") or (store.get_user_zip(uid) or "")
+                if len(z) != 5:
+                    continue
+
+                try:
+                    city, state, lat, lon = await _zip_to_place_and_coords(session, z)
+                    alerts = await _fetch_nws_alerts(session, lat, lon)
+                    min_sev = store.get_note(uid, "wx_alerts_min_sev") or "watch"
+                    min_rank = SEVERITY_ORDER.get(min_sev, 1)
+
+                    fresh = []
+                    for a in alerts:
+                        rank = NWS_SEV_MAP.get(a.get("severity",""), 0)
+                        if rank < min_rank:
+                            continue
+                        aid = a.get("id") or ""
+                        if not aid:
+                            continue
+                        if store.get_note(uid, _seen_key(uid, aid)):
+                            continue
+                        fresh.append(a)
+
+                    if not fresh:
+                        continue
+
+                    emb = discord.Embed(
+                        title=f"⚠️ Weather Alerts — {city}, {state} {z}",
+                        colour=discord.Colour.orange()
+                    )
+                    for a in fresh[:10]:
+                        name = f"{a.get('event') or 'Alert'} ({(a.get('severity') or '').title()})"
+                        when = ""
+                        if a.get("starts"):
+                            when += f"Starts: {a['starts']}\n"
+                        if a.get("ends"):
+                            when += f"Ends: {a['ends']}\n"
+                        body = (a.get("headline") or a.get("desc") or "Details unavailable").strip()
+                        if len(body) > 400:
+                            body = body[:397] + "…"
+                        tail = f"\n{when}Source: {a.get('sender') or 'NWS'}"
+                        if a.get("link"):
+                            tail += f"\nMore: {a['link']}"
+                        emb.add_field(name=name, value=f"{body}{tail}", inline=False)
+
+                    try:
+                        user = await bot.fetch_user(uid)
+                        await user.send(embed=emb)
+                    except Exception:
+                        pass  # best-effort
+
+                    # mark seen
+                    for a in fresh:
+                        aid = a.get("id")
+                        if aid:
+                            store.set_note(uid, _seen_key(uid, aid), "1")
+
+                except Exception:
+                    # soft-fail per user
+                    continue
+    except Exception:
+        # never crash the loop
+        pass
+
+@wx_alerts_scheduler.before_loop
+async def before_wx_alerts():
+    await bot.wait_until_ready()
+
+
 # ---------- NEW: Shop / Inventory / Fishing ----------
 def _find_catalog_item(name: str) -> Optional[str]:
     # case-insensitive name match
@@ -3513,7 +3682,9 @@ async def on_ready():
     if not weather_scheduler.is_running():
         weather_scheduler.start()
 
-    # --- Re-register persistent views ---
+    
+    if not wx_alerts_scheduler.is_running():
+        wx_alerts_scheduler.start()# --- Re-register persistent views ---
     for mid, p in store.list_open_polls():
         try:
             view = PollView(
